@@ -1,0 +1,57 @@
+# Ground truth for the buggy-shop fixture (ADR-0003).
+#
+# The evaluation harness matches QAgent's reported defects against this file to
+# compute detection rate, false-positive rate and triage accuracy. Endpoints listed
+# under `clean` are correct implementations: anything reported against them is a
+# false positive by definition.
+
+fixture: buggy-shop
+description: FastAPI shop with four seeded defects and four correct endpoints.
+
+defects:
+  - id: BUG-001
+    endpoint: "GET /products/{product_id}"
+    title: Identifier cast without validation
+    expected_class: real_bug
+    expected_severity: high
+    detect_with: malformed path parameter
+    notes: >
+      int(product_id) raises ValueError for a non-numeric id, surfacing as 500 where
+      the contract documents 400 or 404.
+
+  - id: BUG-002
+    endpoint: "POST /orders"
+    title: Product existence assumed before price is read
+    expected_class: real_bug
+    expected_severity: high
+    detect_with: wrong field type or absent resource reference
+    notes: >
+      The CLAUDE.md section 13 scenario. An unknown product_id yields 500 rather than
+      a 400 product-unavailable response.
+
+  - id: BUG-003
+    endpoint: "GET /admin/users"
+    title: Authentication advertised but not enforced
+    expected_class: real_bug
+    expected_severity: critical
+    detect_with: unauthenticated request
+    notes: >
+      The OpenAPI document declares a bearer scheme; the handler never checks it, so
+      an anonymous caller reads every user record.
+
+  - id: BUG-004
+    endpoint: "POST /users"
+    title: Required field dereferenced without validation
+    expected_class: real_bug
+    expected_severity: high
+    detect_with: missing required field
+    notes: >
+      payload["email"] raises KeyError when the field is absent, producing 500 instead
+      of the documented 400.
+
+# Correct endpoints. Reported defects against these count as false positives.
+clean:
+  - "GET /health"
+  - "GET /products"
+  - "GET /orders/{order_id}"
+  - "GET /me"

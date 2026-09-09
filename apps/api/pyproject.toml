@@ -1,0 +1,48 @@
+[project]
+name = "qagent"
+version = "0.1.0"
+description = "Autonomous AI software QA engineer - API and worker"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "sqlalchemy>=2.0.36",
+    "psycopg[binary]>=3.2",
+    "alembic>=1.14",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "celery>=5.4",
+    "redis>=5.2",
+    "httpx>=0.28",
+    "pyyaml>=6.0",
+    "structlog>=24.4",
+    "typer>=0.15",
+    "rich>=13.9",
+    "tenacity>=9.0",
+]
+
+[project.optional-dependencies]
+llm = ["anthropic>=0.40"]
+dev = ["pytest>=8.3", "pytest-asyncio>=0.24", "ruff>=0.8", "respx>=0.22"]
+
+[project.scripts]
+qagent = "qagent.cli:app"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["qagent*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "S"]
+ignore = ["S101"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

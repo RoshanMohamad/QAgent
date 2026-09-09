@@ -20,7 +20,9 @@ from qagent.pipeline import PipelineResult
 logger = logging.getLogger(__name__)
 
 
-def recent_history(session: Session, org_id: UUID, project_id: UUID, limit: int = 6) -> dict[str, list[str]]:
+def recent_history(
+    session: Session, org_id: UUID, project_id: UUID, limit: int = 6
+) -> dict[str, list[str]]:
     """Recent pass/fail sequence per case name, for flakiness detection.
 
     Flakiness cannot be read off a single row, which is why test_results carries a
@@ -50,7 +52,9 @@ def _next_bug_reference(session: Session, org_id: UUID) -> str:
     return f"BUG-{1000 + count + 1}"
 
 
-def _upsert_suite(session: Session, org_id: UUID, project_id: UUID, kind: models.TestKind) -> models.TestSuite:
+def _upsert_suite(
+    session: Session, org_id: UUID, project_id: UUID, kind: models.TestKind
+) -> models.TestSuite:
     suite = session.execute(
         select(models.TestSuite).where(
             models.TestSuite.project_id == project_id,
@@ -68,7 +72,12 @@ def _upsert_suite(session: Session, org_id: UUID, project_id: UUID, kind: models
 
 
 def _upsert_case(
-    session: Session, org_id: UUID, suite: models.TestSuite, name: str, kind: models.TestKind, spec: dict
+    session: Session,
+    org_id: UUID,
+    suite: models.TestSuite,
+    name: str,
+    kind: models.TestKind,
+    spec: dict,
 ) -> models.TestCase:
     case = session.execute(
         select(models.TestCase).where(
@@ -130,7 +139,9 @@ def persist_result(
     for outcome in result.outcomes:
         kind = models.TestKind(outcome.kind)
         suite = _upsert_suite(session, org_id, project_id, kind)
-        case = _upsert_case(session, org_id, suite, outcome.name, kind, {"request": outcome.request})
+        case = _upsert_case(
+            session, org_id, suite, outcome.name, kind, {"request": outcome.request}
+        )
 
         failure_class = None
         confidence = None
@@ -182,7 +193,9 @@ def persist_result(
     run.passed = result.passed
     run.failed = result.failed
     run.errored = result.errored
-    run.status = models.RunStatus.FAILED if (result.failed or result.errored) else models.RunStatus.PASSED
+    run.status = (
+        models.RunStatus.FAILED if (result.failed or result.errored) else models.RunStatus.PASSED
+    )
     run.finished_at = datetime.now(UTC)
 
     return run

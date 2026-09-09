@@ -51,7 +51,9 @@ def run_scan(self, org_id: str, project_id: str, run_id: str) -> dict:
         if run is None:
             return {"error": "run not found"}
 
-        environment = session.get(models.Environment, run.environment_id) if run.environment_id else None
+        environment = (
+            session.get(models.Environment, run.environment_id) if run.environment_id else None
+        )
         if environment is None or not environment.base_url:
             run.status = models.RunStatus.ERROR
             return {"error": "environment has no base_url"}

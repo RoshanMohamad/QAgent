@@ -122,7 +122,11 @@ def test_dependency_outage_is_not_blamed_on_the_handler():
     signals = build(
         POSITIVE_SPEC,
         {"method": "GET", "path": "/products", "auth": "default"},
-        {"status": 503, "body_text": "psycopg.OperationalError: connection refused", "duration_ms": 8},
+        {
+            "status": 503,
+            "body_text": "psycopg.OperationalError: connection refused",
+            "duration_ms": 8,
+        },
     )
     assert classify(signals).failure_class is FailureClass.DEPENDENCY
 

@@ -27,8 +27,8 @@ MAX_BODY_CHARS = 20_000
 
 #: Addresses that must never be reachable from a test run in a hosted deployment.
 _BLOCKED_NETS = [
-    ipaddress.ip_network("169.254.0.0/16"),   # link-local, cloud metadata
-    ipaddress.ip_network("127.0.0.0/8"),      # loopback
+    ipaddress.ip_network("169.254.0.0/16"),  # link-local, cloud metadata
+    ipaddress.ip_network("127.0.0.0/8"),  # loopback
     ipaddress.ip_network("10.0.0.0/8"),
     ipaddress.ip_network("172.16.0.0/12"),
     ipaddress.ip_network("192.168.0.0/16"),
@@ -169,13 +169,19 @@ class ApiTestRunner:
         if urlsplit(path).scheme:
             try:
                 guard_target(
-                    path, allow_private=self.config.allow_private,
+                    path,
+                    allow_private=self.config.allow_private,
                     allowlist=self.config.allowlist or None,
                 )
             except TargetRejected as exc:
                 return ExecutionOutcome(
-                    False, "error", 0, {"method": method, "path": path}, {},
-                    [], f"target rejected: {exc}",
+                    False,
+                    "error",
+                    0,
+                    {"method": method, "path": path},
+                    {},
+                    [],
+                    f"target rejected: {exc}",
                 )
 
         recorded_request = {
@@ -198,15 +204,23 @@ class ApiTestRunner:
         except httpx.TimeoutException as exc:
             duration_ms = int((time.perf_counter() - started) * 1000)
             return ExecutionOutcome(
-                False, "error", duration_ms, recorded_request,
-                {"error": "timeout", "duration_ms": duration_ms}, [],
+                False,
+                "error",
+                duration_ms,
+                recorded_request,
+                {"error": "timeout", "duration_ms": duration_ms},
+                [],
                 f"request timed out after {self.config.timeout_seconds}s: {exc}",
             )
         except httpx.HTTPError as exc:
             duration_ms = int((time.perf_counter() - started) * 1000)
             return ExecutionOutcome(
-                False, "error", duration_ms, recorded_request,
-                {"error": type(exc).__name__, "duration_ms": duration_ms}, [],
+                False,
+                "error",
+                duration_ms,
+                recorded_request,
+                {"error": type(exc).__name__, "duration_ms": duration_ms},
+                [],
                 f"transport error: {exc}",
             )
 

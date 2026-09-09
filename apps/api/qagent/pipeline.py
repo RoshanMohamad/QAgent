@@ -95,7 +95,9 @@ class PipelineResult:
         }
 
 
-def discover(base_url: str, openapi_url: str | None = None) -> tuple[list[EndpointSpec], str | None]:
+def discover(
+    base_url: str, openapi_url: str | None = None
+) -> tuple[list[EndpointSpec], str | None]:
     document, source_url = fetch_spec(base_url, openapi_url)
     if not document:
         return [], None

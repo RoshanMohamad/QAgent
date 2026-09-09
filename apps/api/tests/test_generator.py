@@ -26,7 +26,12 @@ DOCUMENT = {
             "get": {
                 "operationId": "getProduct",
                 "parameters": [
-                    {"name": "product_id", "in": "path", "required": True, "schema": {"type": "integer"}}
+                    {
+                        "name": "product_id",
+                        "in": "path",
+                        "required": True,
+                        "schema": {"type": "integer"},
+                    }
                 ],
                 "responses": {"200": {"description": "ok"}, "404": {"description": "missing"}},
             }
@@ -37,9 +42,7 @@ DOCUMENT = {
                 "security": [{"bearer": []}],
                 "requestBody": {
                     "content": {
-                        "application/json": {
-                            "schema": {"$ref": "#/components/schemas/NewOrder"}
-                        }
+                        "application/json": {"schema": {"$ref": "#/components/schemas/NewOrder"}}
                     }
                 },
                 "responses": {"201": {"description": "created"}, "400": {"description": "bad"}},

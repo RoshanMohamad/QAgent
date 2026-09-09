@@ -102,7 +102,9 @@ def create_project(
 def list_projects(
     org_id: UUID = Depends(current_org), session: Session = Depends(get_db)
 ) -> list[dict]:
-    rows = session.execute(select(models.Project).order_by(models.Project.created_at.desc())).scalars()
+    rows = session.execute(
+        select(models.Project).order_by(models.Project.created_at.desc())
+    ).scalars()
     return [
         {"id": str(p.id), "name": p.name, "repo_url": p.repo_url, "stack": p.stack} for p in rows
     ]
@@ -298,9 +300,7 @@ def quality_gate(
 
 
 @app.get("/api/v1/dashboard", tags=["dashboard"])
-def dashboard(
-    org_id: UUID = Depends(current_org), session: Session = Depends(get_db)
-) -> dict:
+def dashboard(org_id: UUID = Depends(current_org), session: Session = Depends(get_db)) -> dict:
     """Counters for the dashboard in CLAUDE.md section 4."""
     totals = session.execute(
         select(
@@ -319,17 +319,13 @@ def dashboard(
         ).all()
     )
 
-    spend = session.execute(
-        select(func.coalesce(func.sum(models.LlmCall.usd), 0.0))
-    ).scalar_one()
+    spend = session.execute(select(func.coalesce(func.sum(models.LlmCall.usd), 0.0))).scalar_one()
 
     return {
         "projects": session.query(models.Project).count(),
         "runs": totals[0],
         "tests": {"total": totals[1], "passed": totals[2], "failed": totals[3]},
-        "bugs": {
-            (k.value if hasattr(k, "value") else str(k)): v for k, v in severities.items()
-        },
+        "bugs": {(k.value if hasattr(k, "value") else str(k)): v for k, v in severities.items()},
         "llm_spend_usd": round(float(spend), 4),
         "generated_at": datetime.now(UTC),
     }

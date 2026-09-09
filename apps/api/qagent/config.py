@@ -14,7 +14,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="", case_sensitive=False, extra="ignore")
 
     env: str = "development"
-    secret_key: str = "change-me-in-production"
+    secret_key: str = "change-me-in-production"  # noqa: S105 - placeholder, not a secret
 
     database_url: str = "postgresql+psycopg://qagent:qagent@localhost:5432/qagent"
     redis_url: str = "redis://localhost:6379/0"

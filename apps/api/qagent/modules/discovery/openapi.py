@@ -32,10 +32,26 @@ COMMON_SPEC_PATHS = [
 #: Path fragments that raise an endpoint's risk score. Risk drives generation order
 #: so that a truncated budget still covers what matters.
 _SENSITIVE_FRAGMENTS = {
-    "auth": 0.30, "login": 0.30, "token": 0.25, "session": 0.20, "password": 0.30,
-    "admin": 0.30, "user": 0.15, "account": 0.15, "role": 0.20, "permission": 0.20,
-    "payment": 0.35, "checkout": 0.30, "order": 0.20, "invoice": 0.20, "billing": 0.25,
-    "upload": 0.20, "file": 0.15, "export": 0.15, "import": 0.15, "search": 0.10,
+    "auth": 0.30,
+    "login": 0.30,
+    "token": 0.25,
+    "session": 0.20,
+    "password": 0.30,
+    "admin": 0.30,
+    "user": 0.15,
+    "account": 0.15,
+    "role": 0.20,
+    "permission": 0.20,
+    "payment": 0.35,
+    "checkout": 0.30,
+    "order": 0.20,
+    "invoice": 0.20,
+    "billing": 0.25,
+    "upload": 0.20,
+    "file": 0.15,
+    "export": 0.15,
+    "import": 0.15,
+    "search": 0.10,
 }
 
 _WRITE_METHODS = {"post", "put", "patch", "delete"}
@@ -173,7 +189,9 @@ def parse_openapi(document: dict) -> list[EndpointSpec]:
                 continue
 
             try:
-                params = list(shared_params) + list(_deref(operation.get("parameters", []), document) or [])
+                params = list(shared_params) + list(
+                    _deref(operation.get("parameters", []), document) or []
+                )
                 requires_auth = _operation_requires_auth(operation, document)
                 endpoints.append(
                     EndpointSpec(
@@ -220,9 +238,9 @@ def fetch_spec(
     Returns the document and the URL it came from. An empty document means
     discovery must fall back to another source rather than that the project failed.
     """
-    candidates = [explicit_url] if explicit_url else [
-        base_url.rstrip("/") + p for p in COMMON_SPEC_PATHS
-    ]
+    candidates = (
+        [explicit_url] if explicit_url else [base_url.rstrip("/") + p for p in COMMON_SPEC_PATHS]
+    )
 
     with httpx.Client(timeout=timeout, follow_redirects=True) as client:
         for url in candidates:

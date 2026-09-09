@@ -105,8 +105,7 @@ def _render(result: PipelineResult, *, verbose: bool) -> None:
     llm = summary.get("llm") or {}
     if llm.get("calls"):
         console.print(
-            f"\n[dim]llm: {llm['calls']} calls, {llm['tokens']} tokens, "
-            f"${llm['usd']:.4f}[/dim]"
+            f"\n[dim]llm: {llm['calls']} calls, {llm['tokens']} tokens, ${llm['usd']:.4f}[/dim]"
         )
 
 
@@ -114,12 +113,16 @@ def _render(result: PipelineResult, *, verbose: bool) -> None:
 def scan(
     url: str = typer.Option(..., "--url", "-u", help="Base URL of the running application."),
     spec: str | None = typer.Option(None, "--spec", "-s", help="Explicit OpenAPI document URL."),
-    header: list[str] = typer.Option([], "--header", "-H", help="Auth header, e.g. 'Authorization: Bearer x'."),
+    header: list[str] = typer.Option(
+        [], "--header", "-H", help="Auth header, e.g. 'Authorization: Bearer x'."
+    ),
     max_cases: int | None = typer.Option(None, "--max-cases", help="Cap generated checks."),
     timeout: float = typer.Option(30.0, "--timeout", help="Per-request timeout in seconds."),
     output: Path | None = typer.Option(None, "--json", help="Write the full result as JSON."),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show passing checks too."),
-    fail_on_bug: bool = typer.Option(True, "--fail-on-bug/--no-fail-on-bug", help="Exit non-zero when a defect is found."),
+    fail_on_bug: bool = typer.Option(
+        True, "--fail-on-bug/--no-fail-on-bug", help="Exit non-zero when a defect is found."
+    ),
 ) -> None:
     """Discover, generate, execute and triage API checks against a running app."""
     auth_headers: dict[str, str] = {}
@@ -194,7 +197,13 @@ def endpoints(
     table.add_column("auth", width=5)
 
     for endpoint in found:
-        colour = "red" if endpoint.risk_score >= 0.6 else "yellow" if endpoint.risk_score >= 0.35 else "green"
+        colour = (
+            "red"
+            if endpoint.risk_score >= 0.6
+            else "yellow"
+            if endpoint.risk_score >= 0.35
+            else "green"
+        )
         table.add_row(
             f"[{colour}]{endpoint.risk_score:.2f}[/]",
             endpoint.method,
@@ -206,7 +215,9 @@ def endpoints(
 
 @app.command()
 def evaluate(
-    fixtures: Path = typer.Option(Path("packages/fixtures"), "--fixtures", help="Fixture directory."),
+    fixtures: Path = typer.Option(
+        Path("packages/fixtures"), "--fixtures", help="Fixture directory."
+    ),
     url: str = typer.Option(..., "--url", "-u", help="Base URL of the running fixture app."),
     name: str = typer.Option("buggy-shop", "--name", help="Fixture to evaluate against."),
 ) -> None:

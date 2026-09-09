@@ -60,28 +60,39 @@ def evaluate(assertion: dict, response: dict) -> AssertionOutcome:
     if kind == "status_in":
         passed = status in (expected or [])
         return AssertionOutcome(
-            kind, passed, expected, status,
+            kind,
+            passed,
+            expected,
+            status,
             f"expected status in {expected}, got {status}",
         )
 
     if kind == "status_not_in":
         passed = status not in (expected or [])
         return AssertionOutcome(
-            kind, passed, f"not in {expected}", status,
+            kind,
+            passed,
+            f"not in {expected}",
+            status,
             f"status {status} must not be one of {expected}",
         )
 
     if kind == "body_matches":
         passed = bool(re.search(expected or "", body_text, re.IGNORECASE))
         return AssertionOutcome(
-            kind, passed, expected, _excerpt(body_text),
+            kind,
+            passed,
+            expected,
+            _excerpt(body_text),
             f"body should match /{expected}/",
         )
 
     if kind == "body_not_matches":
         match = re.search(expected or "", body_text, re.IGNORECASE)
         return AssertionOutcome(
-            kind, match is None, f"no match for {expected}",
+            kind,
+            match is None,
+            f"no match for {expected}",
             match.group(0) if match else None,
             f"body must not match /{expected}/",
         )
@@ -89,7 +100,10 @@ def evaluate(assertion: dict, response: dict) -> AssertionOutcome:
     if kind == "json_path_exists":
         found, value = _json_path(body_json, expected or "")
         return AssertionOutcome(
-            kind, found, f"path {expected} present", value,
+            kind,
+            found,
+            f"path {expected} present",
+            value,
             f"response should contain path '{expected}'",
         )
 
@@ -97,7 +111,10 @@ def evaluate(assertion: dict, response: dict) -> AssertionOutcome:
         path = assertion.get("path", "")
         found, value = _json_path(body_json, path)
         return AssertionOutcome(
-            kind, found and value == expected, {path: expected}, value,
+            kind,
+            found and value == expected,
+            {path: expected},
+            value,
             f"'{path}' should equal {expected!r}",
         )
 
@@ -105,20 +122,24 @@ def evaluate(assertion: dict, response: dict) -> AssertionOutcome:
         headers = {k.lower(): v for k, v in (response.get("headers") or {}).items()}
         name = str(expected or "").lower()
         return AssertionOutcome(
-            kind, name in headers, expected, list(headers),
+            kind,
+            name in headers,
+            expected,
+            list(headers),
             f"response should carry header '{expected}'",
         )
 
     if kind == "latency_under_ms":
         actual = response.get("duration_ms", 0)
         return AssertionOutcome(
-            kind, actual <= (expected or 0), expected, actual,
+            kind,
+            actual <= (expected or 0),
+            expected,
+            actual,
             f"response should arrive within {expected}ms, took {actual}ms",
         )
 
-    return AssertionOutcome(
-        kind, False, expected, None, f"unknown assertion type '{kind}'"
-    )
+    return AssertionOutcome(kind, False, expected, None, f"unknown assertion type '{kind}'")
 
 
 def _excerpt(text: str, limit: int = 200) -> str:

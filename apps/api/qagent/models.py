@@ -53,14 +53,14 @@ class TimestampMixin:
 # --------------------------------------------------------------------------- enums
 
 
-class EnvironmentMode(str, enum.Enum):
+class EnvironmentMode(enum.StrEnum):
     """See ADR-0001. These are the only two supported input contracts."""
 
     TARGET_URL = "target_url"
     COMPOSE = "compose"
 
 
-class RunStatus(str, enum.Enum):
+class RunStatus(enum.StrEnum):
     PENDING = "pending"
     RUNNING = "running"
     PASSED = "passed"
@@ -69,14 +69,14 @@ class RunStatus(str, enum.Enum):
     CANCELLED = "cancelled"
 
 
-class ResultStatus(str, enum.Enum):
+class ResultStatus(enum.StrEnum):
     PASSED = "passed"
     FAILED = "failed"
     SKIPPED = "skipped"
     ERROR = "error"
 
 
-class Severity(str, enum.Enum):
+class Severity(enum.StrEnum):
     CRITICAL = "critical"
     HIGH = "high"
     MEDIUM = "medium"
@@ -84,7 +84,7 @@ class Severity(str, enum.Enum):
     INFO = "info"
 
 
-class FailureClass(str, enum.Enum):
+class FailureClass(enum.StrEnum):
     """CLAUDE.md section 14. A failing test is not automatically a defect."""
 
     REAL_BUG = "real_bug"
@@ -97,7 +97,7 @@ class FailureClass(str, enum.Enum):
     UNKNOWN = "unknown"
 
 
-class TestKind(str, enum.Enum):
+class TestKind(enum.StrEnum):
     API_FUNCTIONAL = "api_functional"
     API_SECURITY = "api_security"
     E2E = "e2e"
@@ -109,7 +109,9 @@ class TestKind(str, enum.Enum):
 class Organization(Base, TimestampMixin):
     __tablename__ = "organizations"
 
-    id: Mapped[uuid.UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     slug: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
 
@@ -119,7 +121,9 @@ class Organization(Base, TimestampMixin):
 class User(Base, TimestampMixin):
     __tablename__ = "users"
 
-    id: Mapped[uuid.UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
     org_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
     )
@@ -137,7 +141,9 @@ class User(Base, TimestampMixin):
 class Project(Base, TimestampMixin):
     __tablename__ = "projects"
 
-    id: Mapped[uuid.UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
     org_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
     )
@@ -159,7 +165,9 @@ class Environment(Base, TimestampMixin):
 
     __tablename__ = "environments"
 
-    id: Mapped[uuid.UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
     org_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
     )
@@ -187,7 +195,9 @@ class ApiEndpoint(Base, TimestampMixin):
 
     __tablename__ = "api_endpoints"
 
-    id: Mapped[uuid.UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
     org_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
     )
@@ -219,7 +229,9 @@ class ApiEndpoint(Base, TimestampMixin):
 class TestSuite(Base, TimestampMixin):
     __tablename__ = "test_suites"
 
-    id: Mapped[uuid.UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
     org_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
     )
@@ -246,7 +258,9 @@ class TestCase(Base, TimestampMixin):
 
     __tablename__ = "test_cases"
 
-    id: Mapped[uuid.UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
     org_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
     )
@@ -274,7 +288,9 @@ class TestCase(Base, TimestampMixin):
 class TestRun(Base, TimestampMixin):
     __tablename__ = "test_runs"
 
-    id: Mapped[uuid.UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
     org_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
     )
@@ -307,7 +323,9 @@ class TestRun(Base, TimestampMixin):
 class TestResult(Base, TimestampMixin):
     __tablename__ = "test_results"
 
-    id: Mapped[uuid.UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
     org_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
     )
@@ -342,7 +360,9 @@ class Artifact(Base, TimestampMixin):
 
     __tablename__ = "artifacts"
 
-    id: Mapped[uuid.UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
     org_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
     )
@@ -365,7 +385,9 @@ class Artifact(Base, TimestampMixin):
 class Bug(Base, TimestampMixin):
     __tablename__ = "bugs"
 
-    id: Mapped[uuid.UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
     org_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
     )
@@ -408,7 +430,9 @@ class AgentRun(Base, TimestampMixin):
 
     __tablename__ = "agent_runs"
 
-    id: Mapped[uuid.UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
     org_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
     )
@@ -437,7 +461,9 @@ class LlmCall(Base, TimestampMixin):
 
     __tablename__ = "llm_calls"
 
-    id: Mapped[uuid.UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
     org_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
     )
@@ -461,7 +487,9 @@ class LlmCall(Base, TimestampMixin):
 class AuditLog(Base, TimestampMixin):
     __tablename__ = "audit_logs"
 
-    id: Mapped[uuid.UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
     org_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
     )

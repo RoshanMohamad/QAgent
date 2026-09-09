@@ -71,7 +71,10 @@ BUG_SCHEMA = {
         "actual": {"type": "string"},
         "root_cause": {
             "type": "string",
-            "description": "The most likely cause. Say plainly if it cannot be determined from the evidence.",
+            "description": (
+                "The most likely cause. Say plainly if it cannot be determined from the "
+                "evidence."
+            ),
         },
         "suggested_fix": {"type": "string"},
     },
@@ -89,8 +92,7 @@ def _evidence_block(spec: dict, request: dict, response: dict, failure_message: 
         f"Response status: {response.get('status')}\n"
         f"Duration: {response.get('duration_ms')}ms\n"
         f"Failed assertions: {failure_message or 'none recorded'}\n\n"
-        "Response body follows.\n"
-        + fence(body, label="response_body", max_chars=4000)
+        "Response body follows.\n" + fence(body, label="response_body", max_chars=4000)
     )
 
 
@@ -161,7 +163,9 @@ _SEVERITY_BY_CLASS = {
 }
 
 
-def _template_report(case_name: str, verdict: Verdict, spec: dict, request: dict, response: dict) -> dict:
+def _template_report(
+    case_name: str, verdict: Verdict, spec: dict, request: dict, response: dict
+) -> dict:
     """Deterministic report used when no model is configured.
 
     It is intentionally decent on its own: the pipeline must produce a usable bug
@@ -179,14 +183,15 @@ def _template_report(case_name: str, verdict: Verdict, spec: dict, request: dict
         "title": case_name,
         "severity": severity,
         "expected": spec.get("expectation", "See assertions."),
-        "actual": f"HTTP {status}" + (
-            f" - {(response.get('body_text') or '')[:200]}" if response.get("body_text") else ""
-        ),
+        "actual": f"HTTP {status}"
+        + (f" - {(response.get('body_text') or '')[:200]}" if response.get("body_text") else ""),
         "root_cause": verdict.reason,
         "suggested_fix": _fix_hint(verdict, spec),
         "steps": [
             f"Send {request.get('method')} {request.get('path')}",
-            f"Body: {json.dumps(request.get('json'))[:300]}" if request.get("json") else "No request body",
+            f"Body: {json.dumps(request.get('json'))[:300]}"
+            if request.get("json")
+            else "No request body",
             f"Observe HTTP {status}",
         ],
     }
@@ -206,12 +211,20 @@ def _fix_hint(verdict: Verdict, spec: dict) -> str:
     if verdict.failure_class is FailureClass.BAD_ASSERTION:
         return "Widen the accepted status codes in this test case to match the documented contract."
     if verdict.failure_class in {FailureClass.ENVIRONMENT, FailureClass.DEPENDENCY}:
-        return "Restore the environment or its dependency and re-run before treating this as a defect."
+        return (
+            "Restore the environment or its dependency and re-run before treating this as a defect."
+        )
     if verdict.failure_class is FailureClass.TEST_DATA:
         return "Seed the fixture this case depends on, or generate the resource within the test."
     if verdict.failure_class is FailureClass.FLAKY_TEST:
-        return "Quarantine this case and re-run it several times to confirm instability before investigating."
-    return "Reproduce manually with the request above to determine whether the application is at fault."
+        return (
+            "Quarantine this case and re-run it several times to confirm instability "
+            "before investigating."
+        )
+    return (
+        "Reproduce manually with the request above to determine whether the application "
+        "is at fault."
+    )
 
 
 def build_bug_report(

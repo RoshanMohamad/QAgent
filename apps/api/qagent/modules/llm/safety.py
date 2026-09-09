@@ -31,7 +31,10 @@ FENCE_CLOSE = "<<<END_UNTRUSTED_CONTENT>>>"
 _SECRET_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("bearer", re.compile(r"(?i)\b(bearer\s+)[A-Za-z0-9._\-]{12,}")),
     ("authorization", re.compile(r"(?i)(\"?authorization\"?\s*[:=]\s*\"?)[^\"\s,}]{12,}")),
-    ("api_key", re.compile(r"(?i)((?:api[_-]?key|secret|token|password)\"?\s*[:=]\s*\"?)[^\"\s,}]{8,}")),
+    (
+        "api_key",
+        re.compile(r"(?i)((?:api[_-]?key|secret|token|password)\"?\s*[:=]\s*\"?)[^\"\s,}]{8,}"),
+    ),
     ("anthropic", re.compile(r"sk-ant-[A-Za-z0-9\-_]{16,}")),
     ("openai", re.compile(r"sk-[A-Za-z0-9]{32,}")),
     ("aws", re.compile(r"AKIA[0-9A-Z]{16}")),
@@ -54,7 +57,12 @@ def scrub(text: str) -> str:
     for name, pattern in _SECRET_PATTERNS:
         if name in {"bearer", "authorization", "api_key", "pg_dsn"}:
             # Keep the key, drop the value.
-            text = pattern.sub(lambda m: m.group(1) + _REDACTED + (m.group(2) if m.lastindex and m.lastindex > 1 else ""), text)
+            text = pattern.sub(
+                lambda m: (
+                    m.group(1) + _REDACTED + (m.group(2) if m.lastindex and m.lastindex > 1 else "")
+                ),
+                text,
+            )
         else:
             text = pattern.sub(_REDACTED, text)
     return text

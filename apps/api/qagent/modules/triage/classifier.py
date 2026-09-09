@@ -15,10 +15,10 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 
 
-class FailureClass(str, Enum):
+class FailureClass(StrEnum):
     REAL_BUG = "real_bug"
     FLAKY_TEST = "flaky_test"
     ENVIRONMENT = "environment"
@@ -132,9 +132,7 @@ def extract_signals(
     # It must be distinguished from an ordinary failure, because a *successful*
     # response to one is an authentication bypass rather than a fussy assertion.
     is_auth_probe = (
-        request.get("auth") == "none"
-        and bool(expected)
-        and set(expected).issubset({401, 403})
+        request.get("auth") == "none" and bool(expected) and set(expected).issubset({401, 403})
     )
 
     error_kind = response.get("error")
@@ -164,7 +162,8 @@ def classify(signals: Signals) -> Verdict:
     # --- transport-level: the request never got a verdict from the application ---
     if signals.is_timeout:
         return Verdict(
-            FailureClass.NETWORK, 0.80,
+            FailureClass.NETWORK,
+            0.80,
             "The request timed out, so the application never returned a verdict. "
             "This is a network or capacity condition unless it reproduces consistently.",
             evidence=[f"timeout after {signals.duration_ms}ms"],
@@ -172,7 +171,8 @@ def classify(signals: Signals) -> Verdict:
 
     if signals.is_transport_error:
         return Verdict(
-            FailureClass.ENVIRONMENT, 0.85,
+            FailureClass.ENVIRONMENT,
+            0.85,
             "The connection could not be established, so the environment was not "
             "reachable. The application itself was never exercised.",
             evidence=["transport error before any response"],
@@ -180,7 +180,8 @@ def classify(signals: Signals) -> Verdict:
 
     if signals.has_dependency_hint and signals.is_server_error:
         return Verdict(
-            FailureClass.DEPENDENCY, 0.82,
+            FailureClass.DEPENDENCY,
+            0.82,
             "The response carries a downstream connection failure, so a dependency "
             "(database, cache or upstream service) was unavailable rather than the "
             "handler being wrong.",
@@ -195,7 +196,8 @@ def classify(signals: Signals) -> Verdict:
     # the platform can find.
     if signals.is_auth_probe and signals.status is not None and 200 <= signals.status < 300:
         return Verdict(
-            FailureClass.REAL_BUG, 0.93,
+            FailureClass.REAL_BUG,
+            0.93,
             "The endpoint served a request that carried no valid credentials. The "
             "specification advertises this operation as protected, so authentication "
             "is advertised but not enforced.",
@@ -208,7 +210,8 @@ def classify(signals: Signals) -> Verdict:
     # --- flakiness: history contradicts this result ---
     if signals.flipped_recently and not signals.is_server_error:
         return Verdict(
-            FailureClass.FLAKY_TEST, 0.72,
+            FailureClass.FLAKY_TEST,
+            0.72,
             "This case has both passed and failed recently without a corresponding "
             "change, which is the signature of a flaky test rather than a defect.",
             evidence=[f"recent history: {', '.join(signals.recent_history[-6:])}"],
@@ -217,7 +220,8 @@ def classify(signals: Signals) -> Verdict:
     # --- genuine application defects ---
     if signals.is_server_error and signals.has_stack_trace:
         return Verdict(
-            FailureClass.REAL_BUG, 0.95,
+            FailureClass.REAL_BUG,
+            0.95,
             "The handler raised an unhandled exception and leaked a stack trace. "
             "A 5xx with a trace is an application defect by definition.",
             evidence=[f"status {signals.status}", "stack trace present in response"],
@@ -225,18 +229,22 @@ def classify(signals: Signals) -> Verdict:
 
     if signals.is_server_error and signals.was_negative_case:
         return Verdict(
-            FailureClass.REAL_BUG, 0.90,
+            FailureClass.REAL_BUG,
+            0.90,
             "Deliberately invalid input produced a server error where the "
             "specification requires a client error. The handler is missing input "
             "validation.",
-            evidence=[f"status {signals.status}", f"specification expects {signals.expected_statuses}"],
+            evidence=[
+                f"status {signals.status}",
+                f"specification expects {signals.expected_statuses}",
+            ],
         )
 
     if signals.is_server_error:
         return Verdict(
-            FailureClass.REAL_BUG, 0.85,
-            "The application returned a server error for a request it documents as "
-            "supported.",
+            FailureClass.REAL_BUG,
+            0.85,
+            "The application returned a server error for a request it documents as supported.",
             evidence=[f"status {signals.status}"],
         )
 
@@ -245,7 +253,8 @@ def classify(signals: Signals) -> Verdict:
     # auth layer tested nothing, whatever it was written to assert.
     if signals.is_auth_status and not signals.auth_configured and not signals.is_auth_probe:
         return Verdict(
-            FailureClass.ENVIRONMENT, 0.78,
+            FailureClass.ENVIRONMENT,
+            0.78,
             "The endpoint rejected the request as unauthenticated and this "
             "environment has no credentials configured. The test could not reach the "
             "behaviour it was written to check.",
@@ -254,7 +263,8 @@ def classify(signals: Signals) -> Verdict:
 
     if signals.status == 404 and not signals.was_negative_case and signals.has_test_data_hint:
         return Verdict(
-            FailureClass.TEST_DATA, 0.70,
+            FailureClass.TEST_DATA,
+            0.70,
             "The target resource does not exist in this environment, so the fixture "
             "the case depends on is missing rather than the handler being wrong.",
             evidence=["status 404 with a not-found body on a positive case"],
@@ -267,7 +277,8 @@ def classify(signals: Signals) -> Verdict:
         and signals.status not in signals.expected_statuses
     ):
         return Verdict(
-            FailureClass.BAD_ASSERTION, 0.68,
+            FailureClass.BAD_ASSERTION,
+            0.68,
             "The application succeeded but with a different 2xx code than the "
             "assertion allows. This is very likely an over-specified test rather than "
             "a defect.",
@@ -275,7 +286,8 @@ def classify(signals: Signals) -> Verdict:
         )
 
     return Verdict(
-        FailureClass.UNKNOWN, 0.35,
+        FailureClass.UNKNOWN,
+        0.35,
         "No rule matched this failure with confidence. Escalating for review.",
         evidence=[f"status {signals.status}"],
     )

@@ -81,4 +81,6 @@ class TestSsrfGuard:
             guard_target("https://evil.example/", allow_private=True, allowlist=["api.example.com"])
 
     def test_allowlisted_host_passes(self):
-        guard_target("https://api.example.com/v1", allow_private=True, allowlist=["api.example.com"])
+        guard_target(
+            "https://api.example.com/v1", allow_private=True, allowlist=["api.example.com"]
+        )

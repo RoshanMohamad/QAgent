@@ -29,6 +29,13 @@ Current measured performance against the reference fixture:
 
 Reproduce these numbers yourself with the [two commands below](#try-it).
 
+**Verified:** the pipeline (discovery, generation, execution, triage, reporting), the
+CLI, the eval harness, 44 unit tests and lint — all run green without a database.
+
+**Implemented but not yet exercised end to end:** the Postgres-backed paths — schema
+creation, RLS policies, the worker and persistence. They import cleanly and the SQL is
+in `db_init.py`, but they need `docker compose up` to confirm.
+
 ---
 
 ## Why triage is the product

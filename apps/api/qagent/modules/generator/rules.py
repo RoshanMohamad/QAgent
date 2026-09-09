@@ -24,7 +24,10 @@ NO_SERVER_ERROR = {"type": "status_not_in", "value": [500, 502, 503, 504]}
 
 #: Stack traces leaking to clients are both an information disclosure and a reliable
 #: signal that an unhandled exception occurred.
-NO_STACK_TRACE = {"type": "body_not_matches", "value": r"(Traceback \(most recent call last\)|at [\w.$]+\(.*\.java:\d+\)|\bstack trace\b)"}
+NO_STACK_TRACE = {
+    "type": "body_not_matches",
+    "value": r"(Traceback \(most recent call last\)|at [\w.$]+\(.*\.java:\d+\)|\bstack trace\b)",
+}
 
 
 @dataclass
@@ -68,7 +71,11 @@ def _request(
 
 
 def _valid_path_params(endpoint: EndpointSpec) -> dict[str, str]:
-    return {p["name"]: values.path_param_value(p, valid=True) for p in endpoint.path_params if p.get("name")}
+    return {
+        p["name"]: values.path_param_value(p, valid=True)
+        for p in endpoint.path_params
+        if p.get("name")
+    }
 
 
 def _required_query(endpoint: EndpointSpec) -> dict[str, Any]:
@@ -89,7 +96,10 @@ def case_happy_path(endpoint: EndpointSpec) -> GeneratedCase:
         name=f"{endpoint.key()} returns {expected} for a valid request",
         kind="api_functional",
         endpoint_key=endpoint.key(),
-        rationale="Baseline: the documented success path must work before anything else is meaningful.",
+        rationale=(
+            "Baseline: the documented success path must work before anything else is "
+            "meaningful."
+        ),
         spec={
             "request": _request(
                 endpoint,
@@ -124,10 +134,16 @@ def case_missing_required_field(endpoint: EndpointSpec) -> GeneratedCase | None:
         name=f"{endpoint.key()} rejects a body missing '{dropped}'",
         kind="api_functional",
         endpoint_key=endpoint.key(),
-        rationale=f"'{dropped}' is declared required; omitting it must be a client error, not a crash.",
+        rationale=(
+            f"'{dropped}' is declared required; omitting it must be a client error, "
+            "not a crash."
+        ),
         spec={
             "request": _request(
-                endpoint, path_params=_valid_path_params(endpoint), query=_required_query(endpoint), body=body
+                endpoint,
+                path_params=_valid_path_params(endpoint),
+                query=_required_query(endpoint),
+                body=body,
             ),
             "assertions": [
                 {"type": "status_in", "value": [400, 409, 422]},
@@ -156,14 +172,19 @@ def case_wrong_field_type(endpoint: EndpointSpec) -> GeneratedCase | None:
         rationale="Type confusion in a handler is a common source of unhandled exceptions.",
         spec={
             "request": _request(
-                endpoint, path_params=_valid_path_params(endpoint), query=_required_query(endpoint), body=body
+                endpoint,
+                path_params=_valid_path_params(endpoint),
+                query=_required_query(endpoint),
+                body=body,
             ),
             "assertions": [
                 {"type": "status_in", "value": [400, 409, 422]},
                 NO_SERVER_ERROR,
                 NO_STACK_TRACE,
             ],
-            "expectation": f"A value of the wrong type for '{target}' returns a 4xx validation error.",
+            "expectation": (
+                f"A value of the wrong type for '{target}' returns a 4xx validation error."
+            ),
         },
     )
 
@@ -184,15 +205,21 @@ def case_malformed_path_param(endpoint: EndpointSpec) -> GeneratedCase | None:
         rationale="Identifiers are routinely cast without guarding, turning bad input into a 500.",
         spec={
             "request": _request(
-                endpoint, path_params=path_params, query=_required_query(endpoint),
-                body=values.example_body(endpoint.request_schema) if endpoint.request_schema else None,
+                endpoint,
+                path_params=path_params,
+                query=_required_query(endpoint),
+                body=values.example_body(endpoint.request_schema)
+                if endpoint.request_schema
+                else None,
             ),
             "assertions": [
                 {"type": "status_in", "value": [400, 404, 422]},
                 NO_SERVER_ERROR,
                 NO_STACK_TRACE,
             ],
-            "expectation": f"A malformed '{target['name']}' returns 400 or 404, never a server error.",
+            "expectation": (
+                f"A malformed '{target['name']}' returns 400 or 404, never a server error."
+            ),
         },
     )
 
@@ -210,11 +237,18 @@ def case_absent_resource(endpoint: EndpointSpec) -> GeneratedCase | None:
         name=f"{endpoint.key()} returns 404 for an absent resource",
         kind="api_functional",
         endpoint_key=endpoint.key(),
-        rationale="A well-formed identifier for a row that does not exist must not crash the handler.",
+        rationale=(
+            "A well-formed identifier for a row that does not exist must not crash the "
+            "handler."
+        ),
         spec={
             "request": _request(
-                endpoint, path_params=path_params, query=_required_query(endpoint),
-                body=values.example_body(endpoint.request_schema) if endpoint.request_schema else None,
+                endpoint,
+                path_params=path_params,
+                query=_required_query(endpoint),
+                body=values.example_body(endpoint.request_schema)
+                if endpoint.request_schema
+                else None,
             ),
             "assertions": [
                 {"type": "status_in", "value": [400, 403, 404, 410]},
@@ -242,8 +276,12 @@ def case_unauthenticated(endpoint: EndpointSpec) -> GeneratedCase | None:
         rationale="The specification marks this operation as protected.",
         spec={
             "request": _request(
-                endpoint, path_params=_valid_path_params(endpoint), query=_required_query(endpoint),
-                body=values.example_body(endpoint.request_schema) if endpoint.request_schema else None,
+                endpoint,
+                path_params=_valid_path_params(endpoint),
+                query=_required_query(endpoint),
+                body=values.example_body(endpoint.request_schema)
+                if endpoint.request_schema
+                else None,
                 auth="none",
             ),
             "assertions": [
@@ -267,8 +305,12 @@ def case_invalid_token(endpoint: EndpointSpec) -> GeneratedCase | None:
         spec={
             "request": {
                 **_request(
-                    endpoint, path_params=_valid_path_params(endpoint), query=_required_query(endpoint),
-                    body=values.example_body(endpoint.request_schema) if endpoint.request_schema else None,
+                    endpoint,
+                    path_params=_valid_path_params(endpoint),
+                    query=_required_query(endpoint),
+                    body=values.example_body(endpoint.request_schema)
+                    if endpoint.request_schema
+                    else None,
                     auth="none",
                 ),
                 "headers": {

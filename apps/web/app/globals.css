@@ -1,0 +1,106 @@
+@import "tailwindcss";
+
+/*
+ * Palette values are the validated reference instance from the data-viz
+ * guidance, used unchanged. Dark is a selected set of steps for the dark
+ * surface, not an automatic inversion.
+ *
+ * Status colors (good/warning/serious/critical) are fixed across both modes and
+ * are never reused as series colors. They always ship beside a text label, so
+ * state is never carried by color alone.
+ */
+
+:root {
+  color-scheme: light;
+
+  --surface-page: #f4f3f0;
+  --surface-1: #fcfcfb;
+  --surface-2: #ffffff;
+  --border: #e3e2dd;
+  --border-strong: #cfcec8;
+
+  --text-primary: #0b0b0b;
+  --text-secondary: #52514e;
+  --text-muted: #7a7975;
+
+  /* Categorical slot 1. The dashboard is an emphasis design: one accent hue
+     plus a de-emphasis gray, so no second series color is needed. */
+  --accent: #2a78d6;
+  --accent-soft: #cde2fb;
+  --de-emphasis: #d6d5d0;
+
+  --good: #0ca30c;
+  --warning: #fab219;
+  --serious: #ec835a;
+  --critical: #d03b3b;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+
+    --surface-page: #121211;
+    --surface-1: #1a1a19;
+    --surface-2: #232322;
+    --border: #302f2d;
+    --border-strong: #43433f;
+
+    --text-primary: #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted: #918f86;
+
+    --accent: #3987e5;
+    --accent-soft: #184f95;
+    --de-emphasis: #43433f;
+  }
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --surface-page: #121211;
+  --surface-1: #1a1a19;
+  --surface-2: #232322;
+  --border: #302f2d;
+  --border-strong: #43433f;
+
+  --text-primary: #ffffff;
+  --text-secondary: #c3c2b7;
+  --text-muted: #918f86;
+
+  --accent: #3987e5;
+  --accent-soft: #184f95;
+  --de-emphasis: #43433f;
+}
+
+body {
+  background: var(--surface-page);
+  color: var(--text-primary);
+  font-family:
+    ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica,
+    Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Columns of numbers must align; large standalone figures must not. */
+.tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Bars grow from a single baseline with a rounded data-end and a square root. */
+.bar-track {
+  background: color-mix(in srgb, var(--de-emphasis) 35%, transparent);
+  border-radius: 2px;
+}
+
+.bar-fill {
+  border-radius: 0 4px 4px 0;
+  height: 100%;
+  min-width: 3px;
+  transition: width 200ms ease-out;
+}
+
+/* Wide content scrolls inside its own container; the page never scrolls sideways. */
+.scroll-x {
+  overflow-x: auto;
+}

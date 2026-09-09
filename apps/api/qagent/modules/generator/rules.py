@@ -97,8 +97,7 @@ def case_happy_path(endpoint: EndpointSpec) -> GeneratedCase:
         kind="api_functional",
         endpoint_key=endpoint.key(),
         rationale=(
-            "Baseline: the documented success path must work before anything else is "
-            "meaningful."
+            "Baseline: the documented success path must work before anything else is meaningful."
         ),
         spec={
             "request": _request(
@@ -135,8 +134,7 @@ def case_missing_required_field(endpoint: EndpointSpec) -> GeneratedCase | None:
         kind="api_functional",
         endpoint_key=endpoint.key(),
         rationale=(
-            f"'{dropped}' is declared required; omitting it must be a client error, "
-            "not a crash."
+            f"'{dropped}' is declared required; omitting it must be a client error, not a crash."
         ),
         spec={
             "request": _request(
@@ -238,8 +236,7 @@ def case_absent_resource(endpoint: EndpointSpec) -> GeneratedCase | None:
         kind="api_functional",
         endpoint_key=endpoint.key(),
         rationale=(
-            "A well-formed identifier for a row that does not exist must not crash the "
-            "handler."
+            "A well-formed identifier for a row that does not exist must not crash the handler."
         ),
         spec={
             "request": _request(

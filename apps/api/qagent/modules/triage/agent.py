@@ -72,8 +72,7 @@ BUG_SCHEMA = {
         "root_cause": {
             "type": "string",
             "description": (
-                "The most likely cause. Say plainly if it cannot be determined from the "
-                "evidence."
+                "The most likely cause. Say plainly if it cannot be determined from the evidence."
             ),
         },
         "suggested_fix": {"type": "string"},
@@ -186,7 +185,7 @@ def _template_report(
         "actual": f"HTTP {status}"
         + (f" - {(response.get('body_text') or '')[:200]}" if response.get("body_text") else ""),
         "root_cause": verdict.reason,
-        "suggested_fix": _fix_hint(verdict, spec),
+        "suggested_fix": _fix_hint(verdict, spec, status),
         "steps": [
             f"Send {request.get('method')} {request.get('path')}",
             f"Body: {json.dumps(request.get('json'))[:300]}"
@@ -201,8 +200,21 @@ def signals_is_security(spec: dict) -> bool:
     return spec.get("kind") == "api_security"
 
 
-def _fix_hint(verdict: Verdict, spec: dict) -> str:
+def _fix_hint(verdict: Verdict, spec: dict, status: int | None = None) -> str:
     if verdict.failure_class is FailureClass.REAL_BUG:
+        # An access-control failure and an unhandled crash need opposite advice.
+        # Telling someone to add input validation when their endpoint is serving
+        # anonymous callers is worse than saying nothing: it sends them to the
+        # wrong layer entirely.
+        served_without_credentials = (
+            signals_is_security(spec) and status is not None and 200 <= status < 300
+        )
+        if served_without_credentials:
+            return (
+                "Enforce the security scheme this operation advertises. The credential "
+                "is currently parsed but never verified, so reject the request before "
+                "the handler runs when it is absent, malformed or unsigned."
+            )
         return (
             "Validate and reject the input before it reaches business logic, and map "
             "the resulting error to the documented 4xx status rather than allowing the "

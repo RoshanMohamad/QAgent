@@ -159,3 +159,50 @@ def test_server_errors_are_never_classified_as_test_problems(status):
     )
     verdict = classify(signals)
     assert verdict.failure_class in {FailureClass.REAL_BUG, FailureClass.DEPENDENCY}
+
+
+class TestSuggestedFix:
+    """A wrong suggested fix sends the developer to the wrong layer entirely.
+
+    Caught by rendering real defect reports in the dashboard: every real_bug was
+    receiving input-validation advice, including the authentication bypasses.
+    """
+
+    @staticmethod
+    def _report(kind, status, failure_class=FailureClass.REAL_BUG):
+        from qagent.config import get_settings
+        from qagent.modules.llm.budget import Budget
+        from qagent.modules.llm.client import LlmClient
+        from qagent.modules.llm.providers import NullProvider
+        from qagent.modules.triage.agent import build_bug_report
+        from qagent.modules.triage.classifier import Verdict
+
+        client = LlmClient(
+            settings=get_settings(),
+            provider=NullProvider(),
+            budget=Budget(10, 1000, 1.0),
+        )
+        return build_bug_report(
+            case_name="check",
+            verdict=Verdict(failure_class, 0.93, "reason"),
+            spec={"kind": kind, "expectation": "e", "assertions": []},
+            request={"method": "GET", "path": "/admin/users"},
+            response={"status": status, "body_text": ""},
+            failure_message=None,
+            llm=client,
+        )
+
+    def test_auth_bypass_is_told_to_enforce_the_scheme(self):
+        fix = self._report("api_security", 200)["suggested_fix"]
+        assert "enforce" in fix.lower()
+        assert "input" not in fix.lower()
+
+    def test_unhandled_crash_is_told_to_validate_input(self):
+        fix = self._report("api_functional", 500)["suggested_fix"]
+        assert "validate" in fix.lower()
+
+    def test_security_defect_is_critical(self):
+        assert self._report("api_security", 200)["severity"] == "critical"
+
+    def test_functional_defect_is_high(self):
+        assert self._report("api_functional", 500)["severity"] == "high"

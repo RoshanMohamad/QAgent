@@ -14,8 +14,9 @@ Discover  →  Generate  →  Execute  →  Triage  →  Report
 
 ## Status
 
-Phase 1 (API quality loop) is implemented and measured. The browser/E2E layer, the
-dashboard and repository provisioning are not yet built — see [Roadmap](#roadmap).
+Phase 1 (API quality loop) and the dashboard are implemented and measured. The
+browser/E2E layer and repository provisioning are not yet built — see
+[Roadmap](#roadmap).
 
 Current measured performance against the reference fixture:
 
@@ -30,11 +31,13 @@ Current measured performance against the reference fixture:
 Reproduce these numbers yourself with the [two commands below](#try-it).
 
 **Verified:** the pipeline (discovery, generation, execution, triage, reporting), the
-CLI, the eval harness, 44 unit tests and lint — all run green without a database.
+CLI, the eval harness, 48 unit tests and lint — all run green without a database. The
+dashboard was rendered against real pipeline output through the documented API
+contract: all three pages, the setup state, and the failure-analysis chart.
 
 **Implemented but not yet exercised end to end:** the Postgres-backed paths — schema
 creation, RLS policies, the worker and persistence. They import cleanly and the SQL is
-in `db_init.py`, but they need `docker compose up` to confirm.
+in `db_init.py`, but confirming them needs a working Docker daemon.
 
 ---
 
@@ -109,6 +112,27 @@ Full stack (Postgres, Redis, API, worker):
 cp .env.example .env
 docker compose up --build
 ```
+
+### Dashboard
+
+```bash
+cd apps/web
+npm install
+cp .env.example .env.local     # set QAGENT_ORG_ID
+npm run dev                    # http://localhost:3000
+```
+
+It reads the API and shows the pass rate, open defects by severity, the quality
+gate decision, per-run failure analysis and full defect reports. Unconfigured or
+unreachable, it says exactly what is wrong rather than rendering a shell of
+zeroes - a dashboard reporting 0 defects because it cannot connect is worse than
+no dashboard.
+
+The failure-analysis chart is an **emphasis** design, not a categorical one: the
+reader's question is "how many of these are actually my fault", so `real_bug`
+carries the accent and every other class is de-emphasis gray. Spending eight
+hues there would make the answer harder to see. Every bar is direct-labelled and
+the same numbers are available as a table, so identity never rests on color.
 
 ---
 
@@ -225,6 +249,8 @@ apps/api/qagent/
 │   └── llm/               providers, budgets, safety boundary
 ├── eval/harness.py        scores the pipeline against ground truth
 └── worker/tasks.py        Celery
+apps/web/                  Next.js dashboard (server components, no client fetching)
+apps/web/                  Next.js dashboard (server components, no client fetching)
 packages/fixtures/         apps with labelled, seeded defects
 docs/decisions/            ADRs
 ```
@@ -232,7 +258,7 @@ docs/decisions/            ADRs
 ## Tests
 
 ```bash
-cd apps/api && pytest tests -q     # 44 tests
+cd apps/api && pytest tests -q     # 48 tests
 ```
 
 CI runs lint, unit tests, **and the evaluation harness** — a change that degrades
@@ -242,15 +268,14 @@ detection or raises false positives fails the build.
 
 ## Roadmap
 
-Phase 1 is done. In order:
+Phase 1 and the dashboard are done. In order:
 
-1. **Dashboard** — Next.js UI over the existing API.
-2. **`compose` mode** — bring a repository's stack up, seed, run, tear down (ADR-0001).
-3. **Route parsing** — discover endpoints in projects with no OpenAPI document.
-4. **Browser E2E** — Playwright, once API triage is trustworthy (ADR-0002).
-5. **Explorer agent** — state graph, autonomous exploration.
-6. **Self-healing selectors** — proposal and approval flow, never silent rewrites.
-7. **Issue tracker sync** — defect loop out to Jira / GitHub Issues.
+1. **`compose` mode** — bring a repository's stack up, seed, run, tear down (ADR-0001).
+2. **Route parsing** — discover endpoints in projects with no OpenAPI document.
+3. **Browser E2E** — Playwright, once API triage is trustworthy (ADR-0002).
+4. **Explorer agent** — state graph, autonomous exploration.
+5. **Self-healing selectors** — proposal and approval flow, never silent rewrites.
+6. **Issue tracker sync** — defect loop out to Jira / GitHub Issues.
 
 More fixtures are the highest-leverage work at any point: every metric above is only
 as trustworthy as the ground truth behind it.

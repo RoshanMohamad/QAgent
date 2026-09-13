@@ -14,9 +14,11 @@ Discover  →  Generate  →  Execute  →  Triage  →  Report
 
 ## Status
 
-Phase 1 (API quality loop) and the dashboard are implemented and measured. The
-browser/E2E layer and repository provisioning are not yet built — see
-[Roadmap](#roadmap).
+Phase 1 (API quality loop), the dashboard, `compose` mode, static route parsing,
+a first browser E2E layer, an Explorer Agent MVP (link-crawl only), self-healing
+selector proposals, and issue tracker sync (GitHub and Jira) are implemented and
+measured. The remaining open piece is interactive exploration (form filling,
+clicking, and inferred state transitions) — see [Roadmap](#roadmap).
 
 Current measured performance against the reference fixture:
 
@@ -102,9 +104,155 @@ Other commands:
 qagent endpoints --url http://127.0.0.1:8080     # discovered surface, ranked by risk
 qagent scan --url ... --json out.json            # machine-readable results
 qagent scan --url ... -H "Authorization: Bearer $TOKEN"
+qagent scan --url ... --repo ./path/to/checkout  # fall back to route parsing if no OpenAPI doc
 ```
 
 `qagent scan` exits non-zero when a defect is found, so it drops straight into CI.
+
+### Compose mode
+
+For a repository that ships its own `docker-compose.yml` (ADR-0001), QAgent can
+own the whole lifecycle instead of requiring an already-running target:
+
+```bash
+qagent scan-repo --compose ./docker-compose.yml --service api --port 8080
+```
+
+This brings the stack up (`docker compose up -d --build --wait`), polls the named
+service until it answers with a non-5xx status, runs the identical pipeline used
+by `qagent scan`, and tears the stack down (`docker compose down -v`) whether the
+run succeeded, failed, or the pipeline itself raised. No new code path: the same
+`run_pipeline` function backs both commands, so this is provisioning bolted onto
+the existing loop, not a second loop to keep in sync.
+
+### Browser E2E
+
+For the frontend, a first check that needs an actual browser rather than an HTTP
+client — no clicking, no generated selectors (that's the Explorer Agent, later):
+
+```bash
+pip install -e ./apps/api[e2e] && playwright install chromium
+
+qagent scan-ui --url http://localhost:3000 --route /login --route /dashboard
+```
+
+Each page is loaded and flagged if it responds with a 5xx, throws an uncaught JS
+exception, or logs a console error. That's still unambiguous evidence of a
+defect — there's no selector here to go stale — so it doesn't reintroduce the
+flake ADR-0002 kept out of the API layer.
+
+### Explorer agent (MVP)
+
+`--route` requires the operator to already know every page. The explorer finds
+the ones nobody listed by crawling same-origin `<a href>` links breadth-first
+and building a state graph — no form filling or clicking yet (CLAUDE.md §8-9
+describes that fuller loop; this is the tractable first slice of it):
+
+```bash
+qagent explore --url http://localhost:3000 --max-pages 25 --check
+```
+
+`--check` feeds every discovered page straight into the same page-load checks
+`scan-ui` runs, so one command answers both "what does this app actually have"
+and "does any of it throw."
+
+The same crawl-then-check stage runs inside `run_pipeline` itself when an
+environment has `e2e_enabled: true` (set on `POST .../environments`), which is
+what makes it part of a persisted `Run QA` rather than a CLI-only side tool: a
+failed page check joins the same `test_results`/`bugs` tables as an API result,
+so it shows up in the dashboard and the quality gate exactly like one. It
+degrades to a recorded, non-fatal skip when Playwright isn't installed on the
+worker, rather than failing the whole run.
+
+### Self-healing selectors
+
+When a selector a test relies on stops matching, QAgent proposes a replacement
+by comparing what the old selector *meant* (its id, `data-testid`, label, text)
+against every element still on the page — never by DOM position, and never by
+rewriting the test itself (CLAUDE.md §11):
+
+```bash
+qagent heal-selectors --url http://localhost:3000/checkout \
+  --selector 'button[data-testid="checkout"]'
+```
+
+Below the confidence threshold (0.7 by default) it reports "no confident
+match" rather than a guess — a wrong high-confidence proposal is worse than an
+honest failure, since a human reviews either way. Every proposal is printed for
+manual approval; nothing here ever touches a test file.
+
+### Security scanning
+
+Static analysis, not a live-target scanner (CLAUDE.md §16) — QAgent shells out
+to Semgrep rather than reimplementing SAST rule coverage:
+
+```bash
+pip install -e ./apps/api[security]   # or a system semgrep install
+
+qagent security --repo . --fail-on high
+```
+
+Semgrep's own ERROR/WARNING/INFO severities map to
+critical/high/medium/low/info; a SQL-injection- or access-control-shaped
+finding (OWASP A01/A03) is promoted to critical regardless of Semgrep's label,
+since those are the two classes CLAUDE.md calls out by name. `--fail-on` sets
+the CI gate: exit non-zero at or above that severity. Because this is static
+analysis - it parses source, it never executes it - none of the sandboxing
+section 22 requires for the runner/browser/explorer stages applies here, so it
+also runs synchronously via `POST /api/v1/projects/{id}/security/scan` (given
+a `repo_path` readable by the API process), persisting findings the same way a
+bug does: they show up in the dashboard and count toward the quality gate.
+
+### Performance testing
+
+Load testing against a live target via k6 (CLAUDE.md §17):
+
+```bash
+# k6 is a standalone Go binary, not a Python package — install it separately:
+# https://grafana.com/docs/k6/latest/set-up/install-k6/
+
+qagent perf --url http://localhost:8080 --vus 100,500,1000,5000 --duration 30
+```
+
+Runs one scenario per VU level, sequentially — so degradation as load rises is
+visible scenario-to-scenario rather than confounded by several scenarios
+hitting the same target at once. Only GET requests against `--path` (default
+`/`) are ever sent, never a discovered POST/PUT/DELETE endpoint: guessing at a
+destructive path under sustained concurrent load needs a human to opt in.
+Measures latency, throughput and error rate from the client side; CPU/memory
+(also named in CLAUDE.md §17) need an agent on the target host, which a load
+*generator* has no way to provide, so they're out of scope by necessity, not
+oversight. `--max-failed-rate`/`--max-p95-ms` set the CI gate per scenario.
+
+Unlike the security scan, this sends real sustained traffic to a live target
+for potentially minutes, so `POST /api/v1/projects/{id}/performance/scan`
+queues it on the same Celery worker that runs a regular scan rather than
+running inline. Scenarios from one load test share a single database
+transaction (and therefore one `created_at`), which is what the quality gate
+uses to mean "the latest load test" — a load test failing once in the past
+does not block every deploy after it, only its own latest run.
+
+### Issue tracker sync
+
+Turn a scan's defects into tracked GitHub issues instead of leaving them in a
+JSON file:
+
+```bash
+qagent scan --url http://127.0.0.1:8080 --json out.json
+qagent report-issues --json out.json --repo your-org/your-repo --label bug
+```
+
+Additive only: it never edits, closes, or comments on an issue a human already
+owns, and a bug already filed (matched by its title) is skipped, never
+duplicated, on the next run. `--dry-run` shows what would be filed without a
+token or a network call.
+
+The same contract ships for Jira:
+
+```bash
+qagent report-issues-jira --json out.json \
+  --base-url https://your-org.atlassian.net --project QA
+```
 
 Full stack (Postgres, Redis, API, worker):
 
@@ -118,12 +266,17 @@ docker compose up --build
 ```bash
 cd apps/web
 npm install
-cp .env.example .env.local     # set QAGENT_ORG_ID
+cp .env.example .env.local     # set QAGENT_API_URL
 npm run dev                    # http://localhost:3000
 ```
 
+Visiting it redirects to `/login`, where you can create an organization (or sign
+in to an existing one). The dashboard authenticates against the API with a
+bearer token issued by `POST /api/v1/auth/login`, stored as an httpOnly cookie -
+there is no `QAGENT_ORG_ID` to configure any more.
+
 It reads the API and shows the pass rate, open defects by severity, the quality
-gate decision, per-run failure analysis and full defect reports. Unconfigured or
+gate decision, per-run failure analysis and full defect reports. Signed out or
 unreachable, it says exactly what is wrong rather than rendering a shell of
 zeroes - a dashboard reporting 0 defects because it cannot connect is worse than
 no dashboard.
@@ -144,6 +297,15 @@ An OpenAPI document is fetched from an explicit URL or probed at seven common
 locations, then flattened into endpoints with local `$ref`s resolved. Every endpoint
 gets a **risk score** from its method, path and security declaration, and generation
 works down that ranking — so a truncated budget still covers what matters.
+
+When no document can be found and `--repo` (or `scan-repo`'s compose checkout) is
+given, discovery falls back to **static route parsing**: an AST walk over Python
+source for FastAPI/Flask-style decorators (`@app.get("/x")`,
+`@app.route("/x", methods=[...])`) and a scan of JS/TS source for Express-style
+calls (`router.post("/x", ...)`). This is deliberately narrow — only literal route
+strings in a recognised call shape are found, never a dynamically built path or a
+route table loaded from config — but recovering *some* of the surface beats
+requiring every project to publish an OpenAPI document before QAgent is useful.
 
 ### 2. Generate
 
@@ -242,14 +404,19 @@ apps/api/qagent/
 ├── models.py              schema, org_id + RLS on every tenant table
 ├── cli.py                 qagent scan | endpoints | evaluate
 ├── modules/
-│   ├── discovery/         OpenAPI ingestion, risk scoring
+│   ├── discovery/         OpenAPI ingestion, static route parsing, risk scoring
 │   ├── generator/         deterministic rules + value synthesis
 │   ├── runner/            SSRF-guarded execution, assertions
 │   ├── triage/            failure classification, bug reports
+│   ├── provisioning/      compose mode: stack lifecycle, health wait
+│   ├── browser/           Playwright page-load checks + selector healing (`e2e` extra)
+│   ├── explorer/          BFS link-crawl, application state graph
+│   ├── security/          Semgrep SAST wrapper (`security` extra)
+│   ├── performance/       k6 load-test wrapper (standalone binary, no extra)
+│   ├── integrations/      GitHub Issues + Jira sync
 │   └── llm/               providers, budgets, safety boundary
 ├── eval/harness.py        scores the pipeline against ground truth
 └── worker/tasks.py        Celery
-apps/web/                  Next.js dashboard (server components, no client fetching)
 apps/web/                  Next.js dashboard (server components, no client fetching)
 packages/fixtures/         apps with labelled, seeded defects
 docs/decisions/            ADRs
@@ -258,7 +425,7 @@ docs/decisions/            ADRs
 ## Tests
 
 ```bash
-cd apps/api && pytest tests -q     # 48 tests
+cd apps/api && pytest tests -q     # 112 tests
 ```
 
 CI runs lint, unit tests, **and the evaluation harness** — a change that degrades
@@ -268,14 +435,18 @@ detection or raises false positives fails the build.
 
 ## Roadmap
 
-Phase 1 and the dashboard are done. In order:
+Phase 1, the dashboard, `compose` mode, route parsing, a first browser E2E
+layer, an Explorer Agent MVP (link-crawl, no interaction), self-healing
+selector proposals, and GitHub + Jira issue sync are done. What's left:
 
-1. **`compose` mode** — bring a repository's stack up, seed, run, tear down (ADR-0001).
-2. **Route parsing** — discover endpoints in projects with no OpenAPI document.
-3. **Browser E2E** — Playwright, once API triage is trustworthy (ADR-0002).
-4. **Explorer agent** — state graph, autonomous exploration.
-5. **Self-healing selectors** — proposal and approval flow, never silent rewrites.
-6. **Issue tracker sync** — defect loop out to Jira / GitHub Issues.
+1. **Explorer agent, interaction** — form filling, clicking, inferred state
+   transitions beyond "this page links to that page." This is the one
+   remaining item that's genuinely open-ended: choosing which button to click
+   *meaningfully* (not at random) needs either heuristics tied to element
+   semantics or a model in the loop, and either way needs the state graph's
+   dead ends and duplicate states worked out first. Everything else on the
+   original roadmap (CLAUDE.md phases 1-5, minus multi-tenant infra) now has a
+   working, tested implementation.
 
 More fixtures are the highest-leverage work at any point: every metric above is only
 as trustworthy as the ground truth behind it.

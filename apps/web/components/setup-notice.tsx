@@ -1,3 +1,4 @@
+import Link from "next/link";
 import type { ApiError } from "@/lib/api";
 
 /**
@@ -15,6 +16,7 @@ export function SetupNotice({
   configured: boolean;
 }) {
   const unreachable = error.status === 503;
+  const needsSignIn = !configured || error.status === 401;
 
   return (
     <div
@@ -26,8 +28,8 @@ export function SetupNotice({
       }}
     >
       <h2 className="text-sm font-semibold">
-        {!configured
-          ? "The dashboard is not configured yet"
+        {needsSignIn
+          ? "You're not signed in"
           : unreachable
             ? "Cannot reach the QAgent API"
             : "The API returned an error"}
@@ -38,21 +40,13 @@ export function SetupNotice({
       </p>
 
       <div className="mt-3 text-xs" style={{ color: "var(--text-secondary)" }}>
-        {!configured ? (
-          <>
-            <p>Create an organization, then put its id in the environment:</p>
-            <pre
-              className="scroll-x mt-2 rounded border px-3 py-2"
-              style={{
-                background: "var(--surface-2)",
-                borderColor: "var(--border)",
-              }}
-            >
-              {`# apps/web/.env.local
-QAGENT_API_URL=${baseUrl}
-QAGENT_ORG_ID=<your organization uuid>`}
-            </pre>
-          </>
+        {needsSignIn ? (
+          <p>
+            <Link href="/login" className="underline">
+              Sign in or create an organization
+            </Link>{" "}
+            to view this dashboard.
+          </p>
         ) : (
           <>
             <p>Start the API and its dependencies:</p>
@@ -65,6 +59,9 @@ QAGENT_ORG_ID=<your organization uuid>`}
             >
               docker compose up postgres redis api
             </pre>
+            <p className="mt-2">
+              API base URL: <code>{baseUrl}</code>
+            </p>
           </>
         )}
       </div>

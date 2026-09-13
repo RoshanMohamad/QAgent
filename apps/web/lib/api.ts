@@ -3,12 +3,14 @@ import type {
   DashboardSummary,
   Project,
   QualityGate,
+  PerformanceRun,
   Result,
   Run,
+  SecurityFinding,
 } from "./types";
+import { getToken } from "./session";
 
 const BASE_URL = process.env.QAGENT_API_URL ?? "http://127.0.0.1:8000";
-const ORG_ID = process.env.QAGENT_ORG_ID ?? "";
 
 export class ApiError extends Error {
   constructor(
@@ -25,14 +27,15 @@ export class ApiError extends Error {
  * no longer hold.
  */
 async function get<T>(path: string): Promise<T> {
-  if (!ORG_ID) {
-    throw new ApiError("QAGENT_ORG_ID is not configured", 401);
+  const token = await getToken();
+  if (!token) {
+    throw new ApiError("Not signed in", 401);
   }
 
   let response: Response;
   try {
     response = await fetch(`${BASE_URL}${path}`, {
-      headers: { "X-Org-Id": ORG_ID },
+      headers: { Authorization: `Bearer ${token}` },
       cache: "no-store",
     });
   } catch (cause) {
@@ -52,6 +55,10 @@ export const api = {
   dashboard: () => get<DashboardSummary>("/api/v1/dashboard"),
   projects: () => get<Project[]>("/api/v1/projects"),
   bugs: (projectId: string) => get<Bug[]>(`/api/v1/projects/${projectId}/bugs`),
+  securityFindings: (projectId: string) =>
+    get<SecurityFinding[]>(`/api/v1/projects/${projectId}/security`),
+  performanceRuns: (projectId: string) =>
+    get<PerformanceRun[]>(`/api/v1/projects/${projectId}/performance`),
   quality: (projectId: string) =>
     get<QualityGate>(`/api/v1/projects/${projectId}/quality`),
   run: (runId: string) => get<Run>(`/api/v1/runs/${runId}`),
@@ -76,8 +83,8 @@ export async function settle<T>(
   }
 }
 
-export function isConfigured(): boolean {
-  return Boolean(ORG_ID);
+export async function isConfigured(): Promise<boolean> {
+  return Boolean(await getToken());
 }
 
 export function apiBaseUrl(): string {

@@ -1,17 +1,21 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import "./globals.css";
+import { getToken } from "@/lib/session";
+import { SignOutButton } from "@/components/sign-out-button";
 
 export const metadata: Metadata = {
   title: "QAgent",
   description: "Autonomous AI software quality engineering platform.",
 };
 
-export default function RootLayout({
+export default async function RootLayout({
   children,
 }: {
   children: React.ReactNode;
 }) {
+  const signedIn = Boolean(await getToken());
+
   return (
     <html lang="en">
       <body className="min-h-screen">
@@ -31,9 +35,12 @@ export default function RootLayout({
               />
               <span className="text-sm font-semibold">QAgent</span>
             </Link>
-            <p className="text-xs" style={{ color: "var(--text-muted)" }}>
-              Quality engineering
-            </p>
+            <div className="flex items-center gap-4">
+              <p className="text-xs" style={{ color: "var(--text-muted)" }}>
+                Quality engineering
+              </p>
+              {signedIn ? <SignOutButton /> : null}
+            </div>
           </div>
         </header>
 

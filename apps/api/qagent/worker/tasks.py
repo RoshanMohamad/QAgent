@@ -19,7 +19,12 @@ from qagent import models
 from qagent.config import get_settings
 from qagent.db import session_scope
 from qagent.modules.llm.client import LlmClient
-from qagent.persistence import persist_agent_run, persist_result, recent_history
+from qagent.persistence import (
+    persist_agent_run,
+    persist_performance_runs,
+    persist_result,
+    recent_history,
+)
 from qagent.pipeline import run_pipeline
 
 logger = logging.getLogger(__name__)
@@ -63,6 +68,7 @@ def run_scan(self, org_id: str, project_id: str, run_id: str) -> dict:
         base_url = environment.base_url
         openapi_url = environment.openapi_url
         headers = dict(environment.default_headers or {})
+        run_e2e = environment.e2e_enabled
         history = recent_history(session, org, project)
 
     llm = LlmClient.from_settings(settings)
@@ -78,6 +84,7 @@ def run_scan(self, org_id: str, project_id: str, run_id: str) -> dict:
             allowlist=settings.egress_allowlist,
             llm=llm,
             history=history,
+            run_e2e=run_e2e,
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception("scan failed")
@@ -101,6 +108,66 @@ def run_scan(self, org_id: str, project_id: str, run_id: str) -> dict:
         )
 
     return result.summary()
+
+
+@celery_app.task(
+    bind=True,
+    name="qagent.run_performance_test",
+    max_retries=1,
+    time_limit=3600,
+    soft_time_limit=3300,
+)
+def run_performance_test(
+    self,
+    org_id: str,
+    project_id: str,
+    base_url: str,
+    vus_levels: list[int],
+    duration_seconds: float,
+    paths: list[str] | None,
+    max_failed_rate: float,
+    max_p95_ms: float,
+) -> dict:
+    """Run a k6 load test and persist one row per VU-level scenario.
+
+    Sends sustained real traffic to a live target for potentially minutes, which
+    is exactly the kind of long, network-bound work ADR-0001 keeps out of a
+    request - same reasoning as run_scan above.
+    """
+    org = UUID(org_id)
+    project = UUID(project_id)
+
+    from qagent.modules.performance.k6 import K6Error, K6Unavailable, run_load_test
+
+    try:
+        result = run_load_test(
+            base_url,
+            vus_levels=vus_levels,
+            duration_seconds=duration_seconds,
+            paths=paths,
+        )
+    except K6Unavailable as exc:
+        logger.error("k6 is not installed on this worker: %s", exc)
+        return {"error": str(exc)}
+    except K6Error as exc:
+        logger.exception("performance test failed")
+        raise self.retry(exc=exc, countdown=30) from exc
+
+    with session_scope(org) as session:
+        rows = persist_performance_runs(
+            session,
+            org_id=org,
+            project_id=project,
+            base_url=base_url,
+            scenarios=result.scenarios,
+            max_failed_rate=max_failed_rate,
+            max_p95_ms=max_p95_ms,
+        )
+
+    return {
+        "scenarios": len(rows),
+        "all_passed": all(r.passed for r in rows),
+    }
 
 
 def _resolve_secret(*, environment_secret_ref: str | None) -> dict[str, str]:

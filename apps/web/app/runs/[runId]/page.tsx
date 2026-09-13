@@ -26,7 +26,7 @@ export default async function RunPage({
       <SetupNotice
         error={run.error}
         baseUrl={apiBaseUrl()}
-        configured={isConfigured()}
+        configured={await isConfigured()}
       />
     );
   }

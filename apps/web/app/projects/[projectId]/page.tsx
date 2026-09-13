@@ -22,9 +22,11 @@ export default async function ProjectPage({
 }) {
   const { projectId } = await params;
 
-  const [gate, bugs] = await Promise.all([
+  const [gate, bugs, findings, performance] = await Promise.all([
     settle(api.quality(projectId)),
     settle(api.bugs(projectId)),
+    settle(api.securityFindings(projectId)),
+    settle(api.performanceRuns(projectId)),
   ]);
 
   if (gate.error && bugs.error) {
@@ -32,12 +34,16 @@ export default async function ProjectPage({
       <SetupNotice
         error={gate.error}
         baseUrl={apiBaseUrl()}
-        configured={isConfigured()}
+        configured={await isConfigured()}
       />
     );
   }
 
   const sorted = (bugs.data ?? [])
+    .slice()
+    .sort((a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity]);
+
+  const sortedFindings = (findings.data ?? [])
     .slice()
     .sort((a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity]);
 
@@ -152,6 +158,98 @@ export default async function ProjectPage({
               </li>
             ))}
           </ul>
+        )}
+      </Card>
+
+      <Card
+        title="Security findings"
+        description="Static analysis (Semgrep). Critical/high count toward the quality gate."
+      >
+        {findings.error ? (
+          <Empty>Could not load security findings.</Empty>
+        ) : sortedFindings.length === 0 ? (
+          <Empty>No security findings for this project.</Empty>
+        ) : (
+          <ul className="space-y-3">
+            {sortedFindings.map((finding) => (
+              <li
+                key={`${finding.rule_id}:${finding.path}:${finding.line}`}
+                className="rounded-md border px-4 py-3"
+                style={{
+                  background: "var(--surface-2)",
+                  borderColor: "var(--border)",
+                }}
+              >
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-3">
+                    <SeverityBadge severity={finding.severity} />
+                    <span
+                      className="tabular text-xs"
+                      style={{ color: "var(--text-muted)" }}
+                    >
+                      {finding.path}:{finding.line}
+                    </span>
+                  </div>
+                  <span className="text-xs" style={{ color: "var(--text-muted)" }}>
+                    {finding.tool}
+                  </span>
+                </div>
+                <p className="mt-2 text-xs font-medium">{finding.rule_id}</p>
+                <p className="mt-1 text-xs" style={{ color: "var(--text-secondary)" }}>
+                  {finding.message}
+                </p>
+              </li>
+            ))}
+          </ul>
+        )}
+      </Card>
+
+      <Card
+        title="Load test scenarios"
+        description="k6, latest scans first. One row per VU level; the most recent scan's failures count toward the quality gate."
+      >
+        {performance.error ? (
+          <Empty>Could not load performance runs.</Empty>
+        ) : (performance.data ?? []).length === 0 ? (
+          <Empty>No load tests recorded for this project.</Empty>
+        ) : (
+          <div className="scroll-x">
+            <table className="w-full text-xs">
+              <thead>
+                <tr
+                  className="text-left"
+                  style={{ color: "var(--text-muted)" }}
+                >
+                  <th className="pb-2 pr-4 font-medium">VUs</th>
+                  <th className="pb-2 pr-4 font-medium">req/s</th>
+                  <th className="pb-2 pr-4 font-medium">failed</th>
+                  <th className="pb-2 pr-4 font-medium">p95</th>
+                  <th className="pb-2 pr-4 font-medium">p99</th>
+                  <th className="pb-2 font-medium">result</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y" style={{ borderColor: "var(--border)" }}>
+                {(performance.data ?? []).map((run, index) => (
+                  <tr key={index} className="tabular">
+                    <td className="py-1.5 pr-4">{run.vus}</td>
+                    <td className="py-1.5 pr-4">{run.requests_per_s.toFixed(1)}</td>
+                    <td className="py-1.5 pr-4">{(run.failed_rate * 100).toFixed(2)}%</td>
+                    <td className="py-1.5 pr-4">{run.latency_p95_ms.toFixed(0)}ms</td>
+                    <td className="py-1.5 pr-4">{run.latency_p99_ms.toFixed(0)}ms</td>
+                    <td className="py-1.5">
+                      <span
+                        style={{
+                          color: run.passed ? "var(--good)" : "var(--critical)",
+                        }}
+                      >
+                        {run.passed ? "pass" : "fail"}
+                      </span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         )}
       </Card>
     </div>

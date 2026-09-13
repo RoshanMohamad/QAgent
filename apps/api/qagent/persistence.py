@@ -15,9 +15,27 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from qagent import models
+from qagent.modules.triage import flakiness
 from qagent.pipeline import PipelineResult
 
 logger = logging.getLogger(__name__)
+
+
+def _case_result_history(
+    session: Session, case_id: UUID, window: int = flakiness.WINDOW
+) -> list[str]:
+    """Oldest-first pass/fail sequence for one case, for flake_rate."""
+    rows = (
+        session.execute(
+            select(models.TestResult.status)
+            .where(models.TestResult.test_case_id == case_id)
+            .order_by(models.TestResult.created_at.desc())
+            .limit(window)
+        )
+        .scalars()
+        .all()
+    )
+    return [s.value if hasattr(s, "value") else str(s) for s in reversed(rows)]
 
 
 def recent_history(
@@ -169,6 +187,13 @@ def persist_result(
         session.add(record)
         session.flush()
 
+        # Updated after every run, pass or fail: a case that is unreliable but
+        # happens to pass this time must not look healthy just because this one
+        # result was green.
+        case_history = _case_result_history(session, case.id)
+        case.flake_rate = flakiness.compute_flake_rate(case_history)
+        case.quarantined = flakiness.should_quarantine(case_history, case.flake_rate)
+
         if outcome.bug:
             bug = outcome.bug
             session.add(
@@ -243,3 +268,94 @@ def persist_agent_run(
         )
 
     return agent_run
+
+
+def persist_security_findings(
+    session: Session,
+    *,
+    org_id: UUID,
+    project_id: UUID,
+    findings: list,
+    tool: str = "semgrep",
+) -> int:
+    """Insert findings new to this project, identified by rule+path+line.
+
+    Re-scanning a repository reports the same unfixed issues every time; without
+    this dedupe, the count would grow every run instead of reflecting what's
+    actually open. Returns the number of genuinely new findings inserted.
+    """
+    existing = {
+        (rule_id, path, line)
+        for rule_id, path, line in session.execute(
+            select(
+                models.SecurityFinding.rule_id,
+                models.SecurityFinding.path,
+                models.SecurityFinding.line,
+            ).where(
+                models.SecurityFinding.project_id == project_id,
+                models.SecurityFinding.tool == tool,
+            )
+        ).all()
+    }
+
+    inserted = 0
+    for finding in findings:
+        if finding.dedupe_key() in existing:
+            continue
+        session.add(
+            models.SecurityFinding(
+                org_id=org_id,
+                project_id=project_id,
+                tool=tool,
+                rule_id=finding.rule_id,
+                path=finding.path,
+                line=finding.line,
+                title=finding.title[:300],
+                severity=models.Severity(finding.severity),
+                message=finding.message,
+                confidence=finding.confidence,
+                cwe=finding.cwe,
+                owasp=finding.owasp,
+            )
+        )
+        inserted += 1
+
+    return inserted
+
+
+def persist_performance_runs(
+    session: Session,
+    *,
+    org_id: UUID,
+    project_id: UUID,
+    base_url: str,
+    scenarios: list,
+    max_failed_rate: float,
+    max_p95_ms: float,
+    tool: str = "k6",
+) -> list[models.PerformanceRun]:
+    """Insert one row per VU-level scenario. Unlike security findings, these are
+    never deduped: each scan is a new data point in a project's performance
+    history, not a persistent state to converge on."""
+    rows = []
+    for scenario in scenarios:
+        row = models.PerformanceRun(
+            org_id=org_id,
+            project_id=project_id,
+            tool=tool,
+            base_url=base_url,
+            vus=scenario.vus,
+            duration_s=scenario.duration_s,
+            requests=scenario.requests,
+            requests_per_s=scenario.requests_per_s,
+            failed_rate=scenario.failed_rate,
+            latency_avg_ms=scenario.latency_avg_ms,
+            latency_p95_ms=scenario.latency_p95_ms,
+            latency_p99_ms=scenario.latency_p99_ms,
+            latency_max_ms=scenario.latency_max_ms,
+            passed=scenario.passes(max_failed_rate=max_failed_rate, max_p95_ms=max_p95_ms),
+        )
+        session.add(row)
+        rows.append(row)
+
+    return rows

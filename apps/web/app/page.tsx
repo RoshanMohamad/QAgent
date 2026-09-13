@@ -20,7 +20,7 @@ export default async function DashboardPage() {
       <SetupNotice
         error={summary.error}
         baseUrl={apiBaseUrl()}
-        configured={isConfigured()}
+        configured={await isConfigured()}
       />
     );
   }
@@ -33,7 +33,15 @@ export default async function DashboardPage() {
     (sum, severity) => sum + (data.bugs[severity] ?? 0),
     0,
   );
-  const blocking = (data.bugs.critical ?? 0) + (data.bugs.high ?? 0);
+  const openFindings = SEVERITY_ORDER.reduce(
+    (sum, severity) => sum + (data.security_findings[severity] ?? 0),
+    0,
+  );
+  const blocking =
+    (data.bugs.critical ?? 0) +
+    (data.bugs.high ?? 0) +
+    (data.security_findings.critical ?? 0) +
+    (data.security_findings.high ?? 0);
 
   return (
     <div className="space-y-8">
@@ -57,7 +65,7 @@ export default async function DashboardPage() {
 
         <div className="text-right">
           <p className="text-xs" style={{ color: "var(--text-secondary)" }}>
-            Open defects
+            Open defects + findings
           </p>
           <p
             className="mt-1 text-3xl font-semibold"
@@ -65,7 +73,7 @@ export default async function DashboardPage() {
               color: blocking > 0 ? "var(--critical)" : "var(--text-primary)",
             }}
           >
-            {openBugs}
+            {openBugs + openFindings}
           </p>
           {blocking > 0 ? (
             <p className="mt-1 text-xs" style={{ color: "var(--critical)" }}>
@@ -76,7 +84,7 @@ export default async function DashboardPage() {
       </div>
 
       {/* KPI row: headline numbers, not a grouped bar chart. */}
-      <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-5">
         <StatTile label="Projects" value={compact(data.projects)} />
         <StatTile label="Checks executed" value={compact(total)} />
         <StatTile
@@ -86,13 +94,19 @@ export default async function DashboardPage() {
           detail={failed > 0 ? "before classification" : "nothing red"}
         />
         <StatTile
+          label="Flaky"
+          value={compact(data.tests.flaky)}
+          accent={data.tests.flaky > 0 ? "var(--warning)" : undefined}
+          detail="quarantined, not blocking"
+        />
+        <StatTile
           label="AI spend"
           value={`$${data.llm_spend_usd.toFixed(2)}`}
           detail="across all runs"
         />
       </div>
 
-      <div className="grid gap-6 md:grid-cols-2">
+      <div className="grid gap-6 md:grid-cols-3">
         <Card
           title="Open defects by severity"
           description="Only defects appear here. Test-side failures are excluded by triage."
@@ -110,6 +124,31 @@ export default async function DashboardPage() {
                     <SeverityBadge severity={severity} />
                     <span className="tabular text-sm font-medium">
                       {data.bugs[severity]}
+                    </span>
+                  </li>
+                ),
+              )}
+            </ul>
+          )}
+        </Card>
+
+        <Card
+          title="Security findings"
+          description="Static analysis (Semgrep). Critical/high count toward the quality gate."
+        >
+          {openFindings === 0 ? (
+            <Empty>No open findings.</Empty>
+          ) : (
+            <ul className="space-y-2">
+              {SEVERITY_ORDER.filter((s) => (data.security_findings[s] ?? 0) > 0).map(
+                (severity) => (
+                  <li
+                    key={severity}
+                    className="flex items-center justify-between"
+                  >
+                    <SeverityBadge severity={severity} />
+                    <span className="tabular text-sm font-medium">
+                      {data.security_findings[severity]}
                     </span>
                   </li>
                 ),

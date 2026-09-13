@@ -182,6 +182,7 @@ class Environment(Base, TimestampMixin):
     )
     base_url: Mapped[str | None] = mapped_column(String(500))
     openapi_url: Mapped[str | None] = mapped_column(String(500))
+    e2e_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     # Non-secret request defaults. Credentials live behind secret_ref, never here.
     default_headers: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
@@ -418,6 +419,84 @@ class Bug(Base, TimestampMixin):
     __table_args__ = (UniqueConstraint("org_id", "reference", name="uq_bug_org_reference"),)
 
 
+class SecurityFinding(Base, TimestampMixin):
+    """One static-analysis finding (CLAUDE.md section 16).
+
+    QAgent doesn't reimplement a SAST engine, it shells out to one (Semgrep to
+    start) and stores what it reported. The unique constraint is the dedupe key
+    across repeated scans of the same repository: same rule, same location means
+    the same finding, so re-scanning never doubles the count.
+    """
+
+    __tablename__ = "security_findings"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    org_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+
+    tool: Mapped[str] = mapped_column(String(32), default="semgrep", nullable=False)
+    rule_id: Mapped[str] = mapped_column(String(300), nullable=False)
+    path: Mapped[str] = mapped_column(String(1000), nullable=False)
+    line: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    title: Mapped[str] = mapped_column(String(300), nullable=False)
+    severity: Mapped[Severity] = mapped_column(
+        Enum(Severity, name="severity"), default=Severity.MEDIUM, nullable=False
+    )
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    confidence: Mapped[str | None] = mapped_column(String(32))
+    cwe: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    owasp: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="open", nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "project_id", "tool", "rule_id", "path", "line", name="uq_finding_location"
+        ),
+    )
+
+
+class PerformanceRun(Base, TimestampMixin):
+    """One k6 scenario at a fixed VU count (CLAUDE.md section 17).
+
+    A load test is a sequence of these at rising VU levels, not a single row, so
+    "where does it start degrading" is a query over this table rather than
+    something computed once and thrown away.
+    """
+
+    __tablename__ = "performance_runs"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    org_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+
+    tool: Mapped[str] = mapped_column(String(32), default="k6", nullable=False)
+    base_url: Mapped[str] = mapped_column(String(500), nullable=False)
+    vus: Mapped[int] = mapped_column(Integer, nullable=False)
+    duration_s: Mapped[float] = mapped_column(Float, nullable=False)
+
+    requests: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    requests_per_s: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    failed_rate: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    latency_avg_ms: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    latency_p95_ms: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    latency_p99_ms: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    latency_max_ms: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    passed: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+
 # --------------------------------------------------------------------------- ai layer
 
 
@@ -511,6 +590,8 @@ TENANT_TABLES = [
     "test_results",
     "artifacts",
     "bugs",
+    "security_findings",
+    "performance_runs",
     "agent_runs",
     "llm_calls",
     "audit_logs",

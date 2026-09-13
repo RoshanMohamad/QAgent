@@ -23,8 +23,9 @@ export type RunStatus =
 export interface DashboardSummary {
   projects: number;
   runs: number;
-  tests: { total: number; passed: number; failed: number };
+  tests: { total: number; passed: number; failed: number; flaky: number };
   bugs: Partial<Record<Severity, number>>;
+  security_findings: Partial<Record<Severity, number>>;
   llm_spend_usd: number;
   generated_at: string;
 }
@@ -79,11 +80,42 @@ export interface Bug {
   steps: string[];
 }
 
+export interface SecurityFinding {
+  tool: string;
+  rule_id: string;
+  title: string;
+  severity: Severity;
+  path: string;
+  line: number;
+  message: string;
+  confidence: string | null;
+  cwe: string[];
+  owasp: string[];
+}
+
+export interface PerformanceRun {
+  tool: string;
+  base_url: string;
+  vus: number;
+  duration_s: number;
+  requests: number;
+  requests_per_s: number;
+  failed_rate: number;
+  latency_avg_ms: number;
+  latency_p95_ms: number;
+  latency_p99_ms: number;
+  latency_max_ms: number;
+  passed: boolean;
+  created_at: string;
+}
+
 export interface QualityGate {
   result: "pass" | "block" | "no_data";
   reason: string;
   run?: { id: string; total: number; passed: number; failed: number };
   open_bugs?: Partial<Record<Severity, number>>;
+  open_security_findings?: Partial<Record<Severity, number>>;
+  failing_performance_scenarios?: number;
 }
 
 /** Human-readable labels. The API returns machine names; the UI never shows them raw. */

@@ -101,6 +101,7 @@ class TestKind(enum.StrEnum):
     API_FUNCTIONAL = "api_functional"
     API_SECURITY = "api_security"
     E2E = "e2e"
+    E2E_INTERACTIVE = "e2e_interactive"
 
 
 # --------------------------------------------------------------------------- tenancy
@@ -183,6 +184,9 @@ class Environment(Base, TimestampMixin):
     base_url: Mapped[str | None] = mapped_column(String(500))
     openapi_url: Mapped[str | None] = mapped_column(String(500))
     e2e_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    interactive_exploration_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False
+    )
 
     # Non-secret request defaults. Credentials live behind secret_ref, never here.
     default_headers: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)

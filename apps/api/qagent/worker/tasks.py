@@ -69,6 +69,7 @@ def run_scan(self, org_id: str, project_id: str, run_id: str) -> dict:
         openapi_url = environment.openapi_url
         headers = dict(environment.default_headers or {})
         run_e2e = environment.e2e_enabled
+        run_interactive = environment.interactive_exploration_enabled
         history = recent_history(session, org, project)
 
     llm = LlmClient.from_settings(settings)
@@ -85,6 +86,7 @@ def run_scan(self, org_id: str, project_id: str, run_id: str) -> dict:
             llm=llm,
             history=history,
             run_e2e=run_e2e,
+            run_interactive=run_interactive,
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception("scan failed")

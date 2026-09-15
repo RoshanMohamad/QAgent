@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from qagent.modules.discovery.openapi import EndpointSpec, fetch_spec, parse_openapi
+from qagent.modules.explorer.actions import InteractionPolicy
 from qagent.modules.generator.rules import GeneratedCase, generate
 from qagent.modules.llm.client import LlmClient
 from qagent.modules.runner.executor import ApiTestRunner, RunnerConfig, TargetRejected
@@ -22,6 +23,7 @@ from qagent.modules.triage.classifier import FailureClass, classify, extract_sig
 
 if TYPE_CHECKING:
     from qagent.modules.browser.runner import PageCheckResult
+    from qagent.modules.explorer.actions import ActionOutcome
 
 logger = logging.getLogger(__name__)
 
@@ -135,6 +137,10 @@ def run_pipeline(
     history: dict[str, list[str]] | None = None,
     run_e2e: bool = False,
     e2e_max_pages: int = 15,
+    run_interactive: bool = False,
+    interactive_max_pages: int = 15,
+    interactive_max_actions: int = 40,
+    interaction_policy: InteractionPolicy | None = None,
 ) -> PipelineResult:
     """Run the full loop against one environment.
 
@@ -152,6 +158,12 @@ def run_pipeline(
     one dashboard and one quality gate with API results. It is optional and degrades
     to a recorded, non-fatal skip when Playwright isn't installed, since it's the
     only stage with a dependency the core install doesn't carry.
+
+    ``run_interactive`` additionally fills forms and clicks through same-origin pages
+    (modules/explorer/interact.py) instead of only following links, folding any defect
+    it finds into ``outcomes`` as ``kind="e2e_interactive"``. It is a separate stage
+    from ``run_e2e`` (own caps, own failure mode) so either can be enabled without the
+    other, and degrades the same way: a non-fatal skip when Playwright isn't installed.
     """
     llm = llm or LlmClient.from_settings()
     result = PipelineResult(base_url=base_url, started_at=datetime.now(UTC))
@@ -215,6 +227,17 @@ def run_pipeline(
             llm=llm,
         )
 
+    if run_interactive:
+        _run_interactive_stage(
+            result,
+            base_url=base_url,
+            max_pages=interactive_max_pages,
+            max_total_actions=interactive_max_actions,
+            policy=interaction_policy,
+            timeout_seconds=timeout_seconds,
+            llm=llm,
+        )
+
     result.finished_at = datetime.now(UTC)
     result.llm_totals = llm.totals()
     return result
@@ -252,6 +275,99 @@ def _run_e2e_stage(
 
     for check in browser_result.checks:
         result.outcomes.append(_page_check_to_outcome(check, llm))
+
+
+def _run_interactive_stage(
+    result: PipelineResult,
+    *,
+    base_url: str,
+    max_pages: int,
+    max_total_actions: int,
+    policy: InteractionPolicy | None,
+    timeout_seconds: float,
+    llm: LlmClient,
+) -> None:
+    """Fill forms, click through the app, and fold any defect found into
+    ``result.outcomes``. Isolated the same way ``_run_e2e_stage`` is, so a
+    browser-stage failure never loses the API (or plain-E2E) results already
+    collected above it.
+    """
+    try:
+        from qagent.modules.explorer.interact import explore_interactive
+
+        graph = explore_interactive(
+            base_url=base_url,
+            max_pages=max_pages,
+            max_total_actions=max_total_actions,
+            policy=policy,
+            timeout_seconds=timeout_seconds,
+            llm=llm,
+        )
+    except ModuleNotFoundError:
+        result.errors.append(
+            "Interactive exploration skipped: playwright is not installed (pip install "
+            "qagent[e2e] && playwright install chromium)."
+        )
+        return
+    except Exception as exc:  # noqa: BLE001 - never sink results already collected
+        logger.exception("interactive exploration failed")
+        result.errors.append(f"Interactive exploration failed: {exc}")
+        return
+
+    for node in graph.nodes.values():
+        for outcome in node.actions_taken:
+            result.outcomes.append(_action_outcome_to_case_outcome(outcome, llm))
+
+
+def _action_outcome_to_case_outcome(outcome: ActionOutcome, llm: LlmClient) -> CaseOutcome:
+    from qagent.modules.explorer.actions import classify_action_outcome
+
+    action = outcome.action
+    status = "passed" if outcome.ok and not (outcome.page_errors or outcome.console_errors) else (
+        "failed" if outcome.ok else "error"
+    )
+
+    element_desc = action.target.text or action.target.selector
+    case_outcome = CaseOutcome(
+        name=f"{action.type.value} {action.target.tag} ({element_desc})",
+        kind="e2e_interactive",
+        endpoint_key=None,
+        status=status,
+        duration_ms=0,
+        request={
+            "method": action.type.value,
+            "path": action.target.selector,
+            "value": action.value,
+        },
+        response={
+            "status": None,
+            "url": outcome.resulting_url,
+            "body_text": "\n".join(outcome.console_errors + outcome.page_errors) or None,
+        },
+        assertions=[],
+        failure_message=outcome.error,
+    )
+
+    verdict = classify_action_outcome(outcome)
+    if verdict is None:
+        return case_outcome
+
+    case_outcome.verdict = verdict.to_dict()
+    if verdict.failure_class is FailureClass.REAL_BUG:
+        case_outcome.bug = build_bug_report(
+            case_name=case_outcome.name,
+            verdict=verdict,
+            spec={
+                "expectation": "The action completes without triggering a server error or "
+                "an uncaught exception.",
+                "kind": "e2e_interactive",
+            },
+            request=case_outcome.request,
+            response=case_outcome.response,
+            failure_message=outcome.error,
+            llm=llm,
+        )
+    return case_outcome
 
 
 def _page_check_to_outcome(check: PageCheckResult, llm: LlmClient) -> CaseOutcome:

@@ -98,6 +98,7 @@ class EnvironmentIn(BaseModel):
     openapi_url: str | None = None
     default_headers: dict[str, str] = Field(default_factory=dict)
     e2e_enabled: bool = False
+    interactive_exploration_enabled: bool = False
 
 
 class RunIn(BaseModel):
@@ -257,6 +258,7 @@ def create_environment(
         openapi_url=payload.openapi_url,
         default_headers=payload.default_headers,
         e2e_enabled=payload.e2e_enabled,
+        interactive_exploration_enabled=payload.interactive_exploration_enabled,
     )
     session.add(environment)
     session.commit()

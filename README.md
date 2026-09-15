@@ -15,10 +15,12 @@ Discover  →  Generate  →  Execute  →  Triage  →  Report
 ## Status
 
 Phase 1 (API quality loop), the dashboard, `compose` mode, static route parsing,
-a first browser E2E layer, an Explorer Agent MVP (link-crawl only), self-healing
-selector proposals, and issue tracker sync (GitHub and Jira) are implemented and
-measured. The remaining open piece is interactive exploration (form filling,
-clicking, and inferred state transitions) — see [Roadmap](#roadmap).
+a first browser E2E layer, an Explorer Agent — link-crawl and interactive
+(form filling, clicking, inferred state transitions) — self-healing selector
+proposals, and issue tracker sync (GitHub and Jira) are implemented and
+measured. Every item from the original CLAUDE.md roadmap (phases 1-5, minus
+multi-tenant infra) now has a working, tested implementation — see
+[Roadmap](#roadmap).
 
 Current measured performance against the reference fixture:
 
@@ -141,12 +143,11 @@ exception, or logs a console error. That's still unambiguous evidence of a
 defect — there's no selector here to go stale — so it doesn't reintroduce the
 flake ADR-0002 kept out of the API layer.
 
-### Explorer agent (MVP)
+### Explorer agent
 
 `--route` requires the operator to already know every page. The explorer finds
 the ones nobody listed by crawling same-origin `<a href>` links breadth-first
-and building a state graph — no form filling or clicking yet (CLAUDE.md §8-9
-describes that fuller loop; this is the tractable first slice of it):
+and building a state graph (CLAUDE.md §8-9):
 
 ```bash
 qagent explore --url http://localhost:3000 --max-pages 25 --check
@@ -163,6 +164,43 @@ failed page check joins the same `test_results`/`bugs` tables as an API result,
 so it shows up in the dashboard and the quality gate exactly like one. It
 degrades to a recorded, non-fatal skip when Playwright isn't installed on the
 worker, rather than failing the whole run.
+
+### Interactive exploration
+
+Add `--interact` to fill forms and click through pages instead of only
+following links — the "choose an action, observe the result, update the state
+graph" loop CLAUDE.md §8-9 describes (ADR-0005):
+
+```bash
+qagent explore --url http://localhost:3000 --interact --max-actions 40
+```
+
+Every actionable element on a page is extracted and ranked by a deterministic
+heuristic (testid, call-to-action text, form membership, required-ness,
+position) — no model needed to produce a useful result. A model is consulted
+only when the ranking is genuinely ambiguous, and even then it can only choose
+an index into the already-ranked candidates, never invent a selector or an
+action (ADR-0004 point 3). Required fields are filled before a form's submit
+button is chosen, and forms are only ever filled with synthetic values.
+
+State identity is `(path, structural fingerprint)`, not bare URL, so an action
+that changes the page without navigating — a form submitting into a "thanks"
+state, a modal opening — is recorded as a distinct node instead of being
+silently missed or looped on forever.
+
+Destructive-looking actions (delete, pay, cancel, checkout, ...) are skipped
+by default; pass `--allow-destructive` to permit them. A failed *action* (an
+element the heuristic couldn't find or click) is never reported as a defect —
+that's evidence about the selector, not the application, the same reasoning
+ADR-0002 applies to a UI assertion. An uncaught exception or console error
+triggered *by* an action is unambiguous evidence of a defect regardless of
+which element caused it, and is reported the same way a failed page-load check
+is. `--json` writes the full state graph, including every action taken and its
+outcome.
+
+Like `--check`, this runs inside `run_pipeline` when an environment has
+`interactive_exploration_enabled: true`, folding any defect found into the
+same `test_results`/`bugs` tables as `kind="e2e_interactive"`.
 
 ### Self-healing selectors
 
@@ -363,6 +401,7 @@ The CLI, the worker and the eval harness all run the identical loop — which me
 | [0002](docs/decisions/ADR-0002-api-tests-before-e2e.md) | API tests ship before browser E2E — a generated selector failure is indistinguishable from a real defect. |
 | [0003](docs/decisions/ADR-0003-evaluation-harness.md) | The eval harness is a first-class component; false-positive rate is the primary metric. |
 | [0004](docs/decisions/ADR-0004-untrusted-content-boundary.md) | Repo and response content is untrusted input. Verdicts come only from constrained schemas. |
+| [0005](docs/decisions/ADR-0005-interactive-exploration.md) | Interactive explorer state identity is `(path, structural fingerprint)`; actions are a closed schema-constrained set, ranked rules-first. |
 
 ---
 
@@ -410,7 +449,7 @@ apps/api/qagent/
 │   ├── triage/            failure classification, bug reports
 │   ├── provisioning/      compose mode: stack lifecycle, health wait
 │   ├── browser/           Playwright page-load checks + selector healing (`e2e` extra)
-│   ├── explorer/          BFS link-crawl, application state graph
+│   ├── explorer/          BFS link-crawl + interactive exploration, application state graph
 │   ├── security/          Semgrep SAST wrapper (`security` extra)
 │   ├── performance/       k6 load-test wrapper (standalone binary, no extra)
 │   ├── integrations/      GitHub Issues + Jira sync
@@ -425,7 +464,7 @@ docs/decisions/            ADRs
 ## Tests
 
 ```bash
-cd apps/api && pytest tests -q     # 112 tests
+cd apps/api && pytest tests -q     # 198 tests
 ```
 
 CI runs lint, unit tests, **and the evaluation harness** — a change that degrades
@@ -436,17 +475,15 @@ detection or raises false positives fails the build.
 ## Roadmap
 
 Phase 1, the dashboard, `compose` mode, route parsing, a first browser E2E
-layer, an Explorer Agent MVP (link-crawl, no interaction), self-healing
-selector proposals, and GitHub + Jira issue sync are done. What's left:
+layer, the Explorer Agent (link-crawl and interactive), self-healing selector
+proposals, and GitHub + Jira issue sync are done. Every item on the original
+roadmap (CLAUDE.md phases 1-5, minus multi-tenant infra) now has a working,
+tested implementation.
 
-1. **Explorer agent, interaction** — form filling, clicking, inferred state
-   transitions beyond "this page links to that page." This is the one
-   remaining item that's genuinely open-ended: choosing which button to click
-   *meaningfully* (not at random) needs either heuristics tied to element
-   semantics or a model in the loop, and either way needs the state graph's
-   dead ends and duplicate states worked out first. Everything else on the
-   original roadmap (CLAUDE.md phases 1-5, minus multi-tenant infra) now has a
-   working, tested implementation.
+What's left is mostly Phase 6 (CLAUDE.md §23): multi-tenancy hardening beyond
+the RLS already in place, distributed workers, and the operational surface
+(rate limiting, billing/usage, broader observability) that only matters once
+there's load to justify it — see ADR-0001 on resisting premature architecture.
 
 More fixtures are the highest-leverage work at any point: every metric above is only
 as trustworthy as the ground truth behind it.

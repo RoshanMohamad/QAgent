@@ -366,33 +366,71 @@ def explore(
     check: bool = typer.Option(
         False, "--check", help="Also run scan-ui-style checks against every discovered page."
     ),
+    interact: bool = typer.Option(
+        False, "--interact", help="Fill forms and click through pages, not just follow links."
+    ),
+    max_actions: int = typer.Option(
+        40, "--max-actions", help="With --interact, hard cap on total actions taken."
+    ),
+    allow_destructive: bool = typer.Option(
+        False,
+        "--allow-destructive",
+        help="With --interact, permit delete/pay/cancel-looking actions (off by default).",
+    ),
     output: Path | None = typer.Option(None, "--json", help="Write the state graph as JSON."),
     fail_on_defect: bool = typer.Option(
-        True, "--fail-on-defect/--no-fail-on-defect", help="With --check, exit non-zero on failure."
+        True,
+        "--fail-on-defect/--no-fail-on-defect",
+        help="With --check or --interact, exit non-zero on a defect.",
     ),
 ) -> None:
-    """Explorer agent (CLAUDE.md §8-9): crawl same-origin links and build a state graph.
+    """Explorer agent (CLAUDE.md §8-9): crawl same-origin pages and build a state graph.
 
-    MVP scope: link discovery only — no form filling, no clicking, no inferred
-    actions. What it buys the pipeline: pages nobody listed with --route. Add
-    --check to run scan-ui's page-load checks against everything it finds.
+    Link discovery only by default — what that buys the pipeline: pages nobody
+    listed with --route. Add --check to run scan-ui's page-load checks against
+    everything it finds, or --interact to fill forms and click through pages
+    instead of only following links (see ADR-0005). Destructive-looking
+    actions (delete, pay, cancel, ...) are skipped unless --allow-destructive
+    is passed, and forms are only ever filled with synthetic values.
     """
-    try:
-        from qagent.modules.explorer.crawler import explore as run_explore
-    except ModuleNotFoundError as exc:
-        console.print(
-            "[red]playwright is not installed.[/red] Run "
-            "[bold]pip install qagent[e2e] && playwright install chromium[/bold]."
-        )
-        raise typer.Exit(code=2) from exc
+    if interact:
+        try:
+            from qagent.modules.explorer.actions import InteractionPolicy
+            from qagent.modules.explorer.interact import explore_interactive
+        except ModuleNotFoundError as exc:
+            console.print(
+                "[red]playwright is not installed.[/red] Run "
+                "[bold]pip install qagent[e2e] && playwright install chromium[/bold]."
+            )
+            raise typer.Exit(code=2) from exc
 
-    graph = run_explore(
-        base_url=url,
-        max_pages=max_pages,
-        max_depth=max_depth,
-        timeout_seconds=timeout,
-        headless=not headed,
-    )
+        graph = explore_interactive(
+            base_url=url,
+            max_pages=max_pages,
+            max_depth=max_depth,
+            max_total_actions=max_actions,
+            timeout_seconds=timeout,
+            headless=not headed,
+            policy=InteractionPolicy(allow_destructive=allow_destructive),
+            llm=LlmClient.from_settings(get_settings()),
+        )
+    else:
+        try:
+            from qagent.modules.explorer.crawler import explore as run_explore
+        except ModuleNotFoundError as exc:
+            console.print(
+                "[red]playwright is not installed.[/red] Run "
+                "[bold]pip install qagent[e2e] && playwright install chromium[/bold]."
+            )
+            raise typer.Exit(code=2) from exc
+
+        graph = run_explore(
+            base_url=url,
+            max_pages=max_pages,
+            max_depth=max_depth,
+            timeout_seconds=timeout,
+            headless=not headed,
+        )
 
     console.print(
         Panel(
@@ -408,13 +446,45 @@ def explore(
     table.add_column("url", overflow="fold")
     table.add_column("title", overflow="fold")
     table.add_column("links", justify="right", width=6)
+    if interact:
+        table.add_column("actions", justify="right", width=7)
     for node in sorted(graph.nodes.values(), key=lambda n: (n.depth, n.url)):
-        table.add_row(str(node.depth), node.url, node.title or "", str(node.link_count))
+        row = [str(node.depth), node.url, node.title or "", str(node.link_count)]
+        if interact:
+            row.append(str(len(node.actions_taken)))
+        table.add_row(*row)
     console.print(table)
+
+    defect_found = False
+    if interact:
+        action_table = Table(show_header=True, header_style="bold", title="actions taken")
+        action_table.add_column("url", overflow="fold")
+        action_table.add_column("action")
+        action_table.add_column("element", overflow="fold")
+        action_table.add_column("result")
+        for node in graph.nodes.values():
+            for outcome in node.actions_taken:
+                if not outcome.ok:
+                    result_text = f"[yellow]error: {outcome.error}[/yellow]"
+                elif outcome.page_errors or outcome.console_errors:
+                    result_text = "[bold red]defect[/bold red]"
+                    defect_found = True
+                else:
+                    result_text = "[green]ok[/green]"
+                element = outcome.action.target.text or outcome.action.target.selector
+                action_table.add_row(node.url, outcome.action.type.value, element, result_text)
+        if any(node.actions_taken for node in graph.nodes.values()):
+            console.print()
+            console.print(action_table)
 
     if output:
         output.write_text(json.dumps(graph.to_dict(), indent=2), encoding="utf-8")
         console.print(f"\n[dim]wrote {output}[/dim]")
+
+    if interact:
+        if fail_on_defect and defect_found:
+            raise typer.Exit(code=1)
+        return
 
     if not check:
         return

@@ -36,6 +36,12 @@ class StateNode:
     depth: int
     title: str | None = None
     link_count: int = 0
+    #: Set only by the interactive explorer (modules/explorer/interact.py); a
+    #: plain link-crawl node never populates these. Kept here rather than on a
+    #: subclass field so ``StateGraph``'s generic node handling doesn't need to
+    #: know which explorer produced a node.
+    dom_fingerprint: str | None = None
+    actions_available: int = 0
 
 
 @dataclass

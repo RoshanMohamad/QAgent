@@ -17,10 +17,9 @@ Discover  →  Generate  →  Execute  →  Triage  →  Report
 Phase 1 (API quality loop), the dashboard, `compose` mode, static route parsing,
 a first browser E2E layer, an Explorer Agent — link-crawl and interactive
 (form filling, clicking, inferred state transitions) — self-healing selector
-proposals, and issue tracker sync (GitHub and Jira) are implemented and
-measured. Every item from the original CLAUDE.md roadmap (phases 1-5, minus
-multi-tenant infra) now has a working, tested implementation — see
-[Roadmap](#roadmap).
+proposals, issue tracker sync (GitHub and Jira), and a repository analyzer /
+Project Analyst agent are implemented and measured. See [Roadmap](#roadmap)
+for what's done versus what's still open within phases 1-5.
 
 Current measured performance against the reference fixture:
 
@@ -35,7 +34,7 @@ Current measured performance against the reference fixture:
 Reproduce these numbers yourself with the [two commands below](#try-it).
 
 **Verified:** the pipeline (discovery, generation, execution, triage, reporting), the
-CLI, the eval harness, 48 unit tests and lint — all run green without a database. The
+CLI, the eval harness, 247 unit tests and lint — all run green without a database. The
 dashboard was rendered against real pipeline output through the documented API
 contract: all three pages, the setup state, and the failure-analysis chart.
 
@@ -279,6 +278,42 @@ transaction (and therefore one `created_at`), which is what the quality gate
 uses to mean "the latest load test" — a load test failing once in the past
 does not block every deploy after it, only its own latest run.
 
+### Repository analysis
+
+Agent 1, the Project Analyst (CLAUDE.md §6-8): detect what a checkout is built
+out of and build its module tree, from a repo alone — nothing here needs the
+app running:
+
+```bash
+qagent analyze --repo ./path/to/checkout
+```
+
+Detection reads manifests and config files only (`package.json`,
+`pyproject.toml`/`requirements.txt`, `docker-compose.yml`, framework config
+files, `.env.example` templates) and parses them with stdlib/YAML parsers —
+never `npm install`, never importing the checkout, never a live `.env` (only
+`.env.example`-style templates, and only variable *names*, never values).
+Every detection carries its evidence — the file and the literal marker that
+proved it — and a technology confirmed from two independent sources (a
+dependency *and* its config file) is corroborated rather than listed twice
+(ADR-0006).
+
+The module tree groups whatever discovery already found — an OpenAPI document,
+or the static route parser's fallback — by leading path segment (`/api/v1/orders/{id}`
+→ `orders`), reads frontend routes off Next.js's own App/Pages Router directory
+convention, and lists database models from ORM source (`__tablename__`, Prisma
+`model`, Django `models.Model`). A module is flagged risky by name (auth,
+payment, admin, checkout, token, ...) or because one of its endpoints scores
+≥0.6 on the same risk heuristic that already orders test generation — one
+number, not two disagreeing ones, for "how much attention does this deserve."
+
+Pass `--url`/`--spec` too and endpoint grouping uses the real OpenAPI surface
+instead of falling back to route parsing, same contract as `qagent endpoints`.
+`POST /api/v1/projects/{id}/analyze` runs the identical pass against a
+`repo_path` the API process can read and persists the result into
+`Project.stack` — the column CLAUDE.md's own schema reserved for this and,
+until now, nothing wrote.
+
 ### Issue tracker sync
 
 Turn a scan's defects into tracked GitHub issues instead of leaving them in a
@@ -411,6 +446,7 @@ The CLI, the worker and the eval harness all run the identical loop — which me
 | [0003](docs/decisions/ADR-0003-evaluation-harness.md) | The eval harness is a first-class component; false-positive rate is the primary metric. |
 | [0004](docs/decisions/ADR-0004-untrusted-content-boundary.md) | Repo and response content is untrusted input. Verdicts come only from constrained schemas. |
 | [0005](docs/decisions/ADR-0005-interactive-exploration.md) | Interactive explorer state identity is `(path, structural fingerprint)`; actions are a closed schema-constrained set, ranked rules-first. |
+| [0006](docs/decisions/ADR-0006-repository-analyzer.md) | The repository analyzer reads and parses text only — never executes a checkout's own tooling — and every detection carries its evidence. |
 
 ---
 
@@ -450,8 +486,9 @@ apps/api/qagent/
 ├── pipeline.py            the loop; no database, no queue
 ├── main.py                HTTP API
 ├── models.py              schema, org_id + RLS on every tenant table
-├── cli.py                 qagent scan | endpoints | evaluate
+├── cli.py                 qagent scan | analyze | endpoints | evaluate
 ├── modules/
+│   ├── analyzer/          Project Analyst: stack detection, module tree (agent 1)
 │   ├── discovery/         OpenAPI ingestion, static route parsing, risk scoring
 │   ├── generator/         deterministic rules + value synthesis
 │   ├── runner/            SSRF-guarded execution, assertions
@@ -473,7 +510,7 @@ docs/decisions/            ADRs
 ## Tests
 
 ```bash
-cd apps/api && pytest tests -q     # 204 tests
+cd apps/api && pytest tests -q     # 247 tests
 ```
 
 CI runs lint, unit tests, **and the evaluation harness** — a change that degrades
@@ -485,9 +522,15 @@ detection or raises false positives fails the build.
 
 Phase 1, the dashboard, `compose` mode, route parsing, a first browser E2E
 layer, the Explorer Agent (link-crawl and interactive), self-healing selector
-proposals, and GitHub + Jira issue sync are done. Every item on the original
-roadmap (CLAUDE.md phases 1-5, minus multi-tenant infra) now has a working,
-tested implementation.
+proposals, GitHub + Jira issue sync, and the repository analyzer / Project
+Analyst agent (`qagent analyze`, agent 1) are done and tested.
+
+Still open within CLAUDE.md phases 1-5: the Test Planner (agent 2) and a real
+Playwright/pytest emitter for generated specs (agent 3 currently ships
+declarative test documents, not files, by design — see [How it works](#how-it-works));
+Repository RAG; screenshot/HAR/trace evidence on bug reports (the `Artifact`
+table exists but has no writer yet); the browser extension and its recorder;
+and OWASP ZAP/Trivy alongside the existing Semgrep SAST integration.
 
 What's left is mostly Phase 6 (CLAUDE.md §23): multi-tenancy hardening beyond
 the RLS already in place, distributed workers, and the operational surface

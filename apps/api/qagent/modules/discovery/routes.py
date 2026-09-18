@@ -25,7 +25,9 @@ from qagent.modules.discovery.openapi import EndpointSpec, score_risk
 
 logger = logging.getLogger(__name__)
 
-_SKIP_DIRS = {
+#: Directories never worth walking: vendored code, build output, caches. Shared with
+#: the analyzer, which walks the same trees for a different purpose.
+SKIP_DIRS = {
     "node_modules",
     ".git",
     "__pycache__",
@@ -60,7 +62,7 @@ def _iter_source_files(repo_dir: Path, extensions: set[str]) -> list[Path]:
     for path in repo_dir.rglob("*"):
         if path.suffix not in extensions or not path.is_file():
             continue
-        if any(part in _SKIP_DIRS for part in path.parts):
+        if any(part in SKIP_DIRS for part in path.parts):
             continue
         files.append(path)
     return files

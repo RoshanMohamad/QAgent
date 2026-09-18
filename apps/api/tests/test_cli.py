@@ -4,6 +4,8 @@ the right policy, not the plain crawler, and reflect defects in the exit code.
 
 from __future__ import annotations
 
+import json
+
 from typer.testing import CliRunner
 
 from qagent.cli import app
@@ -150,3 +152,48 @@ def test_explore_interact_no_fail_on_defect_exits_zero(monkeypatch) -> None:
     )
 
     assert result.exit_code == 0
+
+
+def test_analyze_rejects_non_directory(tmp_path) -> None:
+    missing = tmp_path / "does-not-exist"
+
+    result = runner.invoke(app, ["analyze", "--repo", str(missing)])
+
+    assert result.exit_code == 2
+
+
+def test_analyze_writes_json_report(tmp_path) -> None:
+    (tmp_path / "package.json").write_text('{"dependencies": {"react": "19.0.0"}}', encoding="utf-8")
+    (tmp_path / "app.py").write_text(
+        '@app.get("/orders")\ndef list_orders():\n    ...\n', encoding="utf-8"
+    )
+    output = tmp_path / "analysis.json"
+
+    result = runner.invoke(app, ["analyze", "--repo", str(tmp_path), "--json", str(output)])
+
+    assert result.exit_code == 0
+    assert output.exists()
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert "React" in [t["name"] for t in payload["stack"]["technologies"]]
+    assert payload["endpoint_source"] == "route_parser"
+
+
+def test_analyze_uses_openapi_discovery_when_spec_given(tmp_path, monkeypatch) -> None:
+    from qagent.modules.discovery.openapi import EndpointSpec
+
+    (tmp_path / "app.py").write_text(
+        '@app.get("/should-not-be-used")\ndef ignored():\n    ...\n', encoding="utf-8"
+    )
+
+    def fake_discover(base_url, openapi_url, repo_path):
+        return [EndpointSpec(method="GET", path="/orders", risk_score=0.1)], "explicit"
+
+    monkeypatch.setattr("qagent.pipeline.discover", fake_discover)
+
+    result = runner.invoke(
+        app, ["analyze", "--repo", str(tmp_path), "--spec", "http://x/openapi.json"]
+    )
+
+    assert result.exit_code == 0
+    assert "should-not-be-used" not in result.output
+    assert "orders" in result.output

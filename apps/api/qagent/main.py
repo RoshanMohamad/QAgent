@@ -112,6 +112,10 @@ class SecurityScanIn(BaseModel):
     timeout_seconds: float = Field(default=120.0, gt=0, le=1800)
 
 
+class AnalyzeRepoIn(BaseModel):
+    repo_path: str = Field(min_length=1)
+
+
 class PerformanceScanIn(BaseModel):
     base_url: str = Field(min_length=1)
     vus_levels: list[int] = Field(default_factory=lambda: [100, 500, 1000, 5000])
@@ -237,6 +241,40 @@ def list_projects(
     return [
         {"id": str(p.id), "name": p.name, "repo_url": p.repo_url, "stack": p.stack} for p in rows
     ]
+
+
+@app.post("/api/v1/projects/{project_id}/analyze", tags=["projects"])
+def analyze_project(
+    project_id: UUID,
+    payload: AnalyzeRepoIn,
+    org_id: UUID = Depends(current_org),
+    session: Session = Depends(get_db),
+) -> dict:
+    """Project Analyst agent (CLAUDE.md sections 6-8, agent 1): detect the stack
+    and build the module tree from a checkout already on local disk.
+
+    ``repo_path`` is a filesystem path the API process can read, the same
+    contract ``security/scan`` uses. This only reads text -- no manifest is
+    executed, no dependency installed -- so like the security scan it runs
+    synchronously and needs none of the sandboxing section 22 requires for a
+    live target. The result replaces ``Project.stack`` wholesale each run: it's
+    a snapshot of the checkout as analyzed, not something to merge with history.
+    """
+    from qagent.modules.analyzer.analyst import analyze_repository
+
+    project = session.get(models.Project, project_id)
+    if project is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "project not found")
+
+    repo_dir = Path(payload.repo_path)
+    if not repo_dir.is_dir():
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"not a directory: {repo_dir}")
+
+    analysis = analyze_repository(repo_dir)
+    project.stack = analysis.to_dict()
+    session.commit()
+
+    return {"id": str(project.id), "stack": project.stack}
 
 
 @app.post("/api/v1/projects/{project_id}/environments", status_code=201, tags=["projects"])

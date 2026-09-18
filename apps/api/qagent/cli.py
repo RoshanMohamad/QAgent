@@ -498,6 +498,91 @@ def explore(
 
 
 @app.command()
+def analyze(
+    repo: Path = typer.Option(..., "--repo", "-r", help="Repository checkout to analyze."),
+    spec: str | None = typer.Option(
+        None, "--spec", "-s", help="OpenAPI document URL, if the app is also running."
+    ),
+    url: str | None = typer.Option(
+        None, "--url", "-u", help="Base URL to probe for an OpenAPI document, same as `endpoints`."
+    ),
+    output: Path | None = typer.Option(None, "--json", help="Write the full analysis as JSON."),
+) -> None:
+    """Project Analyst agent: detect the stack and build the module tree (CLAUDE.md
+    sections 6-8, agent 1) from a repo checkout alone -- nothing here needs the app
+    to be running. Pass --url/--spec too and endpoint grouping uses the real OpenAPI
+    surface instead of falling back to static route parsing.
+    """
+    from qagent.modules.analyzer.analyst import analyze_repository
+
+    if not repo.is_dir():
+        console.print(f"[red]not a directory:[/red] {repo}")
+        raise typer.Exit(code=2)
+
+    found_endpoints = None
+    if url or spec:
+        from qagent.pipeline import discover
+
+        found_endpoints, _source = discover(url or "", spec, None)
+        found_endpoints = found_endpoints or None
+
+    analysis = analyze_repository(repo, endpoints=found_endpoints)
+    summary = analysis.summary()
+
+    console.print(
+        Panel(
+            f"[bold]{repo}[/bold]\n"
+            f"{len(analysis.stack.technologies)} technologies - "
+            f"{summary['endpoint_count']} endpoints - "
+            f"{summary['frontend_route_count']} frontend routes - "
+            f"{summary['database_model_count']} database models",
+            title="QAgent analyze",
+            border_style="blue",
+        )
+    )
+
+    if analysis.stack.technologies:
+        table = Table(title="Detected stack", show_header=True, header_style="bold")
+        table.add_column("category")
+        table.add_column("technology")
+        table.add_column("version")
+        table.add_column("confidence", justify="right")
+        for tech in analysis.stack.technologies:
+            table.add_row(
+                tech.category, tech.name, tech.version or "-", f"{tech.confidence:.2f}"
+            )
+        console.print(table)
+
+    if analysis.tree.frontend:
+        console.print("\n[bold]Frontend routes[/bold]")
+        for route in analysis.tree.frontend:
+            console.print(f"  {route}")
+
+    if analysis.tree.backend:
+        console.print(f"\n[bold]Backend modules[/bold] ({analysis.endpoint_source})")
+        for module in analysis.tree.backend:
+            flag = " [red]![/red]" if module.risk_reason else ""
+            console.print(f"  {module.name} ({len(module.endpoints)} endpoint(s)){flag}")
+
+    if analysis.tree.database:
+        console.print("\n[bold]Database models[/bold]")
+        for name in analysis.tree.database:
+            console.print(f"  {name}")
+
+    if analysis.tree.risky_components:
+        console.print("\n[bold red]Risky components[/bold red]")
+        for risky in analysis.tree.risky_components:
+            console.print(f"  {risky.name} (risk {risky.max_risk_score:.2f}): {risky.reason}")
+
+    for warning in analysis.warnings:
+        console.print(f"\n[yellow]warning:[/yellow] {warning}")
+
+    if output:
+        output.write_text(json.dumps(analysis.to_dict(), indent=2), encoding="utf-8")
+        console.print(f"\n[dim]wrote {output}[/dim]")
+
+
+@app.command()
 def endpoints(
     url: str = typer.Option(..., "--url", "-u"),
     spec: str | None = typer.Option(None, "--spec", "-s"),

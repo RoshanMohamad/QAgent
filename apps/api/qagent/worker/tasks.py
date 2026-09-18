@@ -5,6 +5,14 @@ so it never runs inside a request. Celery over Redis is deliberate: reference im
 shows an Argo Workflows topology, which is the right answer only once the platform is
 on Kubernetes and needs distributed scheduling. Until then it is machinery without a
 payload. See ADR-0001 on resisting premature architecture.
+
+Two queues, not one (CLAUDE.md section 23's "distributed workers"): a scan takes
+seconds to minutes, a performance test deliberately sends sustained load for
+potentially the full `task_time_limit`. Routing them onto separate queues means
+a burst of performance tests can never starve every ordinary scan behind it in
+the same queue - a single worker still consumes both by default (docker-compose.yml),
+but an operator can now point a *second* worker at only `qagent.performance` and
+scale that pool independently, without any change here.
 """
 
 from __future__ import annotations
@@ -41,7 +49,11 @@ celery_app.conf.update(
     worker_prefetch_multiplier=1,
     task_time_limit=1800,
     task_soft_time_limit=1500,
-    task_default_queue="qagent",
+    task_default_queue="qagent.scan",
+    task_routes={
+        "qagent.run_scan": {"queue": "qagent.scan"},
+        "qagent.run_performance_test": {"queue": "qagent.performance"},
+    },
 )
 
 

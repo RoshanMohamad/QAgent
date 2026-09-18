@@ -60,7 +60,12 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    command: ["celery", "-A", "qagent.worker.tasks.celery_app", "worker", "--loglevel=info", "-Q", "qagent", "--concurrency=4"]
+    # Consumes both queues by default (worker/tasks.py's task_routes), so a
+    # single-replica deployment still runs everything out of the box. Scale
+    # `docker compose up --scale worker=3` for more of both, or add a second
+    # service below listening on only `-Q qagent.performance` to scale load
+    # tests independently of ordinary scans without touching this one.
+    command: ["celery", "-A", "qagent.worker.tasks.celery_app", "worker", "--loglevel=info", "-Q", "qagent.scan,qagent.performance", "--concurrency=4"]
     # The worker reaches out to third-party applications. It gets no ports, no
     # Docker socket, and in a hosted deployment a default-deny egress policy.
     security_opt:
@@ -70,6 +75,17 @@ services:
       - /tmp
     mem_limit: 1g
     cpus: 1.0
+
+  # Example of the independent-scaling seam above: uncomment to run performance
+  # tests on their own worker pool instead of sharing the default one's capacity.
+  # worker-performance:
+  #   build: ./apps/api
+  #   env_file: .env
+  #   depends_on: { postgres: { condition: service_healthy }, redis: { condition: service_healthy } }
+  #   command: ["celery", "-A", "qagent.worker.tasks.celery_app", "worker", "--loglevel=info", "-Q", "qagent.performance", "--concurrency=2"]
+  #   security_opt: ["no-new-privileges:true"]
+  #   read_only: true
+  #   tmpfs: ["/tmp"]
 
   fixture:
     build:

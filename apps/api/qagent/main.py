@@ -10,12 +10,15 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Response, status
+import redis as redis_lib
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, status
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -27,9 +30,12 @@ from qagent.modules.auth.security import (
     AuthError,
     create_access_token,
     decode_access_token,
+    has_role,
     hash_password,
     verify_password,
 )
+from qagent.modules.observability import metrics
+from qagent.modules.ratelimit.limiter import RateLimiter
 from qagent.persistence import persist_security_findings
 
 logger = logging.getLogger(__name__)
@@ -42,6 +48,44 @@ app = FastAPI(
 )
 
 _ORG_SLUG_RE = re.compile(r"^[a-z0-9-]{2,100}$")
+
+
+@app.middleware("http")
+async def _observe_requests(request: Request, call_next):
+    """Every request, timed and counted (CLAUDE.md section 23).
+
+    Runs before routing decides which endpoint handles the request, so the
+    route template is read from ``request.scope`` *after* ``call_next``
+    returns - Starlette fills it in once the route matches, and reading it any
+    earlier would see nothing. ``/metrics`` and ``/health`` are excluded: a
+    scraper hitting ``/metrics`` every 15s would otherwise show up in its own
+    output, which answers a question nobody asked.
+    """
+    if request.url.path in {"/metrics", "/health"}:
+        return await call_next(request)
+
+    started = time.monotonic()
+    response = await call_next(request)
+    duration = time.monotonic() - started
+
+    route = request.scope.get("route")
+    path_template = route.path if route is not None else request.url.path
+    metrics.HTTP_REQUESTS.labels(
+        method=request.method, path_template=path_template, status=response.status_code
+    ).inc()
+    metrics.HTTP_REQUEST_DURATION_SECONDS.labels(
+        method=request.method, path_template=path_template
+    ).observe(duration)
+    return response
+
+
+@app.get("/metrics", tags=["system"])
+def get_metrics() -> Response:
+    return Response(
+        content=generate_latest(),
+        media_type=CONTENT_TYPE_LATEST,
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 # --------------------------------------------------------------------------- auth
@@ -81,6 +125,79 @@ def current_principal(
 
 def current_org(principal: Principal = Depends(current_principal)) -> UUID:
     return principal.org_id
+
+
+def require_owner(principal: Principal = Depends(current_principal)) -> Principal:
+    """Gate for the handful of actions CLAUDE.md section 22/23's RBAC asks for:
+    reading an arbitrary local ``repo_path`` (analyze/security scan), sending
+    real sustained traffic somewhere (performance scan), provisioning an
+    environment's credentials, and managing who else is in the organization.
+    Everything else stays reachable by any authenticated member - RLS already
+    stops a member from touching another *organization's* data regardless of
+    role, so this is about actions dangerous within one's own org, not tenancy.
+    """
+    if not has_role(principal.role, at_least="owner"):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "owner role required")
+    return principal
+
+
+# --------------------------------------------------------------------- rate limiting
+
+#: Lazy: redis-py doesn't open a connection until the first command, so this
+#: never blocks import or app startup, and a Redis outage surfaces at request
+#: time (caught below) rather than crashing the whole process on boot.
+_redis_client = redis_lib.Redis.from_url(settings.redis_url, decode_responses=True)
+_rate_limiter = RateLimiter(_redis_client)
+
+
+def _too_many_requests(retry_after: int, detail: str) -> HTTPException:
+    return HTTPException(
+        status.HTTP_429_TOO_MANY_REQUESTS, detail, headers={"Retry-After": str(retry_after)}
+    )
+
+
+def rate_limit_by_ip(bucket: str, *, limit: int, window_seconds: int):
+    """Guards an unauthenticated endpoint (register/login) against brute-force
+    and spam, keyed by the caller's address since there's no identity yet to
+    key it by."""
+
+    def dependency(request: Request) -> None:
+        host = request.client.host if request.client else "unknown"
+        try:
+            result = _rate_limiter.hit(
+                f"ratelimit:{bucket}:{host}", limit=limit, window_seconds=window_seconds
+            )
+        except redis_lib.RedisError:
+            # Fails open, not closed: the budgets in modules/llm/budget.py make
+            # the same call for the same reason (README Security section) - a
+            # Redis outage should degrade a protection, not take auth down with it.
+            logger.warning("rate limiter: redis unavailable, allowing request through")
+            return
+        if not result.allowed:
+            raise _too_many_requests(result.retry_after_seconds, "rate limit exceeded")
+
+    return dependency
+
+
+def rate_limit_by_org(bucket: str, *, limit: int, window_seconds: int):
+    """Guards an expensive, queued action per *tenant*, so one organization
+    saturating the shared Celery queue can't starve every other one - RLS
+    isolates data, not throughput."""
+
+    def dependency(org_id: UUID = Depends(current_org)) -> None:
+        try:
+            result = _rate_limiter.hit(
+                f"ratelimit:{bucket}:{org_id}", limit=limit, window_seconds=window_seconds
+            )
+        except redis_lib.RedisError:
+            logger.warning("rate limiter: redis unavailable, allowing request through")
+            return
+        if not result.allowed:
+            raise _too_many_requests(
+                result.retry_after_seconds, "rate limit exceeded for this organization"
+            )
+
+    return dependency
 
 
 # ------------------------------------------------------------------------ schemas
@@ -138,6 +255,12 @@ class LoginIn(BaseModel):
     password: str
 
 
+class InviteUserIn(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+    password: str = Field(min_length=8, max_length=200)
+    role: str = "member"
+
+
 class TokenOut(BaseModel):
     access_token: str
     token_type: str = "bearer"  # noqa: S105 - a JWT scheme name, not a credential
@@ -153,12 +276,18 @@ def health() -> dict:
     return {"status": "ok", "version": app.version, "env": settings.qagent_env}
 
 
-@app.post("/api/v1/auth/register", status_code=201, tags=["auth"])
+@app.post(
+    "/api/v1/auth/register",
+    status_code=201,
+    tags=["auth"],
+    dependencies=[Depends(rate_limit_by_ip("register", limit=5, window_seconds=60))],
+)
 def register(payload: RegisterIn, session: Session = Depends(get_db)) -> TokenOut:
     """Create a new organization and its first (owner) user.
 
     Every user belongs to exactly one organization (see ADR on multi-tenancy in
     models.py), so signup and org creation are one step rather than two.
+    Rate-limited by IP (5/min): an unauthenticated endpoint that fills a table.
     """
     if not _ORG_SLUG_RE.match(payload.org_slug):
         raise HTTPException(
@@ -192,8 +321,13 @@ def register(payload: RegisterIn, session: Session = Depends(get_db)) -> TokenOu
     return TokenOut(access_token=token, org_id=str(org.id), role=user.role)
 
 
-@app.post("/api/v1/auth/login", tags=["auth"])
+@app.post(
+    "/api/v1/auth/login",
+    tags=["auth"],
+    dependencies=[Depends(rate_limit_by_ip("login", limit=10, window_seconds=60))],
+)
 def login(payload: LoginIn, session: Session = Depends(get_db)) -> TokenOut:
+    """Rate-limited by IP (10/min): a password-guessing oracle otherwise."""
     org = session.execute(
         select(models.Organization).where(models.Organization.slug == payload.org_slug)
     ).scalar_one_or_none()
@@ -217,6 +351,57 @@ def login(payload: LoginIn, session: Session = Depends(get_db)) -> TokenOut:
         user_id=user.id, org_id=org.id, role=user.role, secret_key=settings.qagent_secret_key
     )
     return TokenOut(access_token=token, org_id=str(org.id), role=user.role)
+
+
+@app.post("/api/v1/users", status_code=201, tags=["auth"])
+def invite_user(
+    payload: InviteUserIn,
+    org_id: UUID = Depends(current_org),
+    session: Session = Depends(get_db),
+    _owner: Principal = Depends(require_owner),
+) -> dict:
+    """Add another user to the caller's organization. Owner-only (RBAC,
+    CLAUDE.md section 23) - membership itself is the privilege being managed.
+
+    No invite-token/email flow: an owner sets the new user's password directly,
+    the same way `register` sets the first one. Layering email delivery on top
+    is additive whenever there's a mail sender to layer it onto; the role check
+    and the tenant-scoped uniqueness constraint (`uq_users_org_email`) are the
+    part that actually matters for RBAC and are already enforced.
+    """
+    if payload.role not in ("member", "owner"):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "role must be 'member' or 'owner'")
+
+    existing = session.execute(
+        select(models.User).where(models.User.email == payload.email.lower())
+    ).scalar_one_or_none()
+    if existing is not None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "a user with this email already exists")
+
+    user = models.User(
+        org_id=org_id,
+        email=payload.email.lower(),
+        hashed_password=hash_password(payload.password),
+        role=payload.role,
+    )
+    session.add(user)
+    session.commit()
+    return {"id": str(user.id), "email": user.email, "role": user.role}
+
+
+@app.get("/api/v1/users", tags=["auth"])
+def list_users(
+    org_id: UUID = Depends(current_org), session: Session = Depends(get_db)
+) -> list[dict]:
+    """Any authenticated member can see who else is in their own organization -
+    RLS already confines this to one org's rows regardless of role."""
+    rows = session.execute(
+        select(models.User).where(models.User.org_id == org_id).order_by(models.User.created_at)
+    ).scalars()
+    return [
+        {"id": str(u.id), "email": u.email, "role": u.role, "is_active": u.is_active}
+        for u in rows
+    ]
 
 
 @app.post("/api/v1/projects", status_code=201, tags=["projects"])
@@ -249,6 +434,7 @@ def analyze_project(
     payload: AnalyzeRepoIn,
     org_id: UUID = Depends(current_org),
     session: Session = Depends(get_db),
+    _owner: Principal = Depends(require_owner),
 ) -> dict:
     """Project Analyst agent (CLAUDE.md sections 6-8, agent 1): detect the stack
     and build the module tree from a checkout already on local disk.
@@ -259,6 +445,8 @@ def analyze_project(
     synchronously and needs none of the sandboxing section 22 requires for a
     live target. The result replaces ``Project.stack`` wholesale each run: it's
     a snapshot of the checkout as analyzed, not something to merge with history.
+    Owner-only (RBAC, CLAUDE.md section 23): it reads an arbitrary local path
+    the API process can see, which is not a member-level action.
     """
     from qagent.modules.analyzer.analyst import analyze_repository
 
@@ -283,7 +471,11 @@ def create_environment(
     payload: EnvironmentIn,
     org_id: UUID = Depends(current_org),
     session: Session = Depends(get_db),
+    _owner: Principal = Depends(require_owner),
 ) -> dict:
+    """Owner-only (RBAC): an environment carries where a scan sends real
+    traffic and, eventually, `secret_ref` - provisioning that is not a
+    member-level action."""
     if session.get(models.Project, project_id) is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "project not found")
 
@@ -303,14 +495,22 @@ def create_environment(
     return {"id": str(environment.id), "base_url": environment.base_url}
 
 
-@app.post("/api/v1/projects/{project_id}/runs", status_code=202, tags=["runs"])
+@app.post(
+    "/api/v1/projects/{project_id}/runs",
+    status_code=202,
+    tags=["runs"],
+    dependencies=[Depends(rate_limit_by_org("runs", limit=30, window_seconds=60))],
+)
 def start_run(
     project_id: UUID,
     payload: RunIn,
     org_id: UUID = Depends(current_org),
     session: Session = Depends(get_db),
 ) -> dict:
-    """Queue a scan. Never executed inline: it talks to a third-party app over the network."""
+    """Queue a scan. Never executed inline: it talks to a third-party app over
+    the network. Rate-limited per organization (30/min): nothing else stops one
+    tenant from saturating the shared Celery queue every other tenant waits on.
+    """
     if session.get(models.Project, project_id) is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "project not found")
 
@@ -500,6 +700,7 @@ def run_security_scan(
     payload: SecurityScanIn,
     org_id: UUID = Depends(current_org),
     session: Session = Depends(get_db),
+    _owner: Principal = Depends(require_owner),
 ) -> dict:
     """Static analysis via Semgrep (CLAUDE.md section 16).
 
@@ -507,6 +708,7 @@ def run_security_scan(
     contract the CLI's ``--repo`` flags already use. Semgrep only parses source,
     it never executes it, so this runs synchronously and needs none of the
     sandboxing the runner/browser/explorer stages require for a live target.
+    Owner-only (RBAC): reads an arbitrary local path.
     """
     from qagent.modules.security.semgrep import SemgrepError, SemgrepUnavailable, run_semgrep
 
@@ -565,18 +767,28 @@ def list_security_findings(
     ]
 
 
-@app.post("/api/v1/projects/{project_id}/performance/scan", status_code=202, tags=["performance"])
+@app.post(
+    "/api/v1/projects/{project_id}/performance/scan",
+    status_code=202,
+    tags=["performance"],
+    dependencies=[Depends(rate_limit_by_org("performance", limit=5, window_seconds=60))],
+)
 def start_performance_test(
     project_id: UUID,
     payload: PerformanceScanIn,
     org_id: UUID = Depends(current_org),
     session: Session = Depends(get_db),
+    _owner: Principal = Depends(require_owner),
 ) -> dict:
     """Load test via k6 (CLAUDE.md section 17): one scenario per VU level.
 
     Queued rather than run inline: unlike a security scan, this sends sustained
     real traffic to a live target for potentially minutes, which is exactly the
     kind of long, network-bound work that never belongs inside a request.
+    Owner-only (RBAC): sends real sustained traffic somewhere, at up to 5,000
+    concurrent VUs by default (CLAUDE.md section 17) - not a member-level action.
+    Rate-limited per organization (5/min) tighter than a regular scan, since
+    each call can put sustained load on a real target for minutes.
     """
     if session.get(models.Project, project_id) is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "project not found")
@@ -763,4 +975,65 @@ def dashboard(org_id: UUID = Depends(current_org), session: Session = Depends(ge
         },
         "llm_spend_usd": round(float(spend), 4),
         "generated_at": datetime.now(UTC),
+    }
+
+
+@app.get("/api/v1/usage", tags=["usage"])
+def usage(
+    since: datetime | None = None,
+    org_id: UUID = Depends(current_org),
+    session: Session = Depends(get_db),
+) -> dict:
+    """Per-organization usage for a billing period (CLAUDE.md section 23).
+
+    Distinct from `/dashboard`'s all-time `llm_spend_usd`: this is windowed,
+    which is the only shape "billing/usage" actually means - "spend since ever"
+    answers nothing a plan or an invoice needs. Defaults to the current UTC
+    calendar month, since that's the period every eventual billing cycle
+    described in CLAUDE.md section 23 would run against.
+
+    This computes the numbers a billing system would meter against; it does
+    not itself bill anyone. Wiring a real invoice or payment provider on top
+    is additive whenever there's a provider to wire - see ADR-0008.
+    """
+    period_start = since or datetime.now(UTC).replace(
+        day=1, hour=0, minute=0, second=0, microsecond=0
+    )
+
+    runs_by_status = dict(
+        session.execute(
+            select(models.TestRun.status, func.count())
+            .where(models.TestRun.created_at >= period_start)
+            .group_by(models.TestRun.status)
+        ).all()
+    )
+
+    llm = session.execute(
+        select(
+            func.count(models.LlmCall.id),
+            func.coalesce(func.sum(models.LlmCall.input_tokens + models.LlmCall.output_tokens), 0),
+            func.coalesce(func.sum(models.LlmCall.usd), 0.0),
+        ).where(models.LlmCall.created_at >= period_start)
+    ).one()
+
+    defects_by_severity = dict(
+        session.execute(
+            select(models.Bug.severity, func.count())
+            .where(models.Bug.created_at >= period_start)
+            .group_by(models.Bug.severity)
+        ).all()
+    )
+
+    return {
+        "org_id": str(org_id),
+        "period_start": period_start,
+        "generated_at": datetime.now(UTC),
+        "runs": {
+            (k.value if hasattr(k, "value") else str(k)): v for k, v in runs_by_status.items()
+        },
+        "llm": {"calls": llm[0], "tokens": llm[1], "spend_usd": round(float(llm[2]), 4)},
+        "defects": {
+            (k.value if hasattr(k, "value") else str(k)): v
+            for k, v in defects_by_severity.items()
+        },
     }

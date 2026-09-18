@@ -18,9 +18,31 @@ import jwt
 ALGORITHM = "HS256"
 ACCESS_TOKEN_TTL = timedelta(hours=12)
 
+#: Every role that has ever existed, ranked. `register` mints the first user
+#: of an organization as "owner"; every user after that is invited by an
+#: owner (main.py's `POST /api/v1/users`) and defaults to "member". A role not
+#: in this table is a bug, not a lower privilege - `has_role` raises rather
+#: than silently denying, so a typo'd role string fails loudly instead of
+#: quietly locking an org out of its own account.
+ROLE_RANK = {"member": 0, "owner": 1}
+
 
 class AuthError(Exception):
     """Invalid credentials or an invalid/expired token."""
+
+
+def has_role(role: str, *, at_least: str) -> bool:
+    """Is ``role`` at or above ``at_least`` in the hierarchy?
+
+    A plain equality check (``role == "owner"``) would need updating at every
+    call site the day a role is inserted between "member" and "owner"; ranking
+    them once here means a new intermediate role only ever changes this table.
+    """
+    if role not in ROLE_RANK:
+        raise ValueError(f"unknown role: {role!r}")
+    if at_least not in ROLE_RANK:
+        raise ValueError(f"unknown role: {at_least!r}")
+    return ROLE_RANK[role] >= ROLE_RANK[at_least]
 
 
 def hash_password(password: str) -> str:

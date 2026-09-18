@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 
 from qagent import models
 from qagent.modules.llm.safety import scrub
+from qagent.modules.observability import metrics
 from qagent.modules.storage.local import LocalArtifactStore, store_from_settings
 from qagent.modules.triage import flakiness
 from qagent.pipeline import ArtifactBytes, PipelineResult
@@ -242,6 +243,7 @@ def persist_result(
 
         if outcome.bug:
             bug = outcome.bug
+            severity = models.Severity(bug.get("severity", "medium"))
             session.add(
                 models.Bug(
                     org_id=org_id,
@@ -249,7 +251,7 @@ def persist_result(
                     result_id=record.id,
                     reference=_next_bug_reference(session, org_id),
                     title=bug.get("title", outcome.name)[:300],
-                    severity=models.Severity(bug.get("severity", "medium")),
+                    severity=severity,
                     steps=bug.get("steps", []),
                     expected=bug.get("expected"),
                     actual=bug.get("actual"),
@@ -257,6 +259,7 @@ def persist_result(
                     suggested_fix=bug.get("suggested_fix"),
                 )
             )
+            metrics.DEFECTS_TOTAL.labels(severity=severity.value).inc()
             session.flush()
 
             if outcome.artifacts:
@@ -278,6 +281,7 @@ def persist_result(
         models.RunStatus.FAILED if (result.failed or result.errored) else models.RunStatus.PASSED
     )
     run.finished_at = datetime.now(UTC)
+    metrics.RUNS_TOTAL.labels(status=run.status.value).inc()
 
     return run
 
@@ -306,6 +310,7 @@ def persist_agent_run(
     )
     session.add(agent_run)
     session.flush()
+    metrics.LLM_SPEND_USD_TOTAL.inc(llm_totals.get("usd", 0.0))
 
     for record in records:
         session.add(

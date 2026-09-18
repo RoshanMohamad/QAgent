@@ -78,9 +78,10 @@ jobs:
   db-integration:
     # Everything in `test` runs green with no database (README). This job is the
     # other half: a real Postgres + Redis, proving row-level security actually
-    # isolates tenants under the unprivileged role db_init creates, and that a
-    # real `celery worker` process consuming the real broker persists a scan
-    # end to end (ADR-0007).
+    # isolates tenants under the unprivileged role db_init creates, that a real
+    # `celery worker` process consuming the real broker persists a scan end to
+    # end (ADR-0007), and that RBAC/rate limiting/usage hold up against real
+    # infrastructure too (ADR-0008).
     runs-on: ubuntu-latest
     services:
       postgres:

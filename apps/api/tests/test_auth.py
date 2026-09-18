@@ -12,6 +12,7 @@ from qagent.modules.auth.security import (
     AuthError,
     create_access_token,
     decode_access_token,
+    has_role,
     hash_password,
     verify_password,
 )
@@ -60,3 +61,26 @@ def test_decode_rejects_expired_token() -> None:
     )
     with pytest.raises(AuthError):
         decode_access_token(expired, SECRET)
+
+
+def test_has_role_owner_satisfies_member_requirement() -> None:
+    assert has_role("owner", at_least="member") is True
+
+
+def test_has_role_member_does_not_satisfy_owner_requirement() -> None:
+    assert has_role("member", at_least="owner") is False
+
+
+def test_has_role_same_role_satisfies_itself() -> None:
+    assert has_role("member", at_least="member") is True
+    assert has_role("owner", at_least="owner") is True
+
+
+def test_has_role_rejects_unknown_role() -> None:
+    with pytest.raises(ValueError, match="unknown role"):
+        has_role("superadmin", at_least="member")
+
+
+def test_has_role_rejects_unknown_requirement() -> None:
+    with pytest.raises(ValueError, match="unknown role"):
+        has_role("member", at_least="superadmin")

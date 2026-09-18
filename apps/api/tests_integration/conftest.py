@@ -151,7 +151,7 @@ def live_worker(tmp_path_factory):
             [
                 sys.executable, "-m", "celery",
                 "-A", "qagent.worker.tasks.celery_app",
-                "worker", "--loglevel=info", "-Q", "qagent",
+                "worker", "--loglevel=info", "-Q", "qagent.scan,qagent.performance",
                 "--concurrency=1", "--pool=solo",
             ],
             cwd=str(_API_ROOT),
@@ -188,3 +188,22 @@ def _clean_tenant_tables(admin_engine):
     yield
     with admin_engine.begin() as connection:
         connection.execute(text("TRUNCATE organizations CASCADE"))
+
+
+@pytest.fixture(autouse=True)
+def _clean_rate_limits():
+    """main.py's rate limiter and Celery's broker/result backend are different
+    logical Redis databases (REDIS_URL's db 0 vs. CELERY_BROKER_URL's db 1 and
+    CELERY_RESULT_BACKEND's db 2 - see .env.example), so flushing this one never
+    touches a queued or in-flight task. Without this, every test in this session
+    that calls register/login shares one counter (TestClient's client host is
+    the fixed string "testclient", not a real, distinct IP per test), and
+    register's 5/min limit (main.py) would trip well before the suite finishes.
+    """
+    import redis as redis_lib
+
+    from qagent.config import get_settings
+
+    client = redis_lib.Redis.from_url(get_settings().redis_url)
+    client.flushdb()
+    yield

@@ -18,9 +18,10 @@ Phase 1 (API quality loop), the dashboard, `compose` mode, static route parsing,
 a first browser E2E layer, an Explorer Agent — link-crawl and interactive
 (form filling, clicking, inferred state transitions) — self-healing selector
 proposals, issue tracker sync (GitHub and Jira), a repository analyzer / Project
-Analyst agent, and evidence artifacts on browser-found bugs are implemented and
-measured. See [Roadmap](#roadmap) for what's done versus what's still open
-within phases 1-5.
+Analyst agent, evidence artifacts on browser-found bugs, and a scoped Phase 6
+(RBAC, rate limiting, `/metrics`, usage tracking, job-queue separation) are
+implemented and measured. See [Roadmap](#roadmap) for what's done versus what's
+still open.
 
 Current measured performance against the reference fixture:
 
@@ -39,7 +40,7 @@ scores 5 of 6 (83%), because it seeds one defect (an IDOR) the rule set honestly
 cannot catch yet, still at 0% false positives.
 
 **Verified:** the pipeline (discovery, generation, execution, triage, reporting), the
-CLI, the eval harness, 267 unit tests and lint — all run green without a database. The
+CLI, the eval harness, 280 unit tests and lint — all run green without a database. The
 dashboard was rendered against real pipeline output through the documented API
 contract: all three pages, the setup state, and the failure-analysis chart.
 
@@ -397,6 +398,33 @@ cp .env.admin.example .env.admin   # bootstrap-only superuser DSN - api only, ne
 docker compose up --build
 ```
 
+### Access control, rate limits, usage and metrics
+
+`register` always mints exactly one user, "owner" — an owner adds anyone else:
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/v1/users -H "Authorization: Bearer $TOKEN" \
+  -d '{"email": "teammate@example.com", "password": "...", "role": "member"}'
+```
+
+A member can do everything except read an arbitrary local path (`analyze`,
+`security/scan`), send real sustained traffic (`performance/scan`), provision an
+environment, or manage membership — those need an owner (ADR-0008), and RLS
+already confines *both* roles to their own organization's data regardless.
+
+`register`/`login` are rate-limited by IP, `runs`/`performance/scan` by
+organization (Redis-backed, fails open on a Redis outage — same rule as the LLM
+budgets). A billing period's usage:
+
+```bash
+curl http://127.0.0.1:8000/api/v1/usage -H "Authorization: Bearer $TOKEN"
+# {"runs": {"passed": 12, "failed": 3}, "llm": {"calls": 40, "spend_usd": 0.81}, "defects": {"high": 2}}
+```
+
+And `GET /metrics` (Prometheus text format, no auth — matching a scraper's own
+contract): HTTP requests by route template and status, finished runs by status,
+defects by severity, cumulative LLM spend.
+
 ### Dashboard
 
 ```bash
@@ -502,6 +530,7 @@ The CLI, the worker and the eval harness all run the identical loop — which me
 | [0005](docs/decisions/ADR-0005-interactive-exploration.md) | Interactive explorer state identity is `(path, structural fingerprint)`; actions are a closed schema-constrained set, ranked rules-first. |
 | [0006](docs/decisions/ADR-0006-repository-analyzer.md) | The repository analyzer reads and parses text only — never executes a checkout's own tooling — and every detection carries its evidence. |
 | [0007](docs/decisions/ADR-0007-rls-requires-an-unprivileged-role.md) | The API/worker connect as a separate, unprivileged role — never the superuser that bootstraps the schema — or row-level security is silently bypassed. |
+| [0008](docs/decisions/ADR-0008-phase-6-scope.md) | Phase 6 built RBAC, rate limiting, metrics, usage tracking and queue separation now; payment integration, cluster autoscaling and distributed tracing stay deferred until there's a real deployment to size them against. |
 
 ---
 
@@ -526,6 +555,15 @@ so both are treated as hostile:
   (ADR-0007): a superuser bypasses RLS unconditionally, `FORCE` included.
 - **Budgets.** Per-run caps on calls, tokens and spend. Exceeding one degrades to the
   rule-based path rather than failing the run.
+- **RBAC.** `require_owner` (ADR-0008) gates reading an arbitrary local `repo_path`
+  (`analyze`, `security/scan`), sending real sustained traffic (`performance/scan`),
+  provisioning an environment, and managing org membership. Every other authenticated
+  action stays reachable by any member — RLS already stops cross-*tenant* access
+  regardless of role, so this is about actions dangerous within one's own org.
+- **Rate limiting.** Redis-backed, fixed-window: IP-keyed on `register`/`login`
+  (a password-guessing oracle otherwise), org-keyed on `runs`/`performance/scan`
+  (nothing else stops one tenant saturating the shared Celery queue). Fails open,
+  not closed, on a Redis outage — same rule as budgets above.
 
 The worker container runs read-only, with `no-new-privileges`, no exposed ports, and
 no Docker socket.
@@ -561,7 +599,8 @@ apps/api/qagent/
 ├── eval/harness.py        scores the pipeline against ground truth
 ├── db_init.py             schema, the unprivileged app role, RLS (ADR-0007)
 └── worker/tasks.py        Celery
-apps/api/tests_integration/  real Postgres + Redis: RLS isolation, a live worker (ADR-0007)
+apps/api/tests_integration/  real Postgres + Redis: RLS isolation, a live worker,
+                              RBAC, rate limiting, usage (ADR-0007, ADR-0008)
 apps/web/                  Next.js dashboard (server components, no client fetching)
 apps/web/tests/            Vitest + Testing Library: components, lib/api.ts, middleware
 packages/fixtures/         apps with labelled, seeded defects (buggy-shop: FastAPI,
@@ -572,7 +611,7 @@ docs/decisions/            ADRs
 ## Tests
 
 ```bash
-cd apps/api && pytest tests -q     # 267 tests, no database needed
+cd apps/api && pytest tests -q     # 280 tests, no database needed
 ```
 
 Against a real Postgres + Redis (`db-integration` in CI, ADR-0007):
@@ -628,12 +667,30 @@ browser extension and its recorder; and OWASP ZAP/Trivy alongside the existing
 Semgrep SAST integration and the IDOR-shaped gap
 [task-tracker](packages/fixtures/task-tracker)'s BUG-201 documents.
 
-What's left is mostly Phase 6 (CLAUDE.md §23): multi-tenancy hardening beyond
-the RLS already in place (now itself verified against a real database rather
-than merely reviewed — ADR-0007), distributed workers, and the operational
-surface (rate limiting, billing/usage, broader observability) that only matters
-once there's load to justify it — see ADR-0001 on resisting premature
-architecture.
+Phase 6 (CLAUDE.md §23) is scoped, not skipped — see
+[ADR-0008](docs/decisions/ADR-0008-phase-6-scope.md). Built: RBAC (`require_owner`
+gates the actions that read an arbitrary local path, send real traffic, or manage
+org membership; `POST /api/v1/users` closes the gap where there was previously
+no way to have a second user in an organization at all), rate limiting
+(Redis-backed, IP-keyed on auth endpoints, org-keyed on run/performance-scan
+triggers, fails open on a Redis outage), observability (`GET /metrics`,
+Prometheus format), usage tracking (`GET /api/v1/usage`, windowed — not
+`/dashboard`'s all-time spend), and job-queue separation (`qagent.scan` /
+`qagent.performance`, so load-test capacity scales independently of ordinary
+scans). Deliberately not built: payment/invoicing integration, Kubernetes
+manifests or autoscaling policies, and distributed tracing — all three need a
+real deployment or real load to size against, and ADR-0001 is exactly the
+argument against building them on guesses.
+
+Still open elsewhere: within CLAUDE.md phases 1-5, the Test Planner (agent 2)
+and a real Playwright/pytest emitter for generated specs (agent 3 currently
+ships declarative test documents, not files, by design — see
+[How it works](#how-it-works)); Repository RAG; HAR/trace evidence and evidence
+on API/interactive-exploration bugs, not just browser-E2E ones (the same
+`Artifact` mechanism, extended); the browser extension and its recorder; and
+OWASP ZAP/Trivy alongside the existing Semgrep SAST integration and the
+IDOR-shaped gap [task-tracker](packages/fixtures/task-tracker)'s BUG-201
+documents.
 
 More fixtures are the highest-leverage work at any point: every metric above is only
 as trustworthy as the ground truth behind it.

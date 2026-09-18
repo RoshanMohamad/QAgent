@@ -115,11 +115,16 @@ def test_fill_fake_data_false_skips_fill_actions() -> None:
     assert enumerate_actions(elements, policy) == []
 
 
-def test_max_actions_per_page_caps_result() -> None:
+def test_enumerate_actions_is_not_capped_by_max_actions_per_page() -> None:
+    """max_actions_per_page is a total-actions-executed budget enforced by the
+    caller (modules/explorer/interact.py), not a visibility limit here - the
+    required-fill-before-submit gate needs to see every required field, even
+    ones that would rank below the top N, or it can't defer a submit it never
+    saw was unsafe."""
     elements = [ActionableElement(tag="button", text=f"btn {i}", attrs={}) for i in range(10)]
     policy = InteractionPolicy(max_actions_per_page=3)
 
-    assert len(enumerate_actions(elements, policy)) == 3
+    assert len(enumerate_actions(elements, policy)) == 10
 
 
 # --------------------------------------------------------------------------- arbitration

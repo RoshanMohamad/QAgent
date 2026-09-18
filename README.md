@@ -180,8 +180,17 @@ heuristic (testid, call-to-action text, form membership, required-ness,
 position) — no model needed to produce a useful result. A model is consulted
 only when the ranking is genuinely ambiguous, and even then it can only choose
 an index into the already-ranked candidates, never invent a selector or an
-action (ADR-0004 point 3). Required fields are filled before a form's submit
-button is chosen, and forms are only ever filled with synthetic values.
+action (ADR-0004 point 3). Required fields are filled before their own form's
+submit button fires — scoped per form, so one empty field never blocks a
+*different* form elsewhere on the page — and forms are only ever filled with
+synthetic values.
+
+A page offering several independent things worth trying (two separate forms,
+a form plus an unrelated button) doesn't lose the others the moment one of
+them is chosen: each top-level candidate gets its own reload-and-try attempt,
+so the explorer covers what the page actually offers rather than only ever
+walking the single highest-ranked path. A `confirm()`/`alert()` triggered by
+any action is auto-dismissed rather than left to hang the crawl.
 
 State identity is `(path, structural fingerprint)`, not bare URL, so an action
 that changes the page without navigating — a form submitting into a "thanks"
@@ -464,7 +473,7 @@ docs/decisions/            ADRs
 ## Tests
 
 ```bash
-cd apps/api && pytest tests -q     # 198 tests
+cd apps/api && pytest tests -q     # 204 tests
 ```
 
 CI runs lint, unit tests, **and the evaluation harness** — a change that degrades

@@ -63,6 +63,10 @@ class ElementRef:
     input_type: str | None
     text: str | None
     testid: str | None
+    #: The owning form's index (see ActionableElement.form_index), or None.
+    #: Lets a caller scope "are this form's required fields filled" checks to
+    #: the right form when a page has more than one.
+    form_index: int | None = None
 
 
 @dataclass
@@ -92,6 +96,10 @@ class ActionOutcome:
 
 @dataclass
 class InteractionPolicy:
+    #: Hard cap on total actions *executed* on one page (across every branch
+    #: attempt — see modules/explorer/interact.py), enforced by the caller.
+    #: Not a ranking-visibility limit: enumerate_actions always returns every
+    #: safe candidate so the required-field gate can see all of them.
     max_actions_per_page: int = 5
     allow_destructive: bool = False
     destructive_keywords: tuple[str, ...] = (
@@ -166,6 +174,7 @@ def _build_ref(element: ActionableElement) -> ElementRef:
         input_type=element.attrs.get("type"),
         text=element.text,
         testid=element.attrs.get("data-testid"),
+        form_index=element.form_index,
     )
 
 
@@ -198,7 +207,14 @@ def _action_for_element(element: ActionableElement, policy: InteractionPolicy) -
             required=element.required,
         )
 
-    if input_type == "submit" or (tag == "button" and "submit" in (element.text or "").lower()):
+    # A plain <button> with no explicit type defaults to type="submit" per the
+    # HTML spec *unconditionally* - including one with no owning form at all,
+    # where "submitting" does nothing. Require in_form too, or a standalone
+    # button (a JS-driven "Add to cart") gets wrongly treated as this page's
+    # form submission and gated by required-field rules that don't apply to it.
+    if element.in_form and (
+        input_type == "submit" or (tag == "button" and "submit" in (element.text or "").lower())
+    ):
         return Action(type=ActionType.SUBMIT, target=ref, reason="submit the form")
 
     if tag in {"button", "a"} or element.attrs.get("role") == "button" or input_type == "button":
@@ -231,6 +247,15 @@ def enumerate_actions(
 
     Destructive-looking elements are dropped before scoring, never merely
     ranked low — a footgun that occasionally wins arbitration is not safe.
+
+    Deliberately returns the *full* ranked list, uncapped: the required-fill-
+    before-submit gate in modules/explorer/interact.py needs to see every
+    still-required field to decide whether a SUBMIT is safe, and truncating
+    here first would silently hide a required field the gate never gets a
+    chance to defer against — exactly the bug that let a second form's submit
+    fire before its own field was ever attempted. ``policy.max_actions_per_page``
+    is enforced once, as a total-actions-spent-on-this-page budget, by the
+    caller that actually executes actions — not as a visibility limit here.
     """
     policy = policy or InteractionPolicy()
     scored: list[Action] = []
@@ -251,7 +276,7 @@ def enumerate_actions(
         scored.append(action)
 
     scored.sort(key=lambda a: a.score, reverse=True)
-    return scored[: policy.max_actions_per_page]
+    return scored
 
 
 # --------------------------------------------------------------------------- arbitration

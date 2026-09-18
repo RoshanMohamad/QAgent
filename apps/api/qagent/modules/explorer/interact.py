@@ -206,46 +206,77 @@ def _interact(
 
     while queue and len(visited_keys) < max_pages:
         url, depth = queue.popleft()
-
-        try:
-            page.goto(url, timeout=timeout_ms, wait_until="load")
-        except Exception as exc:  # noqa: BLE001 - an unreachable page is a dead-end node
-            logger.debug("could not load %s: %s", url, exc)
-            node = InteractionNode(url=url, depth=depth)
-            key = _state_key(node)
-            if key not in visited_keys:
-                visited_keys.add(key)
-                graph.add_node(node)
-            continue
-
         console_buffer: list[str] = []
         page_error_buffer: list[str] = []
-
-        def _on_console(msg: Any, _buf: list[str] = console_buffer) -> None:
-            if msg.type == "error":
-                _buf.append(msg.text)
-
-        def _on_page_error(exc: Any, _buf: list[str] = page_error_buffer) -> None:
-            _buf.append(str(exc))
-
-        page.on("console", _on_console)
-        page.on("pageerror", _on_page_error)
-
-        current_url = url
-        # Selectors already attempted during this page visit. A structural
-        # fingerprint deliberately can't tell "email filled in" apart from
-        # "email empty" (see `fingerprint`'s docstring), so relying on the
-        # fingerprint alone to decide whether there's anything left to try
-        # would stop after the very first field of a multi-field form. This
-        # tracks progress explicitly instead, and doubles as the guard against
-        # looping forever on an action that turns out to be a no-op.
+        handlers_registered = False
+        # Every selector attempted for this URL, across every branch attempt
+        # below - persists across reloads so a branch already tried is never
+        # tried again, which is also what guarantees the branch loop
+        # terminates (the reload always re-derives the same candidate
+        # universe; this set only ever grows).
         attempted_selectors: set[str] = set()
+        actions_this_url = 0
 
-        # Drill into this page: extract -> fingerprint -> act -> repeat on the
-        # same live page (no reload) as long as the action stays on this URL
-        # and produces progress (a state nobody has recorded, or an action
-        # nobody has tried yet).
-        while True:
+        # A page can offer several independent things worth trying (two
+        # separate forms, a form plus an unrelated button). Rather than take
+        # the single top-ranked action and move on - abandoning every other
+        # candidate the moment one of them navigates away - each branch gets
+        # its own attempt: reload to the pristine page, then drill as deep as
+        # that one branch goes (filling an entire form before submitting it,
+        # for instance) before reloading again for the next-best untried
+        # branch. `need_reload` is False only while progress is happening on
+        # the *same* live DOM without a fresh navigation (mid-form, or a
+        # same-URL state change) - that is the one case where reloading would
+        # erase the very progress just made.
+        need_reload = True
+        current_url = url
+
+        while total_actions < max_total_actions and actions_this_url < policy.max_actions_per_page:
+            # Captured before `need_reload` is cleared below: this iteration's
+            # own "did today's data come from a fresh reload" fact, distinct
+            # from the flag that controls what happens *next* iteration.
+            just_reloaded = need_reload
+
+            if need_reload:
+                try:
+                    page.goto(current_url, timeout=timeout_ms, wait_until="load")
+                except Exception as exc:  # noqa: BLE001 - an unreachable page is a dead-end node
+                    logger.debug("could not load %s: %s", current_url, exc)
+                    if not handlers_registered:
+                        node = InteractionNode(url=current_url, depth=depth)
+                        key = _state_key(node)
+                        if key not in visited_keys:
+                            visited_keys.add(key)
+                            graph.add_node(node)
+                    break
+
+                if not handlers_registered:
+                    # Registered once per URL, not per reload: Playwright
+                    # binds `page.on` listeners to the Page, not the
+                    # Document, so they already survive a reload - adding a
+                    # fresh closure on every branch's reload would just
+                    # double-record the same real-world event.
+                    def _on_console(msg: Any, _buf: list[str] = console_buffer) -> None:
+                        if msg.type == "error":
+                            _buf.append(msg.text)
+
+                    def _on_page_error(exc: Any, _buf: list[str] = page_error_buffer) -> None:
+                        _buf.append(str(exc))
+
+                    def _on_dialog(dialog: Any) -> None:
+                        # A confirm()/alert() blocks Playwright's synchronous
+                        # call until dismissed. Auto-dismissing (never accept)
+                        # keeps a crawl from hanging on any page that happens
+                        # to use a native dialog, destructive-labelled or not.
+                        dialog.dismiss()
+
+                    page.on("console", _on_console)
+                    page.on("pageerror", _on_page_error)
+                    page.on("dialog", _on_dialog)
+                    handlers_registered = True
+
+                need_reload = False
+
             try:
                 title = page.title()
             except Exception:  # noqa: BLE001 - title is cosmetic
@@ -277,7 +308,7 @@ def _interact(
                         queued_urls.add(link)
                         queue.append((link, depth + 1))
 
-            can_act = depth < max_depth and total_actions < max_total_actions
+            can_act = depth < max_depth
             candidates = enumerate_actions(elements, policy) if can_act else []
             candidates = [a for a in candidates if a.target.selector not in attempted_selectors]
 
@@ -285,25 +316,44 @@ def _interact(
             # ranked highest by testid/CTA-text alone would otherwise fire
             # before anything is filled in, and real browsers routinely block
             # that submission via native constraint validation anyway -
-            # leaving nothing for the (fingerprint-based) dedup above to tell
-            # apart from the untouched page, ending the drill right there.
-            has_pending_required_fill = any(
-                a.required and a.type in {ActionType.FILL, ActionType.SELECT} for a in candidates
-            )
-            if has_pending_required_fill:
-                candidates = [a for a in candidates if a.type is not ActionType.SUBMIT]
+            # leaving nothing for the fingerprint-based dedup above to tell
+            # apart from the untouched page, ending the branch right there.
+            # Scoped by form_index so one form's empty field never blocks a
+            # wholly unrelated form's submit elsewhere on the same page.
+            pending_forms = {
+                a.target.form_index
+                for a in candidates
+                if a.required and a.type in {ActionType.FILL, ActionType.SELECT}
+            }
+            if pending_forms:
+                candidates = [
+                    a
+                    for a in candidates
+                    if not (a.type is ActionType.SUBMIT and a.target.form_index in pending_forms)
+                ]
 
             node.candidate_actions = candidates
             node.actions_available = len(candidates)
 
             if not candidates:
-                break
+                if just_reloaded:
+                    # Just reloaded to the pristine page and it still has
+                    # nothing left untried - genuinely done with this URL.
+                    break
+                # A dead end mid-branch (a no-op click, a state with nothing
+                # actionable). Go back to the pristine page and see whether a
+                # different top-level branch is still worth trying.
+                need_reload = True
+                continue
 
             chosen = choose_action(
                 candidates, page_context={"url": current_url, "title": title or ""}, llm=llm
             )
             if chosen is None:
-                break
+                if just_reloaded:
+                    break
+                need_reload = True
+                continue
 
             outcome = _execute_action(
                 page,
@@ -315,26 +365,32 @@ def _interact(
             node.actions_taken.append(outcome)
             attempted_selectors.add(chosen.target.selector)
             total_actions += 1
+            actions_this_url += 1
 
             if not outcome.ok or not outcome.resulting_url:
-                break
+                need_reload = True
+                continue
 
             if not _same_origin(outcome.resulting_url, root):
-                break  # navigated off-site; nothing more to explore from here
+                need_reload = True  # navigated off-site; go back and try another branch
+                continue
 
             if outcome.resulting_url != current_url:
                 # Navigated to a new URL: hand it to the outer BFS like a
                 # discovered link, so it gets its own depth budget and a fresh
-                # `goto` rather than looping in place on the wrong page.
+                # `goto` rather than looping in place on the wrong page - then
+                # come back and try this URL's other branches.
                 graph.add_edge(key, outcome.resulting_url)
                 if outcome.resulting_url not in queued_urls and len(queued_urls) < max_pages:
                     queued_urls.add(outcome.resulting_url)
                     queue.append((outcome.resulting_url, depth + 1))
-                break
+                need_reload = True
+                continue
 
-            # Same URL, new DOM state (validation message, item added, ...):
-            # loop again without reloading, so the next iteration's fingerprint
-            # reflects the change instead of reverting it.
+            # Same URL, new DOM state (validation message, item added, a form
+            # submitting in place, ...): keep going on the live DOM without
+            # reloading, so the next iteration's fingerprint reflects the
+            # change instead of reverting it.
 
     return graph
 

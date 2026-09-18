@@ -76,6 +76,20 @@ def test_extract_carries_select_options() -> None:
     assert elements[0].options == ["", "us", "ca"]
 
 
+def test_extract_carries_form_index_for_scoping_required_fields_per_form() -> None:
+    page = _FakePage(
+        [
+            {"tag": "input", "id": None, "classes": [], "attrs": {}, "text": None, "form_index": 0},
+            {"tag": "input", "id": None, "classes": [], "attrs": {}, "text": None, "form_index": 1},
+            {"tag": "a", "id": None, "classes": [], "attrs": {}, "text": "Home", "form_index": None},
+        ]
+    )
+
+    elements = extract_actionable_elements(page)
+
+    assert [el.form_index for el in elements] == [0, 1, None]
+
+
 def test_extract_marks_disabled_and_invisible_elements() -> None:
     page = _FakePage(
         [

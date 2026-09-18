@@ -80,12 +80,43 @@ Three problems had to be solved before any of that was safe to build:
    produces a `real_bug` verdict and a bug report, regardless of which element
    triggered it.
 
-6. **Bounded by construction, not by luck.** `max_pages`, `max_depth`,
+6. **Every independent branch on a page gets its own attempt, not just the top-ranked
+   one.** The naive version of this loop — pick the best action, follow wherever it
+   leads, move on — abandons every other candidate the moment the first one navigates
+   away, so a page with two independent forms, or a form plus an unrelated button,
+   would only ever explore one of them. Instead, each top-level candidate gets a fresh
+   `page.goto` back to the pristine page before it's tried, and only the specific
+   selectors already attempted (`attempted_selectors`, scoped to one URL visit) are
+   excluded from the next attempt — so the branch loop provably terminates (the
+   candidate set behind a fresh reload is always the same; only that exclusion set
+   grows) while still covering everything the page offers, bounded by
+   `max_actions_per_page`/`max_total_actions`.
+
+   This is also why `enumerate_actions` returns its full ranked list, uncapped: an
+   early version capped it there, which silently hid a low-ranked but still-required
+   field from the gate below, before the gate ever got a chance to defer its form's
+   submit. The cap belongs where actions are actually spent, not where they're ranked.
+
+7. **Required-field gating is scoped per form, and dialogs are never allowed to
+   block.** A SUBMIT is deferred only while *its own* form (`form_index`, from
+   `document.forms`) still has an unattempted required field — an empty field in an
+   unrelated form on the same page must never block a form that's already complete. A
+   plain `<button>` defaults to `type="submit"` per the HTML spec even with no owning
+   form at all, so SUBMIT classification additionally requires `in_form`, or a
+   JS-driven button with no form (an "Add to cart") would be wrongly gated by rules
+   that only make sense for a real submission. Separately, a `confirm()`/`alert()`
+   triggered by any action is auto-dismissed (`page.on("dialog", ...)`) — otherwise a
+   single native dialog anywhere on the page blocks Playwright's synchronous call and
+   hangs the entire crawl, regardless of whether that action's element looked
+   destructive.
+
+8. **Bounded by construction, not by luck.** `max_pages`, `max_depth`,
    `max_total_actions`, and `max_actions_per_page` cap the crawl the same way
-   `crawler.explore` already caps a link-only one. Because progress within a page visit
-   is tracked by attempted selectors rather than by re-deriving it from the
-   fingerprint, the candidate list for a given page strictly shrinks every iteration
-   until it's empty — the loop cannot spin on a no-op action.
+   `crawler.explore` already caps a link-only one. Because progress is tracked by
+   attempted selectors rather than by re-deriving it from the fingerprint, the
+   candidate list for a given branch attempt strictly shrinks until it's empty — the
+   loop cannot spin on a no-op action, and cannot spin on a page whose fingerprint
+   never changes either.
 
 ## Consequences
 
@@ -95,10 +126,15 @@ Three problems had to be solved before any of that was safe to build:
 - `Environment.interactive_exploration_enabled` (default `False`, same shape as
   `e2e_enabled`) gates this in the persisted pipeline; existing environments do not
   start clicking things on upgrade.
-- A form with more required fields than `max_actions_per_page` can rank some of them
-  out of the candidate list before the "defer submit" rule ever sees them. Accepted for
-  v1 — the cap exists to bound noise, and the failure mode is "submits an incomplete
-  form," not a crash or a false defect report.
+- Trying every branch costs one `page.goto` per branch instead of one per page — more
+  network/CPU time for the same page, traded for actually covering what it offers.
+  `max_actions_per_page` is the knob that bounds this, now genuinely a total-spend
+  budget rather than a ranking cutoff that could be worked around by accident.
+- The explorer only ever walks *one* path forward through a same-URL DOM-state chain
+  once it stops reloading (a submitted form leading to a further state change, say) —
+  it does not backtrack *inside* that chain to try alternatives partway through it, only
+  between independent top-level branches. Revisit if that proves to hide real coverage
+  gaps in practice.
 - Interaction traces are stored in `TestResult.response`'s existing JSON column
   (`{"actions": [...]}`) rather than a new table; revisit only if that blob proves too
   large or unqueryable in practice.

@@ -481,12 +481,9 @@ def explore(
         output.write_text(json.dumps(graph.to_dict(), indent=2), encoding="utf-8")
         console.print(f"\n[dim]wrote {output}[/dim]")
 
-    if interact:
-        if fail_on_defect and defect_found:
-            raise typer.Exit(code=1)
-        return
-
     if not check:
+        if interact and fail_on_defect and defect_found:
+            raise typer.Exit(code=1)
         return
 
     run_browser_checks = _import_browser_runner()
@@ -496,7 +493,7 @@ def explore(
     console.print()
     _render_browser_result(result, title="QAgent explore --check")
 
-    if fail_on_defect and result.failed:
+    if fail_on_defect and (result.failed or defect_found):
         raise typer.Exit(code=1)
 
 

@@ -29,17 +29,40 @@ def _null_llm() -> LlmClient:
     return LlmClient(settings=get_settings(), provider=NullProvider(), budget=Budget(10, 1000, 1.0))
 
 
-def _button(testid: str, text: str) -> dict:
+def _button(testid: str, text: str, form_index: int | None = None) -> dict:
     return {
         "tag": "button",
         "id": None,
         "classes": [],
-        "attrs": {"data-testid": testid},
+        "attrs": {"data-testid": testid, "type": "submit"} if form_index is not None else {
+            "data-testid": testid
+        },
         "text": text,
         "required": False,
         "disabled": False,
         "visible": True,
-        "in_form": False,
+        "in_form": form_index is not None,
+        "form_index": form_index,
+        "label": None,
+        "options": [],
+    }
+
+
+def _input(name: str, form_index: int, testid: str | None = None) -> dict:
+    attrs = {"type": "text", "name": name}
+    if testid:
+        attrs["data-testid"] = testid
+    return {
+        "tag": "input",
+        "id": None,
+        "classes": [],
+        "attrs": attrs,
+        "text": None,
+        "required": True,
+        "disabled": False,
+        "visible": True,
+        "in_form": True,
+        "form_index": form_index,
         "label": None,
         "options": [],
     }
@@ -176,6 +199,136 @@ def test_max_total_actions_caps_actions_taken() -> None:
 
     total_actions_recorded = sum(len(n.actions_taken) for n in graph.nodes.values())
     assert total_actions_recorded == 1
+
+
+def test_max_actions_per_page_caps_actions_on_one_url() -> None:
+    """`max_actions_per_page` bounds the *total* actions spent on one URL
+    across every branch attempt, not just the size of a single ranking call."""
+    states = {
+        "start": {
+            "url": ROOT,
+            "elements": [_button("a-btn", "A"), _button("b-btn", "B"), _button("c-btn", "C")],
+        },
+    }
+    page = FakeInteractivePage(states, entry_by_url={ROOT: "start"})
+
+    graph = _interact(
+        page,
+        root=ROOT,
+        policy=InteractionPolicy(max_actions_per_page=2),
+        llm=_null_llm(),
+        max_pages=25,
+        max_depth=3,
+        max_total_actions=40,
+        timeout_ms=5000,
+    )
+
+    total_actions_recorded = sum(len(n.actions_taken) for n in graph.nodes.values())
+    assert total_actions_recorded == 2
+
+
+def test_two_independent_click_candidates_are_both_eventually_tried() -> None:
+    """The fix for the "only one branch per page" gap: a page offering two
+    independent actions must not abandon the second the moment the first one
+    is chosen and explored - both get their own reload-and-try attempt."""
+    states = {
+        "start": {
+            "url": ROOT,
+            "elements": [_button("a-btn", "A"), _button("b-btn", "B")],
+        },
+        "dead_a": {"url": ROOT, "elements": []},
+        "dead_b": {"url": ROOT, "elements": []},
+    }
+    states["start"]["transitions"] = {
+        'button[data-testid="a-btn"]': "dead_a",
+        'button[data-testid="b-btn"]': "dead_b",
+    }
+    page = FakeInteractivePage(states, entry_by_url={ROOT: "start"})
+
+    graph = _interact(
+        page,
+        root=ROOT,
+        policy=InteractionPolicy(),
+        llm=_null_llm(),
+        max_pages=25,
+        max_depth=3,
+        max_total_actions=40,
+        timeout_ms=5000,
+    )
+
+    start_node = next(n for n in graph.nodes.values() if n.actions_available == 2 or n.actions_taken)
+    tried_testids = {o.action.target.testid for o in start_node.actions_taken}
+    assert tried_testids == {"a-btn", "b-btn"}
+    # dead_a and dead_b are structurally identical (both just "no elements"),
+    # so they correctly collapse onto the same fingerprint - the point of this
+    # test is that *both* buttons were tried, not that every destination is
+    # distinguishable from a genuinely different one.
+    assert len(graph.nodes) == 2
+
+
+def test_required_field_gating_is_scoped_per_form() -> None:
+    """A required field belonging to one form must never block a *different*
+    form's submit button on the same page (ADR-0005)."""
+    f0_field = _input("f0field", form_index=0)
+    f1_field = _input("f1field", form_index=1, testid="f1field-input")
+    submit0 = _button("submit0", "Save", form_index=0)
+    submit1 = _button("submit1", "Login", form_index=1)
+    states = {
+        "start": {"url": ROOT, "elements": [f1_field, submit1, f0_field, submit0]},
+        "done1": {"url": ROOT, "elements": []},
+    }
+    f1_selector = 'input[data-testid="f1field-input"]'
+    submit1_selector = 'button[data-testid="submit1"]'
+    states["start"]["transitions"] = {
+        f1_selector: "start",  # filling stays on the same (pristine) state
+        submit1_selector: "done1",
+    }
+    page = FakeInteractivePage(states, entry_by_url={ROOT: "start"})
+
+    graph = _interact(
+        page,
+        root=ROOT,
+        policy=InteractionPolicy(max_actions_per_page=10),
+        llm=_null_llm(),
+        max_pages=25,
+        max_depth=3,
+        max_total_actions=40,
+        timeout_ms=5000,
+    )
+
+    # Form 1's submit fired and reached its own state, even though form 0's
+    # required field (f0field) was never filled.
+    assert any(n.dom_fingerprint and n.url == ROOT and n.actions_available == 0 for n in graph.nodes.values())
+    all_outcomes = [o for n in graph.nodes.values() for o in n.actions_taken]
+    submit1_outcomes = [o for o in all_outcomes if o.action.target.selector == submit1_selector]
+    assert submit1_outcomes and submit1_outcomes[0].ok is True
+    assert submit1_outcomes[0].resulting_url == ROOT
+
+
+def test_dialog_handler_is_registered_and_dismisses() -> None:
+    states = {
+        "start": {"url": ROOT, "elements": [_button("alert-btn", "Trigger")]},
+        "after": {"url": ROOT, "elements": []},
+    }
+    states["start"]["transitions"] = {'button[data-testid="alert-btn"]': "after"}
+    page = FakeInteractivePage(states, entry_by_url={ROOT: "start"})
+
+    _interact(
+        page,
+        root=ROOT,
+        policy=InteractionPolicy(),
+        llm=_null_llm(),
+        max_pages=25,
+        max_depth=3,
+        max_total_actions=40,
+        timeout_ms=5000,
+    )
+
+    assert "dialog" in page._handlers
+    fake_dialog = types.SimpleNamespace(dismissed=False)
+    fake_dialog.dismiss = lambda: setattr(fake_dialog, "dismissed", True)
+    page._handlers["dialog"](fake_dialog)
+    assert fake_dialog.dismissed is True
 
 
 def test_dead_end_page_is_recorded_and_bfs_continues_via_links() -> None:

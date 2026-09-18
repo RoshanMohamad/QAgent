@@ -95,6 +95,39 @@ def test_explore_interact_exits_nonzero_when_action_finds_a_defect(monkeypatch) 
     assert result.exit_code == 1
 
 
+def test_explore_interact_and_check_both_run(monkeypatch) -> None:
+    """Regression guard: --interact used to return before --check's page-load
+    checks ever ran, silently dropping the flag when both were passed."""
+    graph = InteractionGraph(root="http://x/")
+    graph.add_node(InteractionNode(url="http://x/", depth=0, dom_fingerprint="abc"))
+
+    monkeypatch.setattr(
+        "qagent.modules.explorer.interact.explore_interactive", lambda **kwargs: graph
+    )
+
+    check_calls: dict = {}
+
+    class _FakeCheckResult:
+        failed: list = []
+        checks: list = []
+
+        def summary(self):
+            return {"base_url": "http://x/", "total": 0, "passed": 0, "failed": 0, "duration_s": 0}
+
+    def fake_run_browser_checks(**kwargs):
+        check_calls.update(kwargs)
+        return _FakeCheckResult()
+
+    monkeypatch.setattr(
+        "qagent.modules.browser.runner.run_browser_checks", fake_run_browser_checks
+    )
+
+    result = runner.invoke(app, ["explore", "--url", "http://x/", "--interact", "--check"])
+
+    assert result.exit_code == 0
+    assert check_calls  # run_browser_checks was actually invoked, not skipped
+
+
 def test_explore_interact_no_fail_on_defect_exits_zero(monkeypatch) -> None:
     graph = InteractionGraph(root="http://x/")
     node = InteractionNode(url="http://x/", depth=0, dom_fingerprint="abc")

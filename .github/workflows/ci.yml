@@ -142,6 +142,10 @@ jobs:
         working-directory: apps/web
         run: npm install --no-audit --no-fund
 
+      - name: Test
+        working-directory: apps/web
+        run: npm test
+
       - name: Build (type-checks the API contract)
         working-directory: apps/web
         run: npm run build

@@ -563,6 +563,7 @@ apps/api/qagent/
 └── worker/tasks.py        Celery
 apps/api/tests_integration/  real Postgres + Redis: RLS isolation, a live worker (ADR-0007)
 apps/web/                  Next.js dashboard (server components, no client fetching)
+apps/web/tests/            Vitest + Testing Library: components, lib/api.ts, middleware
 packages/fixtures/         apps with labelled, seeded defects (buggy-shop: FastAPI,
                            task-tracker: Flask, incl. one documented detection gap)
 docs/decisions/            ADRs
@@ -586,8 +587,26 @@ export CELERY_RESULT_BACKEND=redis://localhost:56379/2
 cd apps/api && pytest tests_integration -q
 ```
 
-CI runs lint, unit tests, **and the evaluation harness** — a change that degrades
-detection or raises false positives fails the build.
+The dashboard has its own suite — component/unit tests (Vitest + React Testing
+Library), independent of the Python one above:
+
+```bash
+cd apps/web && npm test        # 51 tests, jsdom, no backend needed
+```
+
+Every client component, `lib/api.ts`'s request/error handling (401 with no
+token, a network failure mapped to the same 503 `SetupNotice` renders on, a
+non-ok response, success), and `middleware.ts`'s redirect are covered — 100%
+statement coverage on `components/`. Server components that fetch data
+(`app/page.tsx` and friends) are exercised instead by `npm run build`, which
+type-checks every page against the real API response shapes in `lib/types.ts`,
+and by the pipeline's own eval-fixture runs (README "Status") which is what
+actually produces the data those pages render in practice — there's no headless
+browser here re-clicking through the app; that's what `qagent explore --check`
+(above) is for, pointed at a running dashboard.
+
+CI runs lint, unit tests (API and dashboard), **and the evaluation harness** —
+a change that degrades detection or raises false positives fails the build.
 
 ---
 

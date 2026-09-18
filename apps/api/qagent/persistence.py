@@ -15,8 +15,10 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from qagent import models
+from qagent.modules.llm.safety import scrub
+from qagent.modules.storage.local import LocalArtifactStore, store_from_settings
 from qagent.modules.triage import flakiness
-from qagent.pipeline import PipelineResult
+from qagent.pipeline import ArtifactBytes, PipelineResult
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +116,47 @@ def _upsert_case(
     return case
 
 
+def _persist_artifacts(
+    session: Session,
+    *,
+    org_id: UUID,
+    run_id: UUID,
+    result_id: UUID,
+    artifacts: list[ArtifactBytes],
+    store: LocalArtifactStore,
+) -> None:
+    """Write evidence to storage and record the pointer (CLAUDE.md section 15).
+
+    Text evidence (a console/page-error log) is attacker-influenced content by
+    ADR-0004's own rule - it came out of a third party's browser session - so it
+    is scrubbed the same way any other untrusted text is before anything
+    persists it. A screenshot can't be scrubbed the same way (there is no regex
+    over pixels), so it is stored as captured and `scrubbed` stays false; that
+    column is what makes the difference machine-checkable rather than a claim
+    in a docstring.
+    """
+    for artifact in artifacts:
+        data = artifact.data
+        scrubbed = False
+        if artifact.kind == "log":
+            data = scrub(data.decode("utf-8", errors="replace")).encode("utf-8")
+            scrubbed = True
+
+        stored = store.save(data, org_id=org_id, kind=artifact.kind, extension=artifact.extension)
+        session.add(
+            models.Artifact(
+                org_id=org_id,
+                run_id=run_id,
+                result_id=result_id,
+                kind=artifact.kind,
+                storage_key=stored.storage_key,
+                content_type=artifact.content_type,
+                size_bytes=stored.size_bytes,
+                scrubbed=scrubbed,
+            )
+        )
+
+
 def persist_result(
     session: Session,
     *,
@@ -121,8 +164,11 @@ def persist_result(
     project_id: UUID,
     run: models.TestRun,
     result: PipelineResult,
+    artifact_store: LocalArtifactStore | None = None,
 ) -> models.TestRun:
-    """Write endpoints, cases, results and bugs for one pipeline run."""
+    """Write endpoints, cases, results, bugs and evidence for one pipeline run."""
+    store = artifact_store or store_from_settings()
+
     # --- discovered endpoints ---
     for endpoint in result.endpoints:
         existing = session.execute(
@@ -212,6 +258,16 @@ def persist_result(
                 )
             )
             session.flush()
+
+            if outcome.artifacts:
+                _persist_artifacts(
+                    session,
+                    org_id=org_id,
+                    run_id=run.id,
+                    result_id=record.id,
+                    artifacts=outcome.artifacts,
+                    store=store,
+                )
 
     # --- run summary ---
     run.total = result.total

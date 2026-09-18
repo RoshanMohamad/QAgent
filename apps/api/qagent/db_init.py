@@ -1,24 +1,35 @@
-"""Schema bootstrap and row-level security policies.
+"""Schema bootstrap, the low-privilege application role, and row-level security.
 
 Alembic owns migrations from the first schema change onward; this module exists to
-create the initial schema and, more importantly, to install the RLS policies. Tenant
-isolation enforced by the database cannot be forgotten at a call site, which is why
-it is applied here rather than left to application code.
+create the initial schema, provision the role the API/worker actually connect as,
+and install the RLS policies. Tenant isolation enforced by the database cannot be
+forgotten at a call site, which is why it is applied here rather than left to
+application code -- and, per ADR-0007, why it is applied to a role that RLS can
+actually constrain, not to whatever role happened to run this script.
+
+Everything here runs against an *admin* connection (a real Postgres superuser, or
+at least a role that owns these tables) - `Settings.admin_database_url`, never
+`Settings.database_url`. The application and worker never see the admin DSN.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 
-from sqlalchemy import text
+from sqlalchemy import Engine, create_engine, text
+from sqlalchemy.engine import make_url
 
-from qagent.db import engine
+from qagent.config import get_settings
 from qagent.models import TENANT_TABLES, Base
 
 logger = logging.getLogger(__name__)
 
 #: Applied per tenant table. USING governs reads, WITH CHECK governs writes, so a
-#: row can neither be read nor created outside the caller's organization.
+#: row can neither be read nor created outside the caller's organization. FORCE
+#: additionally applies this to the table's *owner* - necessary but not sufficient:
+#: a superuser bypasses RLS regardless of FORCE, which is exactly why the role this
+#: module creates for runtime use is never one (see `ensure_app_role`, ADR-0007).
 _POLICY = """
 ALTER TABLE {table} ENABLE ROW LEVEL SECURITY;
 ALTER TABLE {table} FORCE ROW LEVEL SECURITY;
@@ -28,28 +39,120 @@ CREATE POLICY {table}_tenant_isolation ON {table}
     WITH CHECK (org_id = current_setting('qagent.current_org', true)::uuid);
 """
 
+#: Postgres unquoted identifiers: this is deliberately stricter than what Postgres
+#: itself accepts, because the role name is about to be interpolated into DDL that
+#: cannot be parameterised (CREATE ROLE takes no bind parameters for its name).
+#: The value comes from configuration, not a request, but an identifier this
+#: routine cannot prove safe is refused rather than trusted.
+_SAFE_IDENTIFIER = re.compile(r"^[a-z_][a-z0-9_]*$")
 
-def create_schema() -> None:
-    Base.metadata.create_all(bind=engine)
+
+def _admin_engine() -> Engine:
+    settings = get_settings()
+    if settings.admin_database_url:
+        return create_engine(settings.admin_database_url, future=True)
+
+    logger.warning(
+        "ADMIN_DATABASE_URL is not set; bootstrapping schema/roles/RLS using the "
+        "same role the application connects as (DATABASE_URL). If that role is a "
+        "Postgres superuser - which the official postgres image's POSTGRES_USER "
+        "always is - every row-level security policy below is silently bypassed "
+        "for every query the app makes. See ADR-0007. Set ADMIN_DATABASE_URL to a "
+        "real superuser DSN and point DATABASE_URL at a separate, unprivileged "
+        "role in any deployment where tenant isolation matters."
+    )
+    return create_engine(settings.database_url, future=True)
+
+
+def create_schema(bind: Engine) -> None:
+    Base.metadata.create_all(bind=bind)
     logger.info("schema created")
 
 
-def apply_rls() -> None:
-    """Install tenant isolation policies.
+def ensure_app_role(admin: Engine) -> str:
+    """Create, or reset, the low-privilege role the API and worker connect as.
 
-    Note that a table owner bypasses RLS unless FORCE is set, which is why the
-    policy statement includes it. The application role must not be the table owner
-    in a production deployment.
+    The role to create is read from ``DATABASE_URL`` itself - the app's own
+    connection string - rather than from a second setting, so there is exactly
+    one place that says "this is who the app connects as" and nothing can drift
+    between the two. It is explicitly stripped of superuser, BYPASSRLS, and the
+    ability to create databases or other roles every time this runs, so a manual
+    `ALTER ROLE` on a long-lived database can never quietly widen it back out.
+
+    It is also never made the owner of a table: `create_schema` runs on the admin
+    connection, so ownership stays there, and this role receives only the DML
+    grants (SELECT/INSERT/UPDATE/DELETE) it needs - never DDL. An owner is exempt
+    from its own RLS policies unless FORCE is set (it is, here); a non-owner
+    without BYPASSRLS is constrained by RLS regardless.
     """
-    with engine.begin() as connection:
+    settings = get_settings()
+    app_url = make_url(settings.database_url)
+    role = app_url.username
+    password = app_url.password or ""
+
+    if not role or not _SAFE_IDENTIFIER.match(role):
+        raise ValueError(
+            f"DATABASE_URL's username {role!r} is not a safe role identifier "
+            "(expected ^[a-z_][a-z0-9_]*$); refusing to run role-bootstrap DDL."
+        )
+
+    # DDL can't bind a parameter in place of an identifier or a password literal,
+    # so the identifier is validated above and the literal is escaped here as
+    # Postgres itself defines escaping for a quoted string (doubling the quote).
+    escaped_password = password.replace("'", "''")
+
+    with admin.begin() as connection:
+        exists = connection.execute(
+            text("SELECT 1 FROM pg_roles WHERE rolname = :role"), {"role": role}
+        ).first()
+
+        privileges = "NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS NOREPLICATION"
+        if exists is None:
+            connection.execute(
+                text(f"CREATE ROLE {role} LOGIN PASSWORD '{escaped_password}' {privileges}")
+            )
+            logger.info("created application role %r", role)
+        else:
+            # Idempotent, and deliberately corrective: re-running this must reset
+            # the password to match configuration and re-strip every privilege
+            # above, not just create the role once and trust it stays narrow.
+            connection.execute(
+                text(f"ALTER ROLE {role} WITH PASSWORD '{escaped_password}' {privileges}")
+            )
+            logger.info("application role %r already existed; password and privileges reset", role)
+
+        connection.execute(text(f"GRANT USAGE ON SCHEMA public TO {role}"))
+        connection.execute(
+            text(f"GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO {role}")
+        )
+        connection.execute(text(f"GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO {role}"))
+        # Covers tables Alembic adds later without a manual re-grant, since those
+        # too are created by the admin connection.
+        connection.execute(
+            text(
+                "ALTER DEFAULT PRIVILEGES IN SCHEMA public "
+                f"GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO {role}"
+            )
+        )
+
+    return role
+
+
+def apply_rls(admin: Engine) -> None:
+    """Install tenant isolation policies. See `_POLICY` for what FORCE buys and
+    does not buy - the app role having no BYPASSRLS is what makes it not buy.
+    """
+    with admin.begin() as connection:
         for table in TENANT_TABLES:
             connection.execute(text(_POLICY.format(table=table)))
     logger.info("row-level security applied to %d tables", len(TENANT_TABLES))
 
 
 def init() -> None:
-    create_schema()
-    apply_rls()
+    admin = _admin_engine()
+    create_schema(admin)
+    ensure_app_role(admin)
+    apply_rls(admin)
 
 
 if __name__ == "__main__":

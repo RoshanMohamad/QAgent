@@ -15,7 +15,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID
 
-from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Response, status
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -398,11 +398,21 @@ def list_bugs(
     org_id: UUID = Depends(current_org),
     session: Session = Depends(get_db),
 ) -> list[dict]:
-    rows = session.execute(
-        select(models.Bug)
-        .where(models.Bug.project_id == project_id)
-        .order_by(models.Bug.created_at.desc())
-    ).scalars()
+    bugs = list(
+        session.execute(
+            select(models.Bug)
+            .where(models.Bug.project_id == project_id)
+            .order_by(models.Bug.created_at.desc())
+        ).scalars()
+    )
+
+    result_ids = [b.result_id for b in bugs if b.result_id is not None]
+    artifacts_by_result: dict[UUID, list[models.Artifact]] = {}
+    if result_ids:
+        for artifact in session.execute(
+            select(models.Artifact).where(models.Artifact.result_id.in_(result_ids))
+        ).scalars():
+            artifacts_by_result.setdefault(artifact.result_id, []).append(artifact)
 
     return [
         {
@@ -415,9 +425,42 @@ def list_bugs(
             "root_cause": b.root_cause,
             "suggested_fix": b.suggested_fix,
             "steps": b.steps,
+            # Evidence (CLAUDE.md section 15): a screenshot/log a reader can
+            # actually open, not just a claim in `actual`. Fetch the bytes at
+            # GET /api/v1/artifacts/{id}.
+            "artifacts": [
+                {"id": str(a.id), "kind": a.kind, "content_type": a.content_type}
+                for a in artifacts_by_result.get(b.result_id, [])
+            ],
         }
-        for b in rows
+        for b in bugs
     ]
+
+
+@app.get("/api/v1/artifacts/{artifact_id}", tags=["bugs"])
+def get_artifact(
+    artifact_id: UUID,
+    org_id: UUID = Depends(current_org),
+    session: Session = Depends(get_db),
+) -> Response:
+    """Fetch one piece of evidence's raw bytes (CLAUDE.md section 15).
+
+    The `Artifact` row is filtered by RLS the same as everything else - a
+    caller can only ever look up an id belonging to their own organization,
+    404 either way, so this never distinguishes "not yours" from "not found."
+    """
+    from qagent.modules.storage.local import ArtifactNotFound, store_from_settings
+
+    artifact = session.get(models.Artifact, artifact_id)
+    if artifact is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "artifact not found")
+
+    try:
+        data = store_from_settings().read(artifact.storage_key)
+    except ArtifactNotFound as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "artifact not found") from exc
+
+    return Response(content=data, media_type=artifact.content_type)
 
 
 @app.get("/api/v1/projects/{project_id}/tests/flaky", tags=["tests"])

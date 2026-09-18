@@ -24,12 +24,19 @@ class FakePage:
     """Enough of Playwright's Page API for ``_check_page`` to exercise: ``on()``
     registers handlers, ``goto()`` can fire them before returning."""
 
-    def __init__(self, response: FakeResponse | None = None, raises: Exception | None = None):
+    def __init__(
+        self,
+        response: FakeResponse | None = None,
+        raises: Exception | None = None,
+        screenshot: bytes | Exception = b"fake-png-bytes",
+    ):
         self._response = response
         self._raises = raises
         self._handlers: dict[str, Any] = {}
         self.fired_console: list[Any] = []
         self.fired_page_errors: list[Any] = []
+        self._screenshot = screenshot
+        self.screenshot_calls = 0
 
     def on(self, event: str, handler: Any) -> None:
         self._handlers[event] = handler
@@ -47,6 +54,12 @@ class FakePage:
         if self._raises:
             raise self._raises
         return self._response
+
+    def screenshot(self, *, type: str, timeout: float):  # noqa: A002 - matches Playwright's own kwarg
+        self.screenshot_calls += 1
+        if isinstance(self._screenshot, Exception):
+            raise self._screenshot
+        return self._screenshot
 
 
 def test_clean_page_passes() -> None:
@@ -107,6 +120,34 @@ def test_result_dataclass_defaults() -> None:
     result = PageCheckResult(url="http://x", status="passed")
     assert result.console_errors == []
     assert result.page_errors == []
+    assert result.screenshot_png is None
+
+
+def test_screenshot_captured_on_failure() -> None:
+    page = FakePage(response=FakeResponse(500))
+    result = _check_page(page, "http://example.test/", timeout_ms=5000)
+    assert result.status == "failed"
+    assert result.screenshot_png == b"fake-png-bytes"
+    assert page.screenshot_calls == 1
+
+
+def test_screenshot_not_captured_on_pass() -> None:
+    """No reader ever looks at a screenshot of a page that worked - capturing
+    one anyway would be pure storage cost."""
+    page = FakePage(response=FakeResponse(200))
+    result = _check_page(page, "http://example.test/", timeout_ms=5000)
+    assert result.status == "passed"
+    assert result.screenshot_png is None
+    assert page.screenshot_calls == 0
+
+
+def test_screenshot_capture_failure_does_not_crash_the_check() -> None:
+    """A page broken enough to be worth a screenshot can also break the
+    screenshot call itself - that must never turn a real defect into a crash."""
+    page = FakePage(response=FakeResponse(500), screenshot=TimeoutError("screenshot timed out"))
+    result = _check_page(page, "http://example.test/", timeout_ms=5000)
+    assert result.status == "failed"
+    assert result.screenshot_png is None
 
 
 class _FakeBrowser:

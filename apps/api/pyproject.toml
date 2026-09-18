@@ -27,7 +27,7 @@ dependencies = [
 llm = ["anthropic>=0.40"]
 e2e = ["playwright>=1.48"]
 security = ["semgrep>=1.90"]
-dev = ["pytest>=8.3", "pytest-asyncio>=0.24", "ruff>=0.8", "respx>=0.22"]
+dev = ["pytest>=8.3", "pytest-asyncio>=0.24", "ruff>=0.8", "respx>=0.22", "flask>=3.0"]
 
 [project.scripts]
 qagent = "qagent.cli:app"
@@ -54,6 +54,9 @@ ignore = [
 # Probe payloads deliberately contain credential-shaped literals.
 "qagent/modules/generator/*" = ["S105", "S106"]
 "tests/*" = ["S105", "S106", "E501"]
+# Launches known, literal commands (sys.executable + fixed args) against a local
+# Postgres/Redis the operator brought up themselves - not untrusted input.
+"tests_integration/*" = ["S105", "S106", "S603", "E501"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

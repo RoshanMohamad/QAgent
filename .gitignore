@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 .venv/
+apps/api/data/
 venv/
 *.egg-info/
 .pytest_cache/
@@ -18,6 +19,7 @@ dist/
 # Env & secrets
 .env
 .env.local
+.env.admin
 *.pem
 *.key
 

@@ -17,6 +17,12 @@ class Settings(BaseSettings):
     qagent_secret_key: str = "change-me-in-production"  # noqa: S105 - placeholder, not a secret
 
     database_url: str = "postgresql+psycopg://qagent:qagent@localhost:5432/qagent"
+    # Bootstrap-only: schema creation, application-role creation, and RLS policy
+    # installation (qagent/db_init.py). Never used at request/task time - only
+    # `database_url` is. Left unset, db_init falls back to `database_url` itself
+    # and logs a loud warning, since that means whatever role the app connects as
+    # is also the one bootstrapping its own restrictions (ADR-0007).
+    admin_database_url: str | None = None
     redis_url: str = "redis://localhost:6379/0"
     celery_broker_url: str = "redis://localhost:6379/1"
     celery_result_backend: str = "redis://localhost:6379/2"
@@ -38,6 +44,11 @@ class Settings(BaseSettings):
     qagent_runner_timeout_seconds: int = 120
     qagent_runner_max_concurrency: int = 4
     qagent_egress_allowlist: str = ""
+
+    # --- Evidence artifacts (CLAUDE.md section 15) ---
+    # Local-filesystem backend for MVP; README's stack lists S3-compatible
+    # storage / Cloudflare R2 for a real deployment (modules/storage/local.py).
+    qagent_artifact_root: str = "./data/artifacts"
 
     @property
     def egress_allowlist(self) -> list[str]:

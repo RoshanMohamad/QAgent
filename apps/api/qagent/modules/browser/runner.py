@@ -34,6 +34,12 @@ class PageCheckResult:
     console_errors: list[str] = field(default_factory=list)
     page_errors: list[str] = field(default_factory=list)
     failure_message: str | None = None
+    # In-memory only - this module has no database import (see module docstring)
+    # and never writes to disk itself. A failing check's screenshot is evidence
+    # for a bug report, so it's captured here and handed up the call chain;
+    # `pipeline.py` decides whether the check became a bug, and `persistence.py`
+    # is the only place that ever touches storage (CLAUDE.md section 15).
+    screenshot_png: bytes | None = None
 
 
 @dataclass
@@ -66,6 +72,22 @@ class BrowserRunResult:
 class _Page(Protocol):
     def on(self, event: str, handler: Any) -> None: ...
     def goto(self, url: str, timeout: float, wait_until: str) -> Any: ...
+
+
+def _capture_screenshot(page: Any, url: str) -> bytes | None:
+    """Best-effort evidence, never a reason to fail the check itself.
+
+    A page bad enough to be worth a screenshot is also a page that can crash
+    the screenshot call - `page.screenshot()` can itself time out against a
+    hung renderer. That failure is not new information (the check already
+    knows the page is broken), so it's logged and swallowed rather than
+    turning "the app is broken" into "the check errored."
+    """
+    try:
+        return page.screenshot(type="png", timeout=5000)
+    except Exception as exc:  # noqa: BLE001 - see docstring
+        logger.warning("screenshot capture failed for %s: %s", url, exc)
+        return None
 
 
 def _check_page(page: _Page, url: str, timeout_ms: int) -> PageCheckResult:
@@ -104,12 +126,15 @@ def _check_page(page: _Page, url: str, timeout_ms: int) -> PageCheckResult:
     if console_errors:
         failures.append(f"{len(console_errors)} console error(s)")
 
+    screenshot_png = _capture_screenshot(page, url) if failures else None
+
     return PageCheckResult(
         url=url,
         status="passed" if not failures else "failed",
         http_status=http_status,
         load_time_ms=load_time_ms,
         console_errors=console_errors,
+        screenshot_png=screenshot_png,
         page_errors=page_errors,
         failure_message="; ".join(failures) or None,
     )

@@ -60,6 +60,51 @@ def test_navigation_error_page_check_is_not_a_bug() -> None:
     assert outcome.bug is None
 
 
+def test_bug_page_check_attaches_screenshot_and_log_artifacts() -> None:
+    check = PageCheckResult(
+        url="http://x/checkout",
+        status="failed",
+        http_status=500,
+        failure_message="page responded 500",
+        console_errors=["Uncaught TypeError: x is not a function"],
+        screenshot_png=b"fake-png-bytes",
+    )
+    outcome = _page_check_to_outcome(check, _null_llm())
+
+    assert outcome.bug is not None
+    kinds = {a.kind for a in outcome.artifacts}
+    assert kinds == {"screenshot", "log"}
+    screenshot = next(a for a in outcome.artifacts if a.kind == "screenshot")
+    assert screenshot.data == b"fake-png-bytes"
+    assert screenshot.content_type == "image/png"
+    log = next(a for a in outcome.artifacts if a.kind == "log")
+    assert b"Uncaught TypeError" in log.data
+
+
+def test_bug_page_check_without_screenshot_has_no_screenshot_artifact() -> None:
+    """Screenshot capture is best-effort (browser/runner.py) - a bug with no
+    captured screenshot must still get its log artifact, not neither."""
+    check = PageCheckResult(
+        url="http://x/checkout",
+        status="failed",
+        http_status=500,
+        failure_message="page responded 500",
+        console_errors=["boom"],
+        screenshot_png=None,
+    )
+    outcome = _page_check_to_outcome(check, _null_llm())
+
+    kinds = {a.kind for a in outcome.artifacts}
+    assert kinds == {"log"}
+
+
+def test_passed_page_check_has_no_artifacts() -> None:
+    check = PageCheckResult(url="http://x/", status="passed", http_status=200)
+    outcome = _page_check_to_outcome(check, _null_llm())
+
+    assert outcome.artifacts == []
+
+
 def _block_playwright_import(monkeypatch: pytest.MonkeyPatch) -> None:
     real_import = builtins.__import__
 

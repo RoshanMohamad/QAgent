@@ -28,7 +28,19 @@ SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False
 
 
 def set_tenant(session: Session, org_id: UUID | str) -> None:
-    """Bind the current transaction to one organization for RLS."""
+    """Bind the *current transaction* to one organization for RLS.
+
+    The final ``true`` makes this ``SET LOCAL``, not ``SET``: it lives only until
+    the transaction ends, then Postgres resets it to an empty string rather than
+    leaving it unset. That is deliberate - a pooled connection must never carry
+    one request's tenant into the next simply because nobody reset it - but it
+    means a call site that commits and then issues another query in the *same*
+    session must call this again first, or every RLS-guarded query in that new
+    transaction fails closed (an invalid ``''::uuid`` cast, not silently seeing
+    every tenant's rows - see ADR-0007). `session_scope` and every FastAPI route
+    here call this exactly once per transaction for that reason; if you add a
+    call site that commits mid-session, call this again immediately after.
+    """
     session.execute(
         text("SELECT set_config('qagent.current_org', :org, true)"),
         {"org": str(org_id)},
@@ -37,6 +49,8 @@ def set_tenant(session: Session, org_id: UUID | str) -> None:
 
 @contextmanager
 def session_scope(org_id: UUID | str | None = None) -> Iterator[Session]:
+    """One session, one transaction, one tenant. Do not call ``session.commit()``
+    yourself inside this block and then keep querying - see `set_tenant`."""
     session = SessionLocal()
     try:
         if org_id is not None:

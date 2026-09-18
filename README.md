@@ -34,13 +34,20 @@ Current measured performance against the reference fixture:
 Reproduce these numbers yourself with the [two commands below](#try-it).
 
 **Verified:** the pipeline (discovery, generation, execution, triage, reporting), the
-CLI, the eval harness, 247 unit tests and lint — all run green without a database. The
+CLI, the eval harness, 255 unit tests and lint — all run green without a database. The
 dashboard was rendered against real pipeline output through the documented API
 contract: all three pages, the setup state, and the failure-analysis chart.
 
-**Implemented but not yet exercised end to end:** the Postgres-backed paths — schema
-creation, RLS policies, the worker and persistence. They import cleanly and the SQL is
-in `db_init.py`, but confirming them needs a working Docker daemon.
+**Verified against a real Postgres and Redis** (`db-integration` in CI,
+[ADR-0007](docs/decisions/ADR-0007-rls-requires-an-unprivileged-role.md)): schema
+creation, row-level security, and the worker are no longer merely "imports cleanly."
+Checking actually found a real bug — the API and worker connected as the same
+Postgres superuser that bootstraps the schema, which silently bypasses RLS regardless
+of `FORCE`, so every tenant could read and write every other tenant's rows. Fixed by
+giving the app a separate, unprivileged role that `db_init` creates and strips of
+`SUPERUSER`/`BYPASSRLS` on every run; `tests_integration/` now proves isolation
+directly against that role and runs a real scan through a real out-of-process
+`celery worker` end to end.
 
 ---
 
@@ -340,6 +347,7 @@ Full stack (Postgres, Redis, API, worker):
 
 ```bash
 cp .env.example .env
+cp .env.admin.example .env.admin   # bootstrap-only superuser DSN - api only, never worker (ADR-0007)
 docker compose up --build
 ```
 
@@ -447,6 +455,7 @@ The CLI, the worker and the eval harness all run the identical loop — which me
 | [0004](docs/decisions/ADR-0004-untrusted-content-boundary.md) | Repo and response content is untrusted input. Verdicts come only from constrained schemas. |
 | [0005](docs/decisions/ADR-0005-interactive-exploration.md) | Interactive explorer state identity is `(path, structural fingerprint)`; actions are a closed schema-constrained set, ranked rules-first. |
 | [0006](docs/decisions/ADR-0006-repository-analyzer.md) | The repository analyzer reads and parses text only — never executes a checkout's own tooling — and every detection carries its evidence. |
+| [0007](docs/decisions/ADR-0007-rls-requires-an-unprivileged-role.md) | The API/worker connect as a separate, unprivileged role — never the superuser that bootstraps the schema — or row-level security is silently bypassed. |
 
 ---
 
@@ -466,7 +475,9 @@ so both are treated as hostile:
   before anything is persisted as an artifact or sent to a provider.
 - **Tenant isolation.** `org_id` on every table with Postgres row-level security
   (`USING` *and* `WITH CHECK`, plus `FORCE`), so isolation cannot be forgotten at a
-  call site.
+  call site — enforced only because the API/worker connect as a separate,
+  unprivileged role and never as the superuser that bootstraps the schema
+  (ADR-0007): a superuser bypasses RLS unconditionally, `FORCE` included.
 - **Budgets.** Per-run caps on calls, tokens and spend. Exceeding one degrades to the
   rule-based path rather than failing the run.
 
@@ -501,7 +512,9 @@ apps/api/qagent/
 │   ├── integrations/      GitHub Issues + Jira sync
 │   └── llm/               providers, budgets, safety boundary
 ├── eval/harness.py        scores the pipeline against ground truth
+├── db_init.py             schema, the unprivileged app role, RLS (ADR-0007)
 └── worker/tasks.py        Celery
+apps/api/tests_integration/  real Postgres + Redis: RLS isolation, a live worker (ADR-0007)
 apps/web/                  Next.js dashboard (server components, no client fetching)
 packages/fixtures/         apps with labelled, seeded defects
 docs/decisions/            ADRs
@@ -510,7 +523,19 @@ docs/decisions/            ADRs
 ## Tests
 
 ```bash
-cd apps/api && pytest tests -q     # 247 tests
+cd apps/api && pytest tests -q     # 255 tests, no database needed
+```
+
+Against a real Postgres + Redis (`db-integration` in CI, ADR-0007):
+
+```bash
+POSTGRES_PORT=55432 REDIS_PORT=56379 docker compose up -d postgres redis
+export ADMIN_DATABASE_URL=postgresql+psycopg://qagent:qagent@localhost:55432/qagent
+export DATABASE_URL=postgresql+psycopg://qagent_app:qagent_app@localhost:55432/qagent
+export REDIS_URL=redis://localhost:56379/0
+export CELERY_BROKER_URL=redis://localhost:56379/1
+export CELERY_RESULT_BACKEND=redis://localhost:56379/2
+cd apps/api && pytest tests_integration -q
 ```
 
 CI runs lint, unit tests, **and the evaluation harness** — a change that degrades

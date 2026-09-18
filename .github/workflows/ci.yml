@@ -42,9 +42,9 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install -e ./apps/api
-          pip install "uvicorn[standard]"
+          pip install "uvicorn[standard]" flask
 
-      - name: Start fixture application
+      - name: Start fixture applications
         run: |
           cd packages/fixtures/buggy-shop
           uvicorn app:app --port 8080 &
@@ -52,11 +52,83 @@ jobs:
             curl -sf http://127.0.0.1:8080/health && break
             sleep 1
           done
+          cd ../task-tracker
+          FLASK_APP=app.py flask run --port 8081 &
+          for i in $(seq 1 20); do
+            curl -sf http://127.0.0.1:8081/health && break
+            sleep 1
+          done
 
-      - name: Evaluate
+      - name: Evaluate (buggy-shop, FastAPI)
         env:
           QAGENT_LLM_PROVIDER: "null"
         run: qagent evaluate --url http://127.0.0.1:8080 --fixtures packages/fixtures
+
+      - name: Evaluate (task-tracker, Flask)
+        # Detection rate here is intentionally < 100%: BUG-201 is a documented,
+        # known gap (IDOR - no generator rule compares two identities). This
+        # step's gate is the same one `evaluate` always applies - false-positive
+        # rate, not detection rate (ADR-0003) - so it fails only on a real
+        # regression, not on a limitation already written down in
+        # packages/fixtures/task-tracker/seeded_defects.yaml.
+        env:
+          QAGENT_LLM_PROVIDER: "null"
+        run: qagent evaluate --url http://127.0.0.1:8081 --name task-tracker --fixtures packages/fixtures
+
+  db-integration:
+    # Everything in `test` runs green with no database (README). This job is the
+    # other half: a real Postgres + Redis, proving row-level security actually
+    # isolates tenants under the unprivileged role db_init creates, and that a
+    # real `celery worker` process consuming the real broker persists a scan
+    # end to end (ADR-0007).
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: qagent
+          POSTGRES_PASSWORD: qagent
+          POSTGRES_DB: qagent
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U qagent"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      ADMIN_DATABASE_URL: postgresql+psycopg://qagent:qagent@localhost:5432/qagent
+      DATABASE_URL: postgresql+psycopg://qagent_app:qagent_app@localhost:5432/qagent
+      REDIS_URL: redis://localhost:6379/0
+      CELERY_BROKER_URL: redis://localhost:6379/1
+      CELERY_RESULT_BACKEND: redis://localhost:6379/2
+      QAGENT_LLM_PROVIDER: "null"
+      QAGENT_SECRET_KEY: ci-integration-test-secret
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        working-directory: apps/api
+        run: |
+          pip install --upgrade pip
+          pip install -e ".[dev]"
+          pip install "uvicorn[standard]"
+
+      - name: Integration tests (RLS isolation + real worker)
+        working-directory: apps/api
+        run: pytest tests_integration -q
 
   web:
     runs-on: ubuntu-latest

@@ -1,0 +1,97 @@
+# Ground truth for the task-tracker fixture (ADR-0003).
+#
+# Second fixture, deliberately a different framework (Flask, hand-written OpenAPI
+# document) from buggy-shop's FastAPI, so detection isn't only ever proven against
+# one code shape. Five of the six seeded defects are the same categories the
+# generator's seven rules already catch, seeded independently here to show the
+# rules generalise rather than being fit to buggy-shop specifically.
+#
+# BUG-201 is different on purpose: it is a real defect (an IDOR - any
+# authenticated user can read any other user's task by id) that the current rule
+# set cannot detect, because every rule in generator/rules.py tests one identity
+# at a time. Catching it needs a check that compares what *two different*
+# credentials can read - CLAUDE.md section 12 lists IDOR by name as an API
+# security test, and it is explicitly not implemented yet (see README Roadmap).
+# `expected_class: real_bug` and `detected: false` on this entry is not a bug in
+# the harness; it is the harness telling the truth about a known gap instead of
+# a fixture quietly avoiding the one case that would surface it.
+
+fixture: task-tracker
+description: Flask task tracker with six seeded defects, one of them (BUG-201) a
+  known detection gap, and two correct endpoints.
+
+defects:
+  - id: BUG-201
+    endpoint: "GET /tasks/{task_id}"
+    title: Any authenticated user can read any other user's task (IDOR)
+    expected_class: real_bug
+    expected_severity: high
+    detect_with: "known gap: requires comparing two distinct identities"
+    known_undetectable: true
+    notes: >
+      The handler authenticates the caller correctly and validates the identifier
+      correctly (malformed -> 400, absent -> 404, no/invalid token -> 401), so
+      every one of the seven generator rules passes against it. The missing check
+      is `task["owner"] != user`. Exploiting it needs a second valid identity
+      requesting a task it does not own - a class of check the current generator
+      does not produce. Tracked as a real, intentional gap, not scored as a
+      harness bug when the evaluation reports it as missed.
+
+  - id: BUG-202
+    endpoint: "POST /tasks"
+    title: Required field dereferenced without validation
+    expected_class: real_bug
+    expected_severity: high
+    detect_with: missing required field, or wrong field type
+    notes: >
+      payload["title"] is missing raises KeyError; a non-string title raises
+      AttributeError on .strip(). Both surface as 500 where 400 is documented.
+
+  - id: BUG-203
+    endpoint: "PUT /tasks/{task_id}"
+    title: Identifier cast without validation
+    expected_class: real_bug
+    expected_severity: high
+    detect_with: malformed path parameter
+    notes: >
+      int(task_id) raises ValueError for a non-numeric id, surfacing as 500
+      where the contract documents 400 or 404. Same shape as buggy-shop's
+      BUG-001, in a different framework.
+
+  - id: BUG-204
+    endpoint: "DELETE /tasks/{task_id}"
+    title: Resource existence assumed before deletion
+    expected_class: real_bug
+    expected_severity: medium
+    detect_with: absent-but-well-formed resource reference
+    notes: >
+      del TASKS[tid] raises KeyError for a well-formed but absent id, producing
+      500 where 404 is documented.
+
+  - id: BUG-205
+    endpoint: "GET /admin/export"
+    title: Authentication advertised but not enforced
+    expected_class: real_bug
+    expected_severity: critical
+    detect_with: unauthenticated request
+    notes: >
+      The OpenAPI document declares this operation bearer-protected; the handler
+      never calls current_user(). An anonymous caller reads every task. Same
+      defect shape as buggy-shop's BUG-003, seeded again to show the rule fires
+      across frameworks, not only against the fixture it was first found on.
+
+  - id: BUG-206
+    endpoint: "POST /tasks/bulk"
+    title: Wrongly typed field dereferenced without validation
+    expected_class: real_bug
+    expected_severity: high
+    detect_with: wrong field type, or missing required field
+    notes: >
+      items[0] raises KeyError when 'items' is an object instead of an array
+      (a dict has no integer key), and raises KeyError one line earlier when
+      'items' is missing entirely. Both surface as 500 where 400 is documented.
+
+# Correct endpoints. Reported defects against these count as false positives.
+clean:
+  - "GET /health"
+  - "GET /tasks"

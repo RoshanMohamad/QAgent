@@ -28,6 +28,19 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class ArtifactBytes:
+    """Evidence captured in-memory during a check. Nothing in this module ever
+    touches storage or the database - `persistence.py` is the only place that
+    writes these to disk and creates the `Artifact` row (CLAUDE.md section 15).
+    """
+
+    kind: str  # "screenshot" | "log"
+    content_type: str
+    extension: str
+    data: bytes
+
+
 @dataclass
 class CaseOutcome:
     name: str
@@ -41,6 +54,7 @@ class CaseOutcome:
     failure_message: str | None = None
     verdict: dict | None = None
     bug: dict | None = None
+    artifacts: list[ArtifactBytes] = field(default_factory=list)
 
 
 @dataclass
@@ -407,6 +421,27 @@ def _page_check_to_outcome(check: PageCheckResult, llm: LlmClient) -> CaseOutcom
             failure_message=check.failure_message,
             llm=llm,
         )
+        # Evidence, only for what actually became a bug report - a screenshot on
+        # every passing page load would be pure storage cost for no reader.
+        if check.screenshot_png:
+            outcome.artifacts.append(
+                ArtifactBytes(
+                    kind="screenshot",
+                    content_type="image/png",
+                    extension=".png",
+                    data=check.screenshot_png,
+                )
+            )
+        console_log = "\n".join(check.console_errors + check.page_errors)
+        if console_log:
+            outcome.artifacts.append(
+                ArtifactBytes(
+                    kind="log",
+                    content_type="text/plain",
+                    extension=".log",
+                    data=console_log.encode("utf-8"),
+                )
+            )
     return outcome
 
 

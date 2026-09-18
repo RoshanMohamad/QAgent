@@ -31,7 +31,13 @@ services:
 
   api:
     build: ./apps/api
-    env_file: .env
+    # .env.admin carries the Postgres superuser DSN that bootstraps the schema,
+    # the app role and RLS (ADR-0007). It is loaded here only, because only this
+    # service's startup command runs `qagent.db_init` - worker never needs it and
+    # never sees it, even though it shares every other setting in .env.
+    env_file:
+      - .env
+      - .env.admin
     depends_on:
       postgres:
         condition: service_healthy
@@ -45,6 +51,9 @@ services:
 
   worker:
     build: ./apps/api
+    # DATABASE_URL only, from .env - the unprivileged qagent_app role db_init
+    # creates. The worker reaches out to arbitrary third-party targets, so it
+    # must never hold Postgres superuser credentials even unused.
     env_file: .env
     depends_on:
       postgres:

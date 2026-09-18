@@ -75,9 +75,10 @@ def test_persist_result_writes_artifact_rows_for_a_browser_bug(tmp_path, Session
     )
     session.commit()
 
-    artifacts = (
-        session.query(models.Artifact).filter(models.Artifact.run_id == run.id).all()
-    )
+    # A fresh transaction started at commit; RLS needs the tenant bound again
+    # before it can see anything (db.py's set_tenant docstring, ADR-0007).
+    set_tenant(session, org.id)
+    artifacts = session.query(models.Artifact).filter(models.Artifact.run_id == run.id).all()
     assert {a.kind for a in artifacts} == {"screenshot", "log"}
 
     screenshot = next(a for a in artifacts if a.kind == "screenshot")
@@ -122,5 +123,6 @@ def test_persist_result_writes_no_artifacts_when_check_captured_none(tmp_path, S
     )
     session.commit()
 
+    set_tenant(session, org.id)
     assert session.query(models.Artifact).filter(models.Artifact.run_id == run.id).count() == 0
     session.close()

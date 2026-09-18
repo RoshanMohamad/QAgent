@@ -17,9 +17,10 @@ Discover  →  Generate  →  Execute  →  Triage  →  Report
 Phase 1 (API quality loop), the dashboard, `compose` mode, static route parsing,
 a first browser E2E layer, an Explorer Agent — link-crawl and interactive
 (form filling, clicking, inferred state transitions) — self-healing selector
-proposals, issue tracker sync (GitHub and Jira), and a repository analyzer /
-Project Analyst agent are implemented and measured. See [Roadmap](#roadmap)
-for what's done versus what's still open within phases 1-5.
+proposals, issue tracker sync (GitHub and Jira), a repository analyzer / Project
+Analyst agent, and evidence artifacts on browser-found bugs are implemented and
+measured. See [Roadmap](#roadmap) for what's done versus what's still open
+within phases 1-5.
 
 Current measured performance against the reference fixture:
 
@@ -31,10 +32,14 @@ Current measured performance against the reference fixture:
 | Runtime | 18 checks in ~1.2s |
 | Cost | $0.00 (rules-only path) |
 
-Reproduce these numbers yourself with the [two commands below](#try-it).
+Reproduce these numbers yourself with the [two commands below](#try-it). A second
+fixture, a different framework (Flask) with a deliberately *harder* defect — see
+[Evaluating against a second fixture](#evaluating-against-a-second-fixture) —
+scores 5 of 6 (83%), because it seeds one defect (an IDOR) the rule set honestly
+cannot catch yet, still at 0% false positives.
 
 **Verified:** the pipeline (discovery, generation, execution, triage, reporting), the
-CLI, the eval harness, 255 unit tests and lint — all run green without a database. The
+CLI, the eval harness, 267 unit tests and lint — all run green without a database. The
 dashboard was rendered against real pipeline output through the documented API
 contract: all three pages, the setup state, and the failure-analysis chart.
 
@@ -106,6 +111,32 @@ Score itself against the ground truth:
 qagent evaluate --url http://127.0.0.1:8080 --fixtures packages/fixtures
 ```
 
+### Evaluating against a second fixture
+
+`buggy-shop` alone can't tell you whether detection generalises or was fit to one
+FastAPI app. `packages/fixtures/task-tracker` is a second fixture — Flask, a
+hand-written OpenAPI document instead of a framework-generated one — with six
+seeded defects instead of buggy-shop's four:
+
+```bash
+pip install flask   # or: pip install -e "./apps/api[dev]"
+cd packages/fixtures/task-tracker && flask --app app run --port 8081 &
+
+qagent evaluate --url http://127.0.0.1:8081 --name task-tracker --fixtures packages/fixtures
+```
+
+Five of the six are the same categories the seven generator rules already catch
+(missing/wrong-type fields, a malformed or absent identifier, unenforced auth),
+seeded independently to show the rules generalise rather than being tuned to one
+app. The sixth, BUG-201, is seeded deliberately because the rules **cannot**
+catch it: it's an IDOR — any authenticated user can read any other user's task
+by id — and every one of the seven rules tests one identity at a time, never two
+identities' access to the same resource (CLAUDE.md section 12 names IDOR
+explicitly; it isn't implemented). The endpoint passes every other generated
+check, which is exactly the point: `seeded_defects.yaml` records it as a known,
+honest miss rather than quietly avoiding the one case that would expose the gap.
+Reported: 5/6 detected, **0% false positives**.
+
 Other commands:
 
 ```bash
@@ -148,6 +179,21 @@ Each page is loaded and flagged if it responds with a 5xx, throws an uncaught JS
 exception, or logs a console error. That's still unambiguous evidence of a
 defect — there's no selector here to go stale — so it doesn't reintroduce the
 flake ADR-0002 kept out of the API layer.
+
+**Evidence, not just a claim.** A page check that becomes a bug report captures a
+screenshot and the console/page-error log at the moment of failure, stores them
+(local filesystem for now — `modules/storage/local.py`; the README's own stack
+table lists S3-compatible storage / Cloudflare R2 for a real deployment, and
+swapping backends later touches one file), and links them to the `Bug` row as
+real `Artifact` rows — the table CLAUDE.md section 15 asks for, reserved in the
+schema since it was first written and unused until now. Fetch one back with
+`GET /api/v1/artifacts/{id}`; `GET .../bugs` lists each bug's artifact ids and
+content types. The log is scrubbed the same way any other untrusted text is
+(ADR-0004) before it ever reaches storage — a live session token in a console
+log is exactly the kind of thing evidence capture must never leak — and the
+`Artifact.scrubbed` column records that a screenshot, unlike text, wasn't:
+there's no regex over pixels, so it's stored as captured. A passing check never
+captures anything; there's no reader for a screenshot of a page that worked.
 
 ### Explorer agent
 
@@ -510,20 +556,22 @@ apps/api/qagent/
 │   ├── security/          Semgrep SAST wrapper (`security` extra)
 │   ├── performance/       k6 load-test wrapper (standalone binary, no extra)
 │   ├── integrations/      GitHub Issues + Jira sync
+│   ├── storage/           evidence artifact backend (local now, S3-compatible later)
 │   └── llm/               providers, budgets, safety boundary
 ├── eval/harness.py        scores the pipeline against ground truth
 ├── db_init.py             schema, the unprivileged app role, RLS (ADR-0007)
 └── worker/tasks.py        Celery
 apps/api/tests_integration/  real Postgres + Redis: RLS isolation, a live worker (ADR-0007)
 apps/web/                  Next.js dashboard (server components, no client fetching)
-packages/fixtures/         apps with labelled, seeded defects
+packages/fixtures/         apps with labelled, seeded defects (buggy-shop: FastAPI,
+                           task-tracker: Flask, incl. one documented detection gap)
 docs/decisions/            ADRs
 ```
 
 ## Tests
 
 ```bash
-cd apps/api && pytest tests -q     # 255 tests, no database needed
+cd apps/api && pytest tests -q     # 267 tests, no database needed
 ```
 
 Against a real Postgres + Redis (`db-integration` in CI, ADR-0007):
@@ -547,20 +595,26 @@ detection or raises false positives fails the build.
 
 Phase 1, the dashboard, `compose` mode, route parsing, a first browser E2E
 layer, the Explorer Agent (link-crawl and interactive), self-healing selector
-proposals, GitHub + Jira issue sync, and the repository analyzer / Project
-Analyst agent (`qagent analyze`, agent 1) are done and tested.
+proposals, GitHub + Jira issue sync, the repository analyzer / Project Analyst
+agent (`qagent analyze`, agent 1), and evidence artifacts on browser-found bugs
+(screenshot + scrubbed console log, real storage, `GET /api/v1/artifacts/{id}`)
+are done and tested.
 
 Still open within CLAUDE.md phases 1-5: the Test Planner (agent 2) and a real
 Playwright/pytest emitter for generated specs (agent 3 currently ships
 declarative test documents, not files, by design — see [How it works](#how-it-works));
-Repository RAG; screenshot/HAR/trace evidence on bug reports (the `Artifact`
-table exists but has no writer yet); the browser extension and its recorder;
-and OWASP ZAP/Trivy alongside the existing Semgrep SAST integration.
+Repository RAG; HAR/trace evidence and evidence on API/interactive-exploration
+bugs, not just browser-E2E ones (the same `Artifact` mechanism, extended); the
+browser extension and its recorder; and OWASP ZAP/Trivy alongside the existing
+Semgrep SAST integration and the IDOR-shaped gap
+[task-tracker](packages/fixtures/task-tracker)'s BUG-201 documents.
 
 What's left is mostly Phase 6 (CLAUDE.md §23): multi-tenancy hardening beyond
-the RLS already in place, distributed workers, and the operational surface
-(rate limiting, billing/usage, broader observability) that only matters once
-there's load to justify it — see ADR-0001 on resisting premature architecture.
+the RLS already in place (now itself verified against a real database rather
+than merely reviewed — ADR-0007), distributed workers, and the operational
+surface (rate limiting, billing/usage, broader observability) that only matters
+once there's load to justify it — see ADR-0001 on resisting premature
+architecture.
 
 More fixtures are the highest-leverage work at any point: every metric above is only
 as trustworthy as the ground truth behind it.

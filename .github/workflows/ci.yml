@@ -75,6 +75,73 @@ jobs:
           QAGENT_LLM_PROVIDER: "null"
         run: qagent evaluate --url http://127.0.0.1:8081 --name task-tracker --fixtures packages/fixtures
 
+      - name: Emitted suite must agree with the pipeline
+        # Agent 3 emits standalone pytest files. The claim is that they are the
+        # same checks, not merely similar ones - so this asserts the emitted
+        # suite reaches exactly the same pass/fail split the in-process runner
+        # does. If the two ever diverge, one of them is lying to a developer.
+        run: |
+          qagent emit --url http://127.0.0.1:8080 --out /tmp/emitted
+          cd /tmp/emitted
+          set +e
+          QAGENT_BASE_URL=http://127.0.0.1:8080 python -m pytest . -q --tb=no > out.txt 2>&1
+          set -e
+          cat out.txt
+          grep -q "11 failed, 7 passed" out.txt || {
+            echo "::error::Emitted suite disagrees with the pipeline (expected 11 failed, 7 passed)."
+            exit 1
+          }
+
+  quality-gate:
+    # Dogfooding: QAgent's own GitHub Action, run against the buggy fixture.
+    # The fixture has four seeded defects, so a working gate MUST block here -
+    # this job asserts the failure path, which is the one that actually matters.
+    # A gate that cannot say "no" is decoration.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Start the buggy fixture
+        run: |
+          pip install --upgrade pip
+          pip install -e ./apps/api "uvicorn[standard]"
+          cd packages/fixtures/buggy-shop
+          uvicorn app:app --port 8080 &
+          for i in $(seq 1 20); do
+            curl -sf http://127.0.0.1:8080/health && break
+            sleep 1
+          done
+
+      - name: Gate must block on the buggy fixture
+        id: gate
+        continue-on-error: true
+        uses: ./
+        with:
+          url: http://127.0.0.1:8080
+          repo-path: packages/fixtures/buggy-shop
+          min-coverage: "0.9"
+
+      - name: Assert the gate blocked
+        env:
+          GATE_RESULT: ${{ steps.gate.outputs.result }}
+        run: |
+          echo "gate reported: $GATE_RESULT"
+          if [ "$GATE_RESULT" != "block" ]; then
+            echo "::error::The gate did not block on a fixture with four seeded defects."
+            exit 1
+          fi
+
+      - name: Gate must pass when the thresholds allow the known defects
+        uses: ./
+        with:
+          url: http://127.0.0.1:8080
+          repo-path: packages/fixtures/buggy-shop
+          max-critical: "2"
+          max-high: "5"
+
   db-integration:
     # Everything in `test` runs green with no database (README). This job is the
     # other half: a real Postgres + Redis, proving row-level security actually
@@ -130,6 +197,96 @@ jobs:
       - name: Integration tests (RLS isolation + real worker)
         working-directory: apps/api
         run: pytest tests_integration -q
+
+      - name: Migrations must upgrade an existing database, not just build a new one
+        # `create_all` only ever created *missing tables*, so every schema change
+        # after the first silently did nothing on a database that already
+        # existed - surfacing much later as "column does not exist" at runtime.
+        # This asserts the path that actually breaks: a populated database at
+        # the pre-migration baseline, upgraded to head with its rows intact.
+        working-directory: apps/api
+        env:
+          PGPASSWORD: qagent
+        run: |
+          set -euo pipefail
+          psql -h localhost -U qagent -d postgres -c "CREATE DATABASE qagent_legacy"
+          export ADMIN_DATABASE_URL=postgresql+psycopg://qagent:qagent@localhost:5432/qagent_legacy
+
+          # Build the pre-migration schema, then remove the version table so it
+          # looks exactly like a database created before Alembic existed.
+          python -m alembic upgrade "$(python -c 'from qagent.db_init import BASELINE_REVISION; print(BASELINE_REVISION)')"
+          psql -h localhost -U qagent -d qagent_legacy -c "DROP TABLE alembic_version"
+          psql -h localhost -U qagent -d qagent_legacy -c "
+            INSERT INTO organizations (id,name,slug,created_at,updated_at)
+              VALUES (gen_random_uuid(),'legacy','legacy-org',now(),now());
+            INSERT INTO projects (id,org_id,name,default_branch,stack,created_at,updated_at)
+              SELECT gen_random_uuid(), id,'p','main','{}',now(),now() FROM organizations;
+            INSERT INTO test_runs (id,org_id,project_id,status,trigger,total,passed,failed,errored,created_at,updated_at)
+              SELECT gen_random_uuid(), p.org_id, p.id,'PASSED','manual',42,42,0,0,now(),now() FROM projects p;"
+
+          DATABASE_URL=postgresql+psycopg://qagent_app:qagent_app@localhost:5432/qagent_legacy             python -c "from qagent.db_init import create_schema, _admin_engine; create_schema(_admin_engine())"
+
+          total=$(psql -h localhost -U qagent -d qagent_legacy -tAc "SELECT total FROM test_runs")
+          plan=$(psql -h localhost -U qagent -d qagent_legacy -tAc "SELECT plan::text FROM test_runs")
+          echo "legacy row after upgrade: total=$total plan=$plan"
+          [ "$total" = "42" ] || { echo "::error::legacy row was lost by the migration"; exit 1; }
+          [ "$plan" = "{}" ] || { echo "::error::new column has no usable default"; exit 1; }
+
+  rag-pgvector:
+    # The RAG store has two vector backends and the default (JSON on stock
+    # postgres) is the one almost everyone runs. This job covers the other one,
+    # because testing only the default is how the pgvector path shipped broken
+    # twice: once binding a type modifier as a parameter, once comparing a uuid
+    # column against a varchar and silently falling back forever.
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: qagent
+          POSTGRES_PASSWORD: qagent
+          POSTGRES_DB: qagent
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U qagent"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      ADMIN_DATABASE_URL: postgresql+psycopg://qagent:qagent@localhost:5432/qagent
+      DATABASE_URL: postgresql+psycopg://qagent_app:qagent_app@localhost:5432/qagent
+      REDIS_URL: redis://localhost:6379/0
+      CELERY_BROKER_URL: redis://localhost:6379/1
+      CELERY_RESULT_BACKEND: redis://localhost:6379/2
+      QAGENT_LLM_PROVIDER: "null"
+      QAGENT_SECRET_KEY: ci-integration-test-secret
+      QAGENT_VECTOR_BACKEND: pgvector
+      QAGENT_EMBEDDING_DIMENSIONS: "2"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        working-directory: apps/api
+        run: |
+          pip install --upgrade pip
+          pip install -e ".[dev,rag]"
+
+      - name: RAG store on the native pgvector backend
+        working-directory: apps/api
+        run: pytest tests_integration/test_rag_store.py -q
 
   web:
     runs-on: ubuntu-latest

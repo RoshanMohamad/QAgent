@@ -17,6 +17,9 @@ from qagent.modules.discovery.openapi import EndpointSpec, fetch_spec, parse_ope
 from qagent.modules.explorer.actions import InteractionPolicy
 from qagent.modules.generator.rules import GeneratedCase, generate
 from qagent.modules.llm.client import LlmClient
+from qagent.modules.observability.tracing import set_attributes, span
+from qagent.modules.planner.strategy import CoverageReport, TestPlan, build_plan, coverage
+from qagent.modules.rag.index import RepositoryIndex
 from qagent.modules.runner.executor import ApiTestRunner, RunnerConfig, TargetRejected
 from qagent.modules.triage.agent import arbitrate, build_bug_report
 from qagent.modules.triage.classifier import FailureClass, classify, extract_signals
@@ -69,6 +72,8 @@ class PipelineResult:
     errors: list[str] = field(default_factory=list)
     llm_totals: dict = field(default_factory=dict)
     spec_url: str | None = None
+    plan: TestPlan | None = None
+    coverage: CoverageReport | None = None
 
     @property
     def total(self) -> int:
@@ -90,6 +95,17 @@ class PipelineResult:
     def bugs(self) -> list[CaseOutcome]:
         return [o for o in self.outcomes if o.bug]
 
+    def surface_coverage(self) -> dict:
+        """How much of the discovered surface a check actually ran against.
+
+        Distinct from ``coverage``, which is plan-vs-actual: a plan can be 100%
+        covered while half the API is untouched, because the plan itself was
+        capped. Both numbers are true and they answer different questions.
+        """
+        from qagent.modules.coverage.surface import summarise
+
+        return summarise(self).to_dict()
+
     def classification_counts(self) -> dict[str, int]:
         counts: dict[str, int] = {}
         for outcome in self.outcomes:
@@ -109,6 +125,9 @@ class PipelineResult:
             "errored": self.errored,
             "bugs": len(self.bugs),
             "classifications": self.classification_counts(),
+            "plan": self.plan.summary() if self.plan else None,
+            "coverage": self.coverage.to_dict() if self.coverage else None,
+            "surface": self.surface_coverage(),
             "llm": self.llm_totals,
             "duration_s": round(
                 ((self.finished_at or datetime.now(UTC)) - self.started_at).total_seconds(), 2
@@ -155,6 +174,8 @@ def run_pipeline(
     interactive_max_pages: int = 15,
     interactive_max_actions: int = 40,
     interaction_policy: InteractionPolicy | None = None,
+    plan_enrichment: bool = False,
+    code_index: RepositoryIndex | None = None,
 ) -> PipelineResult:
     """Run the full loop against one environment.
 
@@ -173,6 +194,17 @@ def run_pipeline(
     to a recorded, non-fatal skip when Playwright isn't installed, since it's the
     only stage with a dependency the core install doesn't carry.
 
+    ``plan_enrichment`` lets the Test Planner (agent 2) spend a model call raising
+    the priority of modules whose business impact the rules under-rated. Off by
+    default: the plan itself is always built, always rules-derived, and always
+    free - enrichment can only reorder what is already there.
+
+    ``code_index`` is a repository index (modules/rag/). When supplied, a failure
+    classified as a real defect is used as a retrieval query against the checkout,
+    and the matching functions are attached to the bug report as ``affected_code``
+    - the "Affected: OrderService.createOrder()" line CLAUDE.md section 13 asks
+    for. Retrieval runs with or without a model configured.
+
     ``run_interactive`` additionally fills forms and clicks through same-origin pages
     (modules/explorer/interact.py) instead of only following links, folding any defect
     it finds into ``outcomes`` as ``kind="e2e_interactive"``. It is a separate stage
@@ -183,7 +215,9 @@ def run_pipeline(
     result = PipelineResult(base_url=base_url, started_at=datetime.now(UTC))
 
     # --- discover -----------------------------------------------------------
-    endpoints, spec_url = discover(base_url, openapi_url, repo_path)
+    with span("qagent.discover", base_url=base_url) as active:
+        endpoints, spec_url = discover(base_url, openapi_url, repo_path)
+        set_attributes(active, endpoints=len(endpoints), spec_url=spec_url or "none")
     result.endpoints = endpoints
     result.spec_url = spec_url
 
@@ -196,10 +230,38 @@ def run_pipeline(
         result.llm_totals = llm.totals()
         return result
 
+    # --- plan ---------------------------------------------------------------
+    # Rules-first and free; `enrich_plan` is the opt-in model pass on top, and is
+    # deliberately not called here so the default loop stays $0.00 (README).
+    with span("qagent.plan") as active:
+        plan = build_plan(endpoints)
+        if plan_enrichment and llm.available:
+            from qagent.modules.planner.strategy import enrich_plan
+
+            plan = enrich_plan(plan, llm)
+        set_attributes(
+            active, modules=len(plan.modules), required_checks=plan.required_checks
+        )
+    result.plan = plan
+
     # --- generate -----------------------------------------------------------
-    generation = generate(endpoints, max_cases=max_cases)
-    result.skipped.extend(generation.skipped)
-    logger.info("generated %d cases across %d endpoints", len(generation.cases), len(endpoints))
+    with span("qagent.generate") as active:
+        generation = generate(endpoints, max_cases=max_cases, plan=plan)
+        result.skipped.extend(generation.skipped)
+        result.coverage = coverage(plan, generation)
+        set_attributes(
+            active,
+            cases=len(generation.cases),
+            coverage_ratio=result.coverage.ratio,
+            uncovered_modules=len(result.coverage.uncovered_modules),
+        )
+    logger.info(
+        "generated %d cases across %d endpoints (%d/%d planned checks covered)",
+        len(generation.cases),
+        len(endpoints),
+        result.coverage.generated,
+        result.coverage.planned,
+    )
 
     # --- execute ------------------------------------------------------------
     config = RunnerConfig(
@@ -221,7 +283,7 @@ def run_pipeline(
 
     auth_configured = bool(auth_headers)
 
-    with runner:
+    with span("qagent.execute", cases=len(generation.cases)) as active, runner:
         for case in generation.cases:
             outcome = _execute_and_triage(
                 case=case,
@@ -229,8 +291,12 @@ def run_pipeline(
                 llm=llm,
                 auth_configured=auth_configured,
                 history=(history or {}).get(case.name, []),
+                code_index=code_index,
             )
             result.outcomes.append(outcome)
+        set_attributes(
+            active, passed=result.passed, failed=result.failed, errored=result.errored
+        )
 
     if run_e2e:
         _run_e2e_stage(
@@ -452,6 +518,7 @@ def _execute_and_triage(
     llm: LlmClient,
     auth_configured: bool,
     history: list[str],
+    code_index: RepositoryIndex | None = None,
 ) -> CaseOutcome:
     execution = runner.execute(case.spec)
 
@@ -502,6 +569,7 @@ def _execute_and_triage(
             response=execution.response,
             failure_message=execution.failure_message,
             llm=llm,
+            index=code_index,
         )
 
     return outcome

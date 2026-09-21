@@ -197,3 +197,68 @@ def test_analyze_uses_openapi_discovery_when_spec_given(tmp_path, monkeypatch) -
     assert result.exit_code == 0
     assert "should-not-be-used" not in result.output
     assert "orders" in result.output
+
+
+# --------------------------------------------------------------- qagent plan
+
+
+def _plan_endpoints():
+    from qagent.modules.discovery.openapi import EndpointSpec, score_risk
+
+    return [
+        EndpointSpec(
+            method="POST", path="/api/v1/auth/login",
+            risk_score=score_risk("POST", "/api/v1/auth/login", False),
+        ),
+        EndpointSpec(
+            method="GET", path="/api/v1/health",
+            risk_score=score_risk("GET", "/api/v1/health", False),
+        ),
+    ]
+
+
+def test_plan_ranks_auth_above_health(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "qagent.pipeline.discover", lambda *a, **k: (_plan_endpoints(), "stub")
+    )
+
+    result = runner.invoke(app, ["plan", "--url", "http://x/"])
+
+    assert result.exit_code == 0
+    assert result.output.index("auth") < result.output.index("health")
+    assert "critical" in result.output
+
+
+def test_plan_names_what_a_capped_run_would_skip(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "qagent.pipeline.discover", lambda *a, **k: (_plan_endpoints(), "stub")
+    )
+
+    result = runner.invoke(app, ["plan", "--url", "http://x/", "--max-cases", "1"])
+
+    assert result.exit_code == 0
+    assert "left untested" in result.output
+    assert "health" in result.output
+
+
+def test_plan_writes_json(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(
+        "qagent.pipeline.discover", lambda *a, **k: (_plan_endpoints(), "stub")
+    )
+    out = tmp_path / "plan.json"
+
+    result = runner.invoke(app, ["plan", "--url", "http://x/", "--json", str(out)])
+
+    assert result.exit_code == 0
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    assert payload["summary"]["modules"] == 2
+    assert payload["modules"][0]["name"] == "auth"
+    assert payload["modules"][0]["checks"]
+
+
+def test_plan_exits_nonzero_when_nothing_is_discovered(monkeypatch) -> None:
+    monkeypatch.setattr("qagent.pipeline.discover", lambda *a, **k: ([], None))
+
+    result = runner.invoke(app, ["plan", "--url", "http://x/"])
+
+    assert result.exit_code == 2

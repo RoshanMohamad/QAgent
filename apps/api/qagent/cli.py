@@ -90,24 +90,95 @@ def _render(result: PipelineResult, *, verbose: bool) -> None:
 
     for outcome in result.bugs:
         bug = outcome.bug or {}
-        console.print(
-            Panel(
-                f"[bold]{bug.get('title')}[/bold]\n\n"
-                f"severity   {bug.get('severity')}\n"
-                f"expected   {bug.get('expected')}\n"
-                f"actual     {bug.get('actual')}\n\n"
-                f"root cause {bug.get('root_cause')}\n\n"
-                f"fix        {bug.get('suggested_fix')}",
-                border_style="red",
-                title="defect",
-            )
+        body = (
+            f"[bold]{bug.get('title')}[/bold]\n\n"
+            f"severity   {bug.get('severity')}\n"
+            f"expected   {bug.get('expected')}\n"
+            f"actual     {bug.get('actual')}\n\n"
+            f"root cause {bug.get('root_cause')}\n\n"
         )
+        # CLAUDE.md section 13's "Affected: OrderService.createOrder()" line.
+        # Present only when a checkout was indexed, so its absence is not a gap
+        # in the report, it is the honest consequence of having no source.
+        if bug.get("affected_location"):
+            body += f"affected   {bug['affected_location']}\n"
+            others = [
+                c["location"]
+                for c in (bug.get("affected_code") or [])
+                if c["location"] != bug["affected_location"]
+            ]
+            if others:
+                body += f"also see   {', '.join(others[:3])}\n"
+            body += "\n"
+        body += f"fix        {bug.get('suggested_fix')}"
+
+        console.print(Panel(body, border_style="red", title="defect"))
+
+    # Surface coverage answers a different question from plan coverage: not
+    # "did we run the plan" but "how much of the API did anything touch".
+    surface = (summary.get("surface") or {}).get("endpoint_surface") or {}
+    if surface.get("total"):
+        colour = "green" if surface["percent"] == 100 else "yellow"
+        console.print(
+            f"\n[{colour}]surface[/{colour}] {surface['covered']}/{surface['total']} "
+            f"discovered endpoints exercised ({surface['percent']}%)"
+        )
+        if surface.get("uncovered"):
+            shown = ", ".join(surface["uncovered"][:5])
+            more = surface["uncovered_total"] - min(5, len(surface["uncovered"]))
+            console.print(
+                f"  [yellow]untouched:[/yellow] {shown}" + (f" (+{more} more)" if more > 0 else "")
+            )
+
+    # Only worth the reader's attention when the plan was not fully covered -
+    # a coverage line that always says 100% teaches people to stop reading it.
+    cov = summary.get("coverage") or {}
+    if cov.get("missing"):
+        console.print(
+            f"\n[yellow]coverage[/yellow] {cov['generated']}/{cov['planned']} planned checks "
+            f"generated ({cov['ratio']:.0%}); {cov['missing']} skipped by the case limit."
+        )
+        if cov.get("uncovered_modules"):
+            console.print(
+                f"  [yellow]untested modules:[/yellow] {', '.join(cov['uncovered_modules'])}"
+            )
 
     llm = summary.get("llm") or {}
     if llm.get("calls"):
         console.print(
             f"\n[dim]llm: {llm['calls']} calls, {llm['tokens']} tokens, ${llm['usd']:.4f}[/dim]"
         )
+
+
+def _code_index_for(repo: Path | None, settings: Any) -> Any:
+    """Build a repository index when a checkout is available, else None.
+
+    Indexing is best-effort by design: a repository QAgent cannot chunk still
+    gets scanned, it just gets bug reports without an "Affected" line. Failing
+    the run over it would trade the whole result for one field.
+    """
+    if repo is None:
+        return None
+
+    from qagent.modules.rag.chunker import chunk_repository
+    from qagent.modules.rag.embeddings import build_embedder
+    from qagent.modules.rag.index import build_index
+
+    try:
+        chunks = chunk_repository(repo)
+    except Exception as exc:  # noqa: BLE001 - evidence is an upgrade, not a requirement
+        console.print(f"[yellow]could not index {repo}: {exc}[/yellow]")
+        return None
+
+    if not chunks:
+        return None
+
+    built = build_index(chunks, embedder=build_embedder(settings))
+    console.print(
+        f"[dim]indexed {built.summary()['chunks']} chunks from "
+        f"{built.summary()['files']} files for root-cause evidence[/dim]"
+    )
+    return built
 
 
 @app.command()
@@ -150,6 +221,7 @@ def scan(
         allow_private=not settings.is_production,
         allowlist=settings.egress_allowlist,
         llm=LlmClient.from_settings(settings),
+        code_index=_code_index_for(repo, settings),
     )
 
     _render(result, verbose=verbose)
@@ -166,6 +238,7 @@ def scan(
 def _write_json_report(result: PipelineResult, output: Path) -> None:
     payload = {
         "summary": result.summary(),
+        "plan": result.plan.to_dict() if result.plan else None,
         "outcomes": [
             {
                 "name": o.name,
@@ -527,16 +600,23 @@ def analyze(
         found_endpoints = found_endpoints or None
 
     analysis = analyze_repository(repo, endpoints=found_endpoints)
+    _render_analysis(analysis, label=str(repo), title="QAgent analyze", output=output)
+
+
+def _render_analysis(analysis: Any, *, label: str, title: str, output: Path | None) -> None:
+    """Print a ``ProjectAnalysis``. Shared by `analyze` (a local checkout) and
+    `connect` (a freshly cloned one) so the two never drift into reporting the
+    same analysis differently."""
     summary = analysis.summary()
 
     console.print(
         Panel(
-            f"[bold]{repo}[/bold]\n"
+            f"[bold]{label}[/bold]\n"
             f"{len(analysis.stack.technologies)} technologies - "
             f"{summary['endpoint_count']} endpoints - "
             f"{summary['frontend_route_count']} frontend routes - "
             f"{summary['database_model_count']} database models",
-            title="QAgent analyze",
+            title=title,
             border_style="blue",
         )
     )
@@ -583,6 +663,43 @@ def analyze(
 
 
 @app.command()
+def connect(
+    repo_url: str = typer.Option(
+        ..., "--repo", "-r", help="https://github.com/owner/repo, or the owner/repo shorthand."
+    ),
+    branch: str | None = typer.Option(None, "--branch", "-b", help="Branch (default: the repo's)."),
+    token: str | None = typer.Option(
+        None, "--token", help="GitHub token for private repos; defaults to $GITHUB_TOKEN."
+    ),
+    output: Path | None = typer.Option(None, "--json", help="Write the full analysis as JSON."),
+) -> None:
+    """Clone a GitHub repository and analyze it (CLAUDE.md section 6).
+
+    The same Project Analyst `analyze` runs, against a shallow clone made in a
+    temporary directory and deleted when this exits. Nothing in the checkout is
+    executed (ADR-0006) -- only text is read.
+    """
+    import os
+
+    from qagent.modules.analyzer.analyst import analyze_repository
+    from qagent.modules.provisioning.clone import CloneError, cloned_repository, head_commit
+
+    resolved_token = token or os.environ.get("GITHUB_TOKEN")
+
+    try:
+        console.print(f"[dim]cloning {repo_url} ...[/dim]")
+        with cloned_repository(repo_url, branch=branch, token=resolved_token) as repo_dir:
+            commit_sha = head_commit(repo_dir)
+            analysis = analyze_repository(repo_dir)
+    except CloneError as exc:
+        console.print(f"[red]clone failed:[/red] {exc}")
+        raise typer.Exit(code=2) from exc
+
+    label = repo_url if not commit_sha else f"{repo_url} @ {commit_sha[:8]}"
+    _render_analysis(analysis, label=label, title="QAgent connect", output=output)
+
+
+@app.command()
 def endpoints(
     url: str = typer.Option(..., "--url", "-u"),
     spec: str | None = typer.Option(None, "--spec", "-s"),
@@ -620,6 +737,465 @@ def endpoints(
             "yes" if endpoint.requires_auth else "-",
         )
     console.print(table)
+
+
+@app.command("record-import")
+def record_import(
+    session_file: Path = typer.Argument(..., help="Session JSON exported by the extension."),
+    base_url: str | None = typer.Option(
+        None, "--url", "-u", help="Only keep traffic to this origin."
+    ),
+    out: Path | None = typer.Option(
+        None, "--out", "-o", help="Directory to emit runnable pytest files into."
+    ),
+    output: Path | None = typer.Option(None, "--json", help="Write the converted session."),
+) -> None:
+    """Turn a recorded browser session into tests (CLAUDE.md section 10).
+
+    The clicks become a UI flow document; the XHR/fetch traffic the flow
+    provoked becomes API checks in the same declarative shape the generator
+    produces, so they run through the existing runner and triage unchanged.
+
+    That second half is the point. A recorded session reaches requests static
+    discovery cannot: they need a logged-in user, a cart with something in it,
+    an order that already exists.
+    """
+    from qagent.modules.recorder.session import parse_session, to_api_cases, to_ui_flow
+
+    try:
+        document = json.loads(session_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        console.print(f"[red]could not read session file:[/red] {exc}")
+        raise typer.Exit(code=2) from exc
+
+    session = parse_session(document)
+    cases = to_api_cases(session, base_url=base_url)
+    flow = to_ui_flow(session)
+
+    console.print(
+        Panel(
+            f"[bold]{session_file.name}[/bold]\n"
+            f"start: {session.start_url or 'unknown'}\n"
+            f"{len(session.actions)} UI action(s), {len(session.requests)} request(s)\n"
+            f"{len(cases)} API check(s) derived",
+            title="QAgent record",
+            border_style="blue",
+        )
+    )
+
+    for warning in session.warnings:
+        console.print(f"[yellow]warning[/yellow] {warning}")
+
+    # A console error captured while recording is a finding in its own right:
+    # the flow already reproduced something before any test was written.
+    for diagnostic in session.diagnostics:
+        console.print(f"[red]observed[/red] {diagnostic}")
+
+    if flow["requires_secrets"]:
+        console.print(
+            f"\n[yellow]{len(flow['requires_secrets'])} field(s) were redacted[/yellow] "
+            "(password-like inputs). Supply them from a secret store when replaying."
+        )
+
+    if cases:
+        table = Table(show_header=True, header_style="bold")
+        table.add_column("method", width=7)
+        table.add_column("path", overflow="fold")
+        table.add_column("body", width=9)
+        table.add_column("asserts", overflow="fold")
+        for case in cases:
+            request = case.spec["request"]
+            success = next(
+                (a for a in case.spec["assertions"] if a["type"] == "status_in"), None
+            )
+            # A request with no recorded body cannot be replayed faithfully, so
+            # it only asserts the invariant that holds regardless of input.
+            # Showing that plainly beats printing a list of 5xx codes under a
+            # column headed "expects".
+            table.add_row(
+                request["method"],
+                request["path"],
+                "recorded" if request.get("json") is not None else "[dim]none[/dim]",
+                f"status in {success['value']}" if success else "never a 5xx",
+            )
+        console.print(table)
+
+    if out:
+        from qagent.modules.emitter.pytest_emitter import emit as emit_pytest
+
+        report = emit_pytest(
+            cases, base_url=base_url or session.start_url or "http://localhost", out_dir=out
+        )
+        console.print(f"\n[dim]wrote {report.case_count} test(s) to {out}[/dim]")
+
+    if output:
+        output.write_text(
+            json.dumps(
+                {
+                    "summary": session.summary(),
+                    "ui_flow": flow,
+                    "api_cases": [c.to_dict() for c in cases],
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        console.print(f"[dim]wrote {output}[/dim]")
+
+    if not session.actions and not session.requests:
+        raise typer.Exit(code=2)
+
+
+@app.command()
+def emit(
+    url: str = typer.Option(..., "--url", "-u", help="Base URL of the running application."),
+    out: Path = typer.Option(..., "--out", "-o", help="Directory to write the test files into."),
+    spec: str | None = typer.Option(None, "--spec", "-s", help="Explicit OpenAPI document URL."),
+    repo: Path | None = typer.Option(
+        None, "--repo", help="Repo source root to statically parse routes from as a fallback."
+    ),
+    max_cases: int | None = typer.Option(None, "--max-cases", help="Cap generated checks."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Report what would be written."),
+) -> None:
+    """Write the generated checks out as runnable pytest files (agent 3).
+
+    The emitted suite depends only on pytest and httpx - not on QAgent - so the
+    tests keep working if this tool is uninstalled. Point them at an application
+    with QAGENT_BASE_URL and supply credentials with QAGENT_AUTH_HEADER.
+    """
+    from qagent.modules.emitter.pytest_emitter import emit as emit_pytest
+    from qagent.modules.generator.rules import generate
+    from qagent.modules.planner.strategy import build_plan
+    from qagent.pipeline import discover
+
+    endpoints, source = discover(url, spec, repo)
+    if not endpoints:
+        console.print("[red]no endpoints discovered; nothing to emit[/red]")
+        raise typer.Exit(code=2)
+
+    # Planned ordering matters here too: under --max-cases, the emitted suite
+    # should contain the critical modules, not whatever came first.
+    test_plan = build_plan(endpoints)
+    generation = generate(endpoints, max_cases=max_cases, plan=test_plan)
+
+    report = emit_pytest(generation.cases, base_url=url, out_dir=out, dry_run=dry_run)
+
+    console.print(
+        Panel(
+            f"[bold]{out}[/bold]\nsource: {source}\n"
+            f"{report.case_count} test(s) across {len(report.files)} file(s)"
+            + ("  [yellow](dry run, nothing written)[/yellow]" if dry_run else ""),
+            title="QAgent emit",
+            border_style="blue",
+        )
+    )
+
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("file", overflow="fold")
+    table.add_column("tests", justify="right", width=6)
+    for emitted in report.files:
+        table.add_row(emitted.path, str(emitted.case_count))
+    if table.row_count:
+        console.print(table)
+
+    for skipped in report.skipped:
+        console.print(f"[yellow]skipped[/yellow] {skipped}")
+
+    if not dry_run and report.files:
+        console.print(
+            f"\n[dim]run them with: QAGENT_BASE_URL={url} python -m pytest {out}[/dim]"
+        )
+
+
+@app.command()
+def gate(
+    url: str = typer.Option(..., "--url", "-u", help="Base URL of the running application."),
+    spec: str | None = typer.Option(None, "--spec", "-s", help="Explicit OpenAPI document URL."),
+    repo: Path | None = typer.Option(
+        None, "--repo", help="Repo source root, for route parsing and root-cause evidence."
+    ),
+    header: list[str] = typer.Option(
+        [], "--header", "-H", help="Auth header, e.g. 'Authorization: Bearer x'."
+    ),
+    max_cases: int | None = typer.Option(None, "--max-cases", help="Cap generated checks."),
+    timeout: float = typer.Option(30.0, "--timeout", help="Per-request timeout in seconds."),
+    max_critical: int = typer.Option(0, "--max-critical", help="Critical defects allowed."),
+    max_high: int = typer.Option(0, "--max-high", help="High defects allowed."),
+    max_medium: int | None = typer.Option(None, "--max-medium", help="Medium defects allowed."),
+    max_low: int | None = typer.Option(None, "--max-low", help="Low defects allowed."),
+    min_coverage: float | None = typer.Option(
+        None, "--min-coverage", help="Fraction of the test plan that must run, 0..1."
+    ),
+    max_errors: int | None = typer.Option(
+        None, "--max-errors", help="Errored checks allowed (usually infrastructure, not defects)."
+    ),
+    output: Path | None = typer.Option(None, "--json", help="Write the decision as JSON."),
+) -> None:
+    """Run QA and exit non-zero if the result should block a deploy.
+
+    This is the CI entry point (CLAUDE.md sections 18-19). It needs no database,
+    no project and no org, because a pull request has none of those - requiring
+    them would mean standing up Postgres to find out whether a branch is safe.
+
+    Exit codes: 0 deploy, 1 block, 2 the run could not be evaluated at all.
+    """
+    from qagent.modules.gate.policy import GatePolicy, evaluate, render
+
+    auth_headers: dict[str, str] = {}
+    for item in header:
+        if ":" not in item:
+            console.print(f"[red]ignoring malformed header:[/red] {item}")
+            continue
+        name, _, value = item.partition(":")
+        auth_headers[name.strip()] = value.strip()
+
+    settings = get_settings()
+    result = run_pipeline(
+        base_url=url,
+        openapi_url=spec,
+        repo_path=repo,
+        auth_headers=auth_headers,
+        max_cases=max_cases,
+        timeout_seconds=timeout,
+        allow_private=not settings.is_production,
+        allowlist=settings.egress_allowlist,
+        llm=LlmClient.from_settings(settings),
+        code_index=_code_index_for(repo, settings),
+    )
+
+    if result.errors and not result.outcomes:
+        # Nothing ran. Reporting "pass" here would be the worst possible
+        # outcome: a gate that waves through every deploy because it never
+        # managed to test anything.
+        for error in result.errors:
+            console.print(f"[red]error[/red] {error}")
+        console.print("\n[red]RESULT: ERROR[/red] - nothing was tested, so nothing was verified.")
+        raise typer.Exit(code=2)
+
+    decision = evaluate(
+        result,
+        GatePolicy(
+            max_critical=max_critical,
+            max_high=max_high,
+            max_medium=max_medium,
+            max_low=max_low,
+            min_coverage=min_coverage,
+            max_errors=max_errors,
+        ),
+    )
+
+    console.print(
+        Panel(
+            render(decision),
+            border_style="red" if decision.blocked else "green",
+            title="quality gate",
+        )
+    )
+
+    if output:
+        output.write_text(
+            json.dumps(
+                {"summary": result.summary(), "gate": decision.to_dict()}, indent=2, default=str
+            ),
+            encoding="utf-8",
+        )
+        console.print(f"[dim]wrote {output}[/dim]")
+
+    raise typer.Exit(code=decision.exit_code)
+
+
+@app.command()
+def search(
+    query: str = typer.Argument(..., help="What to look for, e.g. 'create order price'."),
+    repo: Path = typer.Option(..., "--repo", help="Repository checkout to search."),
+    k: int = typer.Option(5, "--k", help="Number of results."),
+    show_code: bool = typer.Option(False, "--code", help="Print the matching source."),
+) -> None:
+    """Search a checkout with the same retriever bug reports use (modules/rag/).
+
+    Exposed as its own command because it is the only way to see *why* a bug
+    report cited the function it cited, and the fastest way to tell whether
+    retrieval is working on a given repository before trusting it in a run.
+    """
+    from qagent.modules.rag.chunker import chunk_repository
+    from qagent.modules.rag.embeddings import build_embedder
+    from qagent.modules.rag.index import build_index
+
+    try:
+        chunks = chunk_repository(repo)
+    except NotADirectoryError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=2) from exc
+
+    index = build_index(chunks, embedder=build_embedder())
+    summary = index.summary()
+    console.print(
+        f"[dim]{summary['chunks']} chunks from {summary['files']} files "
+        f"({summary['symbols']} named symbols), retriever={summary['retriever']}[/dim]\n"
+    )
+
+    hits = index.search(query, k=k)
+    if not hits:
+        console.print("[yellow]no matches[/yellow]")
+        raise typer.Exit(code=1)
+
+    for hit in hits:
+        console.print(f"[green]{hit.score:>7.3f}[/green]  {hit.chunk.location}")
+        if show_code:
+            console.print(Panel(hit.chunk.text[:1200], border_style="dim"))
+
+
+@app.command()
+def index(
+    repo: Path = typer.Option(..., "--repo", help="Repository checkout to index."),
+    output: Path | None = typer.Option(None, "--json", help="Write the chunk manifest as JSON."),
+) -> None:
+    """Chunk a checkout and report what the index would contain.
+
+    Useful before a scan: it answers whether QAgent can actually see this
+    repository's source, which is a different question from whether the scan
+    passes.
+    """
+    from qagent.modules.rag.chunker import chunk_repository
+    from qagent.modules.rag.embeddings import build_embedder
+    from qagent.modules.rag.index import build_index
+
+    try:
+        chunks = chunk_repository(repo)
+    except NotADirectoryError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=2) from exc
+
+    built = build_index(chunks, embedder=build_embedder())
+    summary = built.summary()
+    note = "" if summary["embedded"] else "  [dim](lexical only; no embedder configured)[/dim]"
+
+    console.print(
+        Panel(
+            f"[bold]{repo}[/bold]\n"
+            f"{summary['chunks']} chunks from {summary['files']} files\n"
+            f"{summary['symbols']} named symbols\n"
+            f"retriever: {summary['retriever']}{note}",
+            title="QAgent index",
+            border_style="blue",
+        )
+    )
+
+    by_language: dict[str, int] = {}
+    for chunk in chunks:
+        by_language[chunk.language] = by_language.get(chunk.language, 0) + 1
+    for language, count in sorted(by_language.items(), key=lambda kv: -kv[1]):
+        console.print(f"  {count:>5}  {language}")
+
+    if output:
+        output.write_text(
+            json.dumps({"summary": summary, "chunks": [c.to_dict() for c in chunks]}, indent=2),
+            encoding="utf-8",
+        )
+        console.print(f"\n[dim]wrote {output}[/dim]")
+
+
+_PRIORITY_STYLE = {
+    "critical": "bold red",
+    "high": "red",
+    "medium": "yellow",
+    "low": "dim",
+}
+
+
+@app.command()
+def plan(
+    url: str = typer.Option(..., "--url", "-u", help="Base URL of the running application."),
+    spec: str | None = typer.Option(None, "--spec", "-s", help="Explicit OpenAPI document URL."),
+    repo: Path | None = typer.Option(
+        None, "--repo", help="Repo source root to statically parse routes from as a fallback."
+    ),
+    max_cases: int | None = typer.Option(
+        None, "--max-cases", help="Show what a run capped at this many checks would cover."
+    ),
+    enrich: bool = typer.Option(
+        False, "--enrich", help="Spend one model call letting a review raise module priorities."
+    ),
+    show_checks: bool = typer.Option(False, "--checks", help="List every required check."),
+    output: Path | None = typer.Option(None, "--json", help="Write the plan as JSON."),
+) -> None:
+    """Show the test strategy (agent 2) without executing anything.
+
+    Useful on its own -- it answers "what would you test, and in what order?"
+    before committing to a run -- and useful with ``--max-cases``, which is the
+    only way to see what a budgeted run is about to leave untested.
+    """
+    from qagent.modules.generator.rules import generate
+    from qagent.modules.planner.strategy import build_plan, coverage, enrich_plan
+    from qagent.pipeline import discover
+
+    found, source = discover(url, spec, repo)
+    if not found:
+        console.print("[red]no endpoints discovered; nothing to plan[/red]")
+        raise typer.Exit(code=2)
+
+    test_plan = build_plan(found)
+    if enrich:
+        llm = LlmClient.from_settings()
+        if not llm.available:
+            console.print("[yellow]no model provider configured; plan is rules-only[/yellow]")
+        test_plan = enrich_plan(test_plan, llm)
+
+    summary = test_plan.summary()
+    console.print(
+        Panel(
+            f"[bold]{url}[/bold]\nsource: {source}\n"
+            f"{len(found)} endpoints in {summary['modules']} modules, "
+            f"{summary['required_checks']} required checks",
+            title="QAgent plan",
+            border_style="blue",
+        )
+    )
+
+    for warning in test_plan.warnings:
+        console.print(f"[yellow]warning[/yellow] {warning}")
+
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("priority", width=9)
+    table.add_column("module", width=18, overflow="fold")
+    table.add_column("endpoints", justify="right", width=9)
+    table.add_column("checks", justify="right", width=6)
+    table.add_column("why", overflow="fold")
+
+    for module in test_plan.modules:
+        style = _PRIORITY_STYLE.get(module.priority.value, "white")
+        table.add_row(
+            f"[{style}]{module.priority.value}[/]",
+            module.name,
+            str(len(module.endpoint_keys)),
+            str(len(module.checks)),
+            module.rationale,
+        )
+    console.print(table)
+
+    if show_checks:
+        for module in test_plan.modules:
+            if not module.checks:
+                continue
+            console.print(f"\n[bold]{module.name}[/bold] ({module.priority.value})")
+            for check in module.checks:
+                console.print(f"  [green]+[/green] {check.endpoint_key} - {check.intent}")
+
+    if max_cases is not None:
+        result = coverage(test_plan, generate(found, max_cases=max_cases, plan=test_plan))
+        colour = "green" if result.missing == 0 else "yellow"
+        console.print(
+            f"\n[{colour}]at --max-cases {max_cases}:[/] {result.generated}/{result.planned} "
+            f"planned checks would run ({result.ratio:.0%})"
+        )
+        if result.uncovered_modules:
+            console.print(
+                f"  [yellow]left untested:[/yellow] {', '.join(result.uncovered_modules)}"
+            )
+
+    if output:
+        output.write_text(json.dumps(test_plan.to_dict(), indent=2), encoding="utf-8")
+        console.print(f"\n[dim]wrote {output}[/dim]")
 
 
 @app.command()
@@ -856,84 +1432,173 @@ _SEVERITY_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
 @app.command()
 def security(
     repo: Path = typer.Option(..., "--repo", "-r", help="Path to the repository to scan."),
+    scanners: str = typer.Option(
+        "semgrep,trivy",
+        "--scanners",
+        help="Comma-separated static scanners. A missing one is skipped, not fatal.",
+    ),
     config: str = typer.Option(
         "auto", "--config", help="Semgrep config: 'auto', a ruleset name, or a local rules file."
     ),
-    timeout: float = typer.Option(300.0, "--timeout", help="Scan timeout in seconds."),
+    timeout: float = typer.Option(600.0, "--timeout", help="Scan timeout in seconds."),
     fail_on: str = typer.Option(
         "high", "--fail-on", help="Minimum severity that exits non-zero: critical|high|medium|low."
     ),
     output: Path | None = typer.Option(None, "--json", help="Write findings as JSON."),
 ) -> None:
-    """Static analysis via Semgrep (CLAUDE.md section 16): `qagent security`.
+    """Static analysis over a checkout (CLAUDE.md section 16): `qagent security`.
 
-    Parses source, never executes it, so this needs none of the sandboxing the
-    runner/browser/explorer commands require for a live target. Findings are
-    scored against the same severity scale as everything else QAgent reports
-    (critical/high/medium/low/info), with SQL-injection- and access-control-shaped
-    findings promoted to critical regardless of Semgrep's own severity label.
+    Runs Semgrep (bugs in the code this project wrote) and Trivy (known CVEs in
+    the code it imported). Both parse files and never execute them, so this
+    needs none of the sandboxing the runner/browser/explorer commands require
+    for a live target. `qagent dast` is the running-application scanner.
+
+    A scanner that is not installed is reported as a skip rather than failing
+    the run: almost nobody has all of them on day one, and a scan that refuses
+    to start is a scan that gets removed from CI. The skip is always printed,
+    because "no findings" means nothing without knowing what actually ran.
     """
-    from qagent.modules.security.semgrep import SemgrepError, SemgrepUnavailable, run_semgrep
+    from qagent.modules.security.aggregate import scan_repository
+
+    requested = tuple(name.strip() for name in scanners.split(",") if name.strip())
+    if not requested:
+        console.print("[red]no scanners requested[/red]")
+        raise typer.Exit(code=2)
+
+    if not repo.is_dir():
+        console.print(f"[red]not a directory: {repo}[/red]")
+        raise typer.Exit(code=2)
+
+    result = scan_repository(repo, scanners=requested, timeout_seconds=timeout)
+
+    counts = result.counts_by_severity()
+    by_scanner = result.counts_by_scanner()
+    ran = ", ".join(f"{k} ({v})" for k, v in sorted(by_scanner.items())) or "none"
+    console.print(
+        Panel(
+            f"[bold]{result.root}[/bold]\n{len(result.findings)} finding(s)\n"
+            f"scanners with findings: {ran}",
+            title="QAgent security",
+            border_style="blue",
+        )
+    )
+
+    for name, reason in sorted(result.skipped.items()):
+        console.print(f"[yellow]skipped {name}:[/yellow] {reason}")
+
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("severity", width=10)
+    table.add_column("from", width=8)
+    table.add_column("rule", overflow="fold")
+    table.add_column("location", overflow="fold")
+    table.add_column("message", overflow="fold")
+    for finding in result.sorted_findings():
+        style = _FINDING_SEVERITY_STYLE.get(finding.severity, "")
+        message = finding.message
+        # The fixed version is the single most actionable field a dependency
+        # finding has; it must not get lost inside a truncated description.
+        if finding.fixed_version:
+            message = f"[green]fix: {finding.fixed_version}[/green] - {message}"
+        table.add_row(
+            f"[{style}]{finding.severity}[/{style}]" if style else finding.severity,
+            finding.scanner,
+            finding.rule_id,
+            f"{finding.path}:{finding.line}" if finding.line else finding.path,
+            message,
+        )
+    if table.row_count:
+        console.print(table)
+
+    for error in result.scan_errors:
+        console.print(f"\n[yellow]{error}[/yellow]")
+
+    if output:
+        output.write_text(json.dumps(result.to_dict(), indent=2), encoding="utf-8")
+        console.print(f"\n[dim]wrote {output}[/dim]")
+
+    threshold = _SEVERITY_RANK.get(fail_on, 3)
+    if any(_SEVERITY_RANK.get(sev, 0) >= threshold and n for sev, n in counts.items()):
+        raise typer.Exit(code=1)
+
+
+@app.command()
+def dast(
+    url: str = typer.Option(..., "--url", "-u", help="Base URL of the running application."),
+    zap_url: str = typer.Option(
+        "http://127.0.0.1:8090", "--zap", help="Address of the ZAP daemon's API."
+    ),
+    api_key: str | None = typer.Option(None, "--api-key", help="ZAP API key, if one is set."),
+    max_pages: int = typer.Option(50, "--max-pages", help="Cap on pages the spider may visit."),
+    max_wait: float = typer.Option(300.0, "--max-wait", help="Seconds to wait per scan phase."),
+    active: bool = typer.Option(
+        False,
+        "--active",
+        help="Send attack traffic. Only against a system you are authorised to attack.",
+    ),
+    fail_on: str = typer.Option(
+        "high", "--fail-on", help="Minimum severity that exits non-zero: critical|high|medium|low."
+    ),
+    output: Path | None = typer.Option(None, "--json", help="Write findings as JSON."),
+) -> None:
+    """Dynamic analysis of a running application via OWASP ZAP (CLAUDE.md §16).
+
+    The third kind of scanner: `security` reads source and lockfiles, this
+    sends requests and reads what comes back, which is the only way to see a
+    missing security header or a cookie without HttpOnly.
+
+    Passive by default. `--active` makes ZAP send injection and traversal
+    payloads and can mutate application state, so it is opt-in and always
+    announced - a QA tool that attacks a host because a flag defaulted to true
+    is a liability, not a feature.
+    """
+    from qagent.modules.security.base import ScannerError, ScannerUnavailable
+    from qagent.modules.security.zap import ZapConfig, run_zap
+
+    if active:
+        console.print(
+            "[yellow]--active: sending attack traffic. Only do this against a system "
+            "you are authorised to test.[/yellow]"
+        )
+
+    config = ZapConfig(
+        base_url=zap_url, api_key=api_key, max_children=max_pages, max_wait_seconds=max_wait
+    )
 
     try:
-        result = run_semgrep(repo, config=config, timeout_seconds=timeout)
-    except SemgrepUnavailable as exc:
+        result = run_zap(url, config=config, active=active)
+    except ScannerUnavailable as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=2) from exc
-    except SemgrepError as exc:
-        console.print(f"[red]semgrep error:[/red] {exc}")
+    except ScannerError as exc:
+        console.print(f"[red]zap error:[/red] {exc}")
         raise typer.Exit(code=2) from exc
 
     counts = result.counts_by_severity()
     console.print(
         Panel(
-            f"[bold]{result.root}[/bold]\n{len(result.findings)} finding(s)",
-            title="QAgent security",
+            f"[bold]{url}[/bold]\n{len(result.findings)} finding(s)\n"
+            f"mode: {'active (attack traffic sent)' if active else 'passive'}",
+            title="QAgent DAST",
             border_style="blue",
         )
     )
 
     table = Table(show_header=True, header_style="bold")
     table.add_column("severity", width=10)
-    table.add_column("rule", overflow="fold")
-    table.add_column("location", overflow="fold")
-    table.add_column("message", overflow="fold")
-    for finding in sorted(
-        result.findings, key=lambda f: _SEVERITY_RANK.get(f.severity, 0), reverse=True
-    ):
+    table.add_column("alert", overflow="fold")
+    table.add_column("url", overflow="fold")
+    for finding in result.sorted_findings():
         style = _FINDING_SEVERITY_STYLE.get(finding.severity, "")
         table.add_row(
             f"[{style}]{finding.severity}[/{style}]" if style else finding.severity,
-            finding.rule_id,
-            f"{finding.path}:{finding.line}",
-            finding.message,
+            finding.title,
+            finding.path,
         )
-    console.print(table)
-
-    if result.scan_errors:
-        console.print(f"\n[yellow]{len(result.scan_errors)} file(s) could not be scanned.[/yellow]")
+    if table.row_count:
+        console.print(table)
 
     if output:
-        payload = {
-            "root": result.root,
-            "findings": [
-                {
-                    "rule_id": f.rule_id,
-                    "title": f.title,
-                    "severity": f.severity,
-                    "path": f.path,
-                    "line": f.line,
-                    "message": f.message,
-                    "confidence": f.confidence,
-                    "cwe": f.cwe,
-                    "owasp": f.owasp,
-                }
-                for f in result.findings
-            ],
-            "by_severity": counts,
-            "scan_errors": result.scan_errors,
-        }
-        output.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        output.write_text(json.dumps(result.to_dict(), indent=2), encoding="utf-8")
         console.print(f"\n[dim]wrote {output}[/dim]")
 
     threshold = _SEVERITY_RANK.get(fail_on, 3)

@@ -317,6 +317,14 @@ class TestRun(Base, TimestampMixin):
     failed: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     errored: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
+    #: The strategy this run was held to, and how much of it actually ran
+    #: (agent 2, modules/planner/strategy.py). Stored on the run rather than the
+    #: project because the plan is derived from whatever discovery found *at that
+    #: moment*: a run that covered 60% of its plan stays a true statement about
+    #: that run even after the next deploy changes the API surface.
+    plan: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    coverage: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
@@ -384,6 +392,81 @@ class Artifact(Base, TimestampMixin):
     scrubbed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
 
+def _embedding_column_type():
+    """JSON by default; a real ``vector(n)`` when the deployment opted in.
+
+    Decided once, here, because SQLAlchemy fixes a column's type when the model
+    is defined. An earlier version of this tried to be clever - store JSON, then
+    ``ALTER`` the column to ``vector`` at init when the extension turned out to
+    be available. That fails in a way worth recording: the ALTER succeeds, and
+    then every INSERT fails with "column is of type vector but expression is of
+    type json", because the ORM is still binding the type it was defined with.
+    A physical schema that disagrees with the mapper is not a graceful
+    degradation, it is an outage.
+
+    So it is a declared choice. ``QAGENT_VECTOR_BACKEND=pgvector`` requires both
+    the package and the extension, and ``db_init`` checks for both and says so.
+    The default requires neither and works on the image the compose file ships.
+    """
+    from qagent.config import get_settings
+
+    settings = get_settings()
+    if settings.qagent_vector_backend != "pgvector":
+        return JSON
+
+    try:
+        from pgvector.sqlalchemy import Vector
+    except ImportError as exc:  # pragma: no cover - configuration error path
+        raise RuntimeError(
+            "QAGENT_VECTOR_BACKEND=pgvector needs the pgvector package: "
+            "pip install 'qagent[rag]'"
+        ) from exc
+
+    return Vector(settings.qagent_embedding_dimensions)
+
+
+class CodeChunk(Base, TimestampMixin):
+    """One indexed span of a project's source (CLAUDE.md sections 8 and 21).
+
+    Persisted so an index survives the worker process that built it: without
+    this, every scan re-chunks and re-embeds the whole checkout, which is free
+    for BM25 and expensive for embeddings.
+    """
+
+    __tablename__ = "code_chunks"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    org_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+
+    #: Which checkout this was indexed from. Chunks from a stale commit are
+    #: worse than none: they cite line numbers that have since moved.
+    commit_sha: Mapped[str | None] = mapped_column(String(64), index=True)
+
+    path: Mapped[str] = mapped_column(String(500), nullable=False)
+    start_line: Mapped[int] = mapped_column(Integer, nullable=False)
+    end_line: Mapped[int] = mapped_column(Integer, nullable=False)
+    symbol: Mapped[str | None] = mapped_column(String(300))
+    language: Mapped[str] = mapped_column(String(32), default="text", nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+
+    #: sha256 of (path, start_line, content). Lets a re-index skip text that has
+    #: not changed, which is the whole point of persisting embeddings.
+    digest: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    embedding: Mapped[list | None] = mapped_column(_embedding_column_type())
+    embedding_model: Mapped[str | None] = mapped_column(String(100))
+
+    __table_args__ = (
+        Index("ix_code_chunks_project_digest", "project_id", "digest", unique=True),
+    )
+
+
 # --------------------------------------------------------------------------- defects
 
 
@@ -421,6 +504,116 @@ class Bug(Base, TimestampMixin):
     external_ref: Mapped[str | None] = mapped_column(String(200))
 
     __table_args__ = (UniqueConstraint("org_id", "reference", name="uq_bug_org_reference"),)
+
+
+class BugEvent(Base, TimestampMixin):
+    """One state change on a bug (CLAUDE.md section 20).
+
+    The `Bug` row carries the *current* status and nothing else, which cannot
+    answer the questions a defect's history is actually asked: when was this
+    first seen, how long was it open, did it regress after being closed. A
+    status column overwritten in place destroys exactly that.
+
+    Deliberately append-only: nothing updates or deletes a row here. An audit
+    trail that can be edited is not one.
+    """
+
+    __tablename__ = "bug_events"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    org_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    bug_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("bugs.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+
+    #: opened | reopened | status_changed | severity_changed | synced | closed
+    event: Mapped[str] = mapped_column(String(32), nullable=False)
+    from_value: Mapped[str | None] = mapped_column(String(64))
+    to_value: Mapped[str | None] = mapped_column(String(64))
+
+    #: Null when QAgent itself made the change, which is the common case - a
+    #: run reopening a defect has no human actor and pretending otherwise
+    #: would attribute automated decisions to whoever last logged in.
+    actor_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL")
+    )
+    run_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("test_runs.id", ondelete="SET NULL")
+    )
+    detail: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+
+    __table_args__ = (Index("ix_bug_events_bug_created", "bug_id", "created_at"),)
+
+
+class BugComment(Base, TimestampMixin):
+    """A human note on a defect (CLAUDE.md section 20)."""
+
+    __tablename__ = "bug_comments"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    org_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    bug_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("bugs.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    author_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL")
+    )
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    #: True for a comment QAgent wrote (an AI analysis note), so a reader can
+    #: tell a machine's opinion from a colleague's without checking the author.
+    generated: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+    __table_args__ = (Index("ix_bug_comments_bug_created", "bug_id", "created_at"),)
+
+
+class Repository(Base, TimestampMixin):
+    """A connected source repository (CLAUDE.md sections 5-6, 20).
+
+    Separate from `Project` because the relationship is genuinely one-to-many
+    in every case the plan describes: a project has a frontend repo and a
+    backend repo, or a monorepo plus a deployment repo. Folding the URL into
+    `Project` (where `repo_url` still lives, for the single-repo case) would
+    make the second one a schema change.
+
+    No token column, by design. ADR-0009 keeps credentials out of argv *and*
+    out of the database; a connected repository holds a reference to a secret,
+    never the secret.
+    """
+
+    __tablename__ = "repositories"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    org_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+
+    provider: Mapped[str] = mapped_column(String(32), default="github", nullable=False)
+    url: Mapped[str] = mapped_column(String(500), nullable=False)
+    default_branch: Mapped[str] = mapped_column(String(100), default="main", nullable=False)
+    #: Where a checkout lives inside the repo, for a monorepo.
+    subdirectory: Mapped[str | None] = mapped_column(String(300))
+    #: Name of a secret in whatever store holds it - never the credential.
+    secret_ref: Mapped[str | None] = mapped_column(String(200))
+
+    last_analyzed_sha: Mapped[str | None] = mapped_column(String(64))
+    last_analyzed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        UniqueConstraint("project_id", "url", name="uq_repository_project_url"),
+    )
 
 
 class SecurityFinding(Base, TimestampMixin):
@@ -567,6 +760,120 @@ class LlmCall(Base, TimestampMixin):
     agent_run: Mapped[AgentRun] = relationship(back_populates="calls")
 
 
+class QualityGate(Base, TimestampMixin):
+    """One recorded deploy-or-block decision (CLAUDE.md sections 18, 20).
+
+    `GET /projects/{id}/quality` and `qagent gate` both compute this verdict on
+    demand, and a verdict that is only ever computed cannot be audited: nobody
+    can answer "what did the gate say when we shipped the release that broke
+    production", because the numbers it saw have since changed.
+
+    So the decision is stored with the *inputs* it was made from, not just the
+    outcome. Recomputing it later against today's open defects would produce a
+    different, useless answer.
+    """
+
+    __tablename__ = "quality_gates"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    org_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    run_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("test_runs.id", ondelete="SET NULL"), index=True
+    )
+
+    result: Mapped[str] = mapped_column(String(16), nullable=False)  # pass | block | error
+    reason: Mapped[str | None] = mapped_column(Text)
+    commit_sha: Mapped[str | None] = mapped_column(String(64), index=True)
+    #: "ci" | "manual" | "api" - a gate run from a pull request and one run by
+    #: hand mean different things when reading the history back.
+    trigger: Mapped[str] = mapped_column(String(32), default="ci", nullable=False)
+
+    #: The thresholds in force and the per-check numbers, exactly as
+    #: modules/gate/policy.py produced them.
+    policy: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    checks: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+
+    __table_args__ = (Index("ix_quality_gates_project_created", "project_id", "created_at"),)
+
+
+class Deployment(Base, TimestampMixin):
+    """A release the gate was consulted about (CLAUDE.md sections 18-19, 20).
+
+    Recorded so the question that matters can be answered afterwards: did the
+    defects QAgent found before a deploy correlate with what went wrong after
+    it. Without a deployment row there is nothing to join a defect against but
+    a timestamp.
+    """
+
+    __tablename__ = "deployments"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    org_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    environment_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("environments.id", ondelete="SET NULL")
+    )
+    quality_gate_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("quality_gates.id", ondelete="SET NULL")
+    )
+
+    commit_sha: Mapped[str | None] = mapped_column(String(64), index=True)
+    version: Mapped[str | None] = mapped_column(String(100))
+    #: pending | deployed | blocked | rolled_back
+    status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
+    deployed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (Index("ix_deployments_project_created", "project_id", "created_at"),)
+
+
+class Notification(Base, TimestampMixin):
+    """An outbound alert and whether it was actually delivered (§20, §23 Phase 5).
+
+    Delivery status is stored rather than assumed. "We notified the team" is a
+    claim a Slack outage silently falsifies, and a notification system that
+    cannot tell you it failed is worse than none - it converts a loud problem
+    into a quiet one.
+    """
+
+    __tablename__ = "notifications"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    org_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+
+    #: run_finished | gate_blocked | critical_defect | security_finding
+    event: Mapped[str] = mapped_column(String(64), nullable=False)
+    channel: Mapped[str] = mapped_column(String(32), nullable=False)  # slack | webhook | email
+    target: Mapped[str] = mapped_column(String(500), nullable=False)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+
+    status: Mapped[str] = mapped_column(String(16), default="pending", nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_error: Mapped[str | None] = mapped_column(Text)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (Index("ix_notifications_status_created", "status", "created_at"),)
+
+
 class AuditLog(Base, TimestampMixin):
     __tablename__ = "audit_logs"
 
@@ -593,7 +900,14 @@ TENANT_TABLES = [
     "test_runs",
     "test_results",
     "artifacts",
+    "code_chunks",
     "bugs",
+    "bug_events",
+    "bug_comments",
+    "repositories",
+    "quality_gates",
+    "deployments",
+    "notifications",
     "security_findings",
     "performance_runs",
     "agent_runs",

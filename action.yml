@@ -1,0 +1,171 @@
+name: "QAgent Quality Gate"
+description: >-
+  Run autonomous API quality checks against a running application and block the
+  workflow when the result contains real defects or covered too little of its
+  own test plan.
+author: "QAgent"
+
+branding:
+  icon: shield
+  color: blue
+
+inputs:
+  url:
+    description: "Base URL of the running application under test."
+    required: true
+  spec:
+    description: "Explicit OpenAPI document URL. Probed automatically when omitted."
+    required: false
+    default: ""
+  repo-path:
+    description: >-
+      Source root. Used to parse routes statically when no OpenAPI document is
+      available, and to index the source so defects cite the function that
+      causes them. Usually just '.'.
+    required: false
+    default: ""
+  header:
+    description: >-
+      Auth header, e.g. 'Authorization: Bearer ${{ secrets.QA_TOKEN }}'. One per
+      line for several. Passed to the application under test, never logged.
+    required: false
+    default: ""
+  max-critical:
+    description: "Critical defects tolerated before the gate blocks."
+    required: false
+    default: "0"
+  max-high:
+    description: "High defects tolerated before the gate blocks."
+    required: false
+    default: "0"
+  max-medium:
+    description: "Medium defects tolerated. Empty means the check is not applied."
+    required: false
+    default: ""
+  min-coverage:
+    description: >-
+      Fraction of the generated test plan that must actually run, 0..1. Guards
+      against a green result that only looks green because most of the plan was
+      skipped.
+    required: false
+    default: ""
+  max-cases:
+    description: "Cap on generated checks. Empty means no cap."
+    required: false
+    default: ""
+  fail-on-block:
+    description: >-
+      Set to 'false' to report the verdict without failing the job - useful when
+      first adopting the gate on an existing codebase.
+    required: false
+    default: "true"
+  python-version:
+    description: "Python used to install QAgent itself."
+    required: false
+    default: "3.12"
+
+outputs:
+  result:
+    description: "'pass', 'block', or 'error' when nothing could be tested."
+    value: ${{ steps.gate.outputs.result }}
+  report:
+    description: "Path to the JSON report (summary plus the gate decision)."
+    value: ${{ steps.gate.outputs.report }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Install QAgent
+      shell: bash
+      run: pip install --upgrade pip && pip install -e "${{ github.action_path }}/apps/api"
+
+    - name: Run quality gate
+      id: gate
+      shell: bash
+      env:
+        # Passed through the environment rather than the command line: an
+        # argv is visible to every process on the runner, and this may carry
+        # a bearer token.
+        QAGENT_GATE_HEADERS: ${{ inputs.header }}
+      run: |
+        # `set +e` is load-bearing: GitHub runs `shell: bash` as `bash -eo
+        # pipefail`, so without it the step aborts the instant the gate exits
+        # non-zero - which is exactly the case this step exists to report on.
+        set +e
+        set -u
+
+        report="$RUNNER_TEMP/qagent-gate.json"
+        args=(--url "${{ inputs.url }}" --json "$report")
+
+        if [ -n "${{ inputs.spec }}" ];         then args+=(--spec "${{ inputs.spec }}"); fi
+        if [ -n "${{ inputs.repo-path }}" ];    then args+=(--repo "${{ inputs.repo-path }}"); fi
+        if [ -n "${{ inputs.max-cases }}" ];    then args+=(--max-cases "${{ inputs.max-cases }}"); fi
+        if [ -n "${{ inputs.max-medium }}" ];   then args+=(--max-medium "${{ inputs.max-medium }}"); fi
+        if [ -n "${{ inputs.min-coverage }}" ]; then args+=(--min-coverage "${{ inputs.min-coverage }}"); fi
+        args+=(--max-critical "${{ inputs.max-critical }}")
+        args+=(--max-high "${{ inputs.max-high }}")
+
+        while IFS= read -r line; do
+          if [ -n "$line" ]; then args+=(--header "$line"); fi
+        done <<< "${QAGENT_GATE_HEADERS:-}"
+
+        qagent gate "${args[@]}"
+        code=$?
+
+        case "$code" in
+          0) result=pass ;;
+          1) result=block ;;
+          *) result=error ;;
+        esac
+
+        echo "result=$result"  >> "$GITHUB_OUTPUT"
+        echo "report=$report"  >> "$GITHUB_OUTPUT"
+        echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+
+    - name: Summarise
+      if: always()
+      shell: bash
+      run: |
+        report="${{ steps.gate.outputs.report }}"
+        {
+          echo "## QAgent quality gate"
+          echo
+          echo "**Result:** ${{ steps.gate.outputs.result }}"
+          echo
+          if [ -f "$report" ]; then
+            python - "$report" <<'PY'
+        import json, sys
+        data = json.load(open(sys.argv[1]))
+        gate, summary = data.get("gate", {}), data.get("summary", {})
+        print(f"{summary.get('total', 0)} checks, "
+              f"{summary.get('passed', 0)} passed, "
+              f"{summary.get('failed', 0)} failed, "
+              f"{summary.get('bugs', 0)} defect(s)")
+        print()
+        print("| check | verdict | detail |")
+        print("|---|---|---|")
+        for check in gate.get("checks", []):
+            verdict = "pass" if check["passed"] else "**fail**"
+            print(f"| `{check['name']}` | {verdict} | {check['detail']} |")
+        PY
+          else
+            echo "_No report was produced: nothing could be tested._"
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Enforce
+      if: always()
+      shell: bash
+      run: |
+        # Deliberately a separate step. The summary above must be written even
+        # when the gate blocks, and a failing step would skip it.
+        if [ "${{ inputs.fail-on-block }}" != "true" ]; then
+          echo "fail-on-block is disabled; reporting only."
+          exit 0
+        fi
+        exit "${{ steps.gate.outputs.exit_code }}"

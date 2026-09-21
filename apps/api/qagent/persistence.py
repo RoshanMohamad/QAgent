@@ -99,6 +99,7 @@ def _upsert_case(
     name: str,
     kind: models.TestKind,
     spec: dict,
+    endpoint: models.ApiEndpoint | None = None,
 ) -> models.TestCase:
     case = session.execute(
         select(models.TestCase).where(
@@ -108,13 +109,165 @@ def _upsert_case(
 
     if case is None:
         case = models.TestCase(
-            org_id=org_id, suite_id=suite.id, name=name, kind=kind, spec=spec, generated_by="rule"
+            org_id=org_id,
+            suite_id=suite.id,
+            name=name,
+            kind=kind,
+            spec=spec,
+            generated_by="rule",
+            endpoint_id=endpoint.id if endpoint is not None else None,
         )
         session.add(case)
         session.flush()
     else:
         case.spec = spec
+        # Backfilled on re-scan: cases created before this link existed have a
+        # null endpoint_id, and leaving them null would under-report coverage
+        # forever on any project that has already been scanned once.
+        if endpoint is not None and case.endpoint_id is None:
+            case.endpoint_id = endpoint.id
     return case
+
+
+def _existing_bug(
+    session: Session, project_id: UUID, case_id: UUID
+) -> models.Bug | None:
+    """The open-or-closed defect this test case has already produced.
+
+    Identity is the *test case*, not the bug title: a title is written by a
+    model when one is configured and is not stable between runs, so matching on
+    it would file the same defect twice with two references. The case is
+    deterministic - it comes from one rule applied to one endpoint - which
+    makes it the right key.
+    """
+    return session.execute(
+        select(models.Bug)
+        .join(models.TestResult, models.TestResult.id == models.Bug.result_id)
+        .where(
+            models.Bug.project_id == project_id,
+            models.TestResult.test_case_id == case_id,
+        )
+        .order_by(models.Bug.created_at.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+
+
+def _record_event(
+    session: Session,
+    *,
+    bug: models.Bug,
+    event: str,
+    run_id: UUID | None = None,
+    from_value: str | None = None,
+    to_value: str | None = None,
+    detail: dict | None = None,
+) -> None:
+    """Append one immutable entry to a defect's history.
+
+    `actor_user_id` is deliberately left null: every event written from here is
+    QAgent's own decision during a run, and attributing it to a person would be
+    a lie that an audit trail cannot afford.
+    """
+    session.add(
+        models.BugEvent(
+            org_id=bug.org_id,
+            bug_id=bug.id,
+            event=event,
+            from_value=from_value,
+            to_value=to_value,
+            run_id=run_id,
+            detail=detail or {},
+        )
+    )
+
+
+def _upsert_bug(
+    session: Session,
+    *,
+    org_id: UUID,
+    project_id: UUID,
+    run: models.TestRun,
+    case: models.TestCase,
+    result: models.TestResult,
+    report: dict,
+    fallback_title: str,
+) -> models.Bug:
+    """Create the defect, or update the one this case already produced.
+
+    Before `bug_events` existed this unconditionally inserted, so a defect that
+    survived ten runs became ten `BUG-` references and the dashboard counted it
+    ten times. Now a repeat is an update plus a history entry, which is both the
+    honest count and the thing that makes "how long has this been open" and
+    "did it regress after we closed it" answerable at all.
+    """
+    severity = models.Severity(str(report.get("severity", "medium")))
+    title = str(report.get("title") or fallback_title)[:300]
+    existing = _existing_bug(session, project_id, case.id)
+
+    if existing is None:
+        bug = models.Bug(
+            org_id=org_id,
+            project_id=project_id,
+            result_id=result.id,
+            reference=_next_bug_reference(session, org_id),
+            title=title,
+            severity=severity,
+            steps=report.get("steps", []),
+            expected=report.get("expected"),
+            actual=report.get("actual"),
+            root_cause=report.get("root_cause"),
+            suggested_fix=report.get("suggested_fix"),
+        )
+        session.add(bug)
+        session.flush()
+        _record_event(
+            session, bug=bug, event="opened", run_id=run.id, to_value=severity.value
+        )
+        metrics.DEFECTS_TOTAL.labels(severity=severity.value).inc()
+        return bug
+
+    was_status = existing.status
+    was_severity = existing.severity
+
+    # Point at the newest evidence: an old result row's response body is not
+    # what a developer should be shown for a defect that reproduced today.
+    existing.result_id = result.id
+    existing.title = title
+    existing.steps = report.get("steps", [])
+    existing.expected = report.get("expected")
+    existing.actual = report.get("actual")
+    existing.root_cause = report.get("root_cause")
+    existing.suggested_fix = report.get("suggested_fix")
+    existing.severity = severity
+
+    if was_status != "open":
+        # A defect that comes back after being closed is the single most
+        # important thing this table records: it is a regression, and the
+        # status column alone would simply flip back to "open" and forget.
+        existing.status = "open"
+        _record_event(
+            session,
+            bug=existing,
+            event="reopened",
+            run_id=run.id,
+            from_value=was_status,
+            to_value="open",
+        )
+        metrics.DEFECTS_TOTAL.labels(severity=severity.value).inc()
+    elif was_severity != severity:
+        _record_event(
+            session,
+            bug=existing,
+            event="severity_changed",
+            run_id=run.id,
+            from_value=was_severity.value,
+            to_value=severity.value,
+        )
+    else:
+        _record_event(session, bug=existing, event="reproduced", run_id=run.id)
+
+    session.flush()
+    return existing
 
 
 def _persist_artifacts(
@@ -170,7 +323,19 @@ def persist_result(
     """Write endpoints, cases, results, bugs and evidence for one pipeline run."""
     store = artifact_store or store_from_settings()
 
+    # --- plan and coverage ---
+    if result.plan is not None:
+        run.plan = result.plan.to_dict()
+    if result.coverage is not None:
+        run.coverage = result.coverage.to_dict()
+
     # --- discovered endpoints ---
+    # Keyed by "METHOD /path" so each case can be linked back to the endpoint it
+    # exercises. Without that link `TestCase.endpoint_id` stays null - as it did
+    # until surface coverage needed it - and there is no way to ask the database
+    # which endpoints nobody ever tested.
+    endpoint_rows: dict[str, models.ApiEndpoint] = {}
+
     for endpoint in result.endpoints:
         existing = session.execute(
             select(models.ApiEndpoint).where(
@@ -181,8 +346,7 @@ def persist_result(
         ).scalar_one_or_none()
 
         if existing is None:
-            session.add(
-                models.ApiEndpoint(
+            existing = models.ApiEndpoint(
                     org_id=org_id,
                     project_id=project_id,
                     method=endpoint.method,
@@ -194,18 +358,29 @@ def persist_result(
                     responses=endpoint.responses,
                     requires_auth=endpoint.requires_auth,
                     risk_score=endpoint.risk_score,
-                )
             )
+            session.add(existing)
         else:
             existing.risk_score = endpoint.risk_score
             existing.requires_auth = endpoint.requires_auth
+
+        endpoint_rows[endpoint.key()] = existing
+
+    # Flushed so the new rows have ids to link cases against.
+    session.flush()
 
     # --- cases and results ---
     for outcome in result.outcomes:
         kind = models.TestKind(outcome.kind)
         suite = _upsert_suite(session, org_id, project_id, kind)
         case = _upsert_case(
-            session, org_id, suite, outcome.name, kind, {"request": outcome.request}
+            session,
+            org_id,
+            suite,
+            outcome.name,
+            kind,
+            {"request": outcome.request},
+            endpoint=endpoint_rows.get(outcome.endpoint_key or ""),
         )
 
         failure_class = None
@@ -242,25 +417,16 @@ def persist_result(
         case.quarantined = flakiness.should_quarantine(case_history, case.flake_rate)
 
         if outcome.bug:
-            bug = outcome.bug
-            severity = models.Severity(bug.get("severity", "medium"))
-            session.add(
-                models.Bug(
-                    org_id=org_id,
-                    project_id=project_id,
-                    result_id=record.id,
-                    reference=_next_bug_reference(session, org_id),
-                    title=bug.get("title", outcome.name)[:300],
-                    severity=severity,
-                    steps=bug.get("steps", []),
-                    expected=bug.get("expected"),
-                    actual=bug.get("actual"),
-                    root_cause=bug.get("root_cause"),
-                    suggested_fix=bug.get("suggested_fix"),
-                )
+            _upsert_bug(
+                session,
+                org_id=org_id,
+                project_id=project_id,
+                run=run,
+                case=case,
+                result=record,
+                report=outcome.bug,
+                fallback_title=outcome.name,
             )
-            metrics.DEFECTS_TOTAL.labels(severity=severity.value).inc()
-            session.flush()
 
             if outcome.artifacts:
                 _persist_artifacts(

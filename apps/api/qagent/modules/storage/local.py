@@ -10,31 +10,28 @@ This is deliberately the simplest thing that could work: a directory on disk,
 one file per distinct set of bytes, named by content hash so identical evidence
 (the same screenshot captured by two different checks) is stored once. The
 README's own stack table lists S3-compatible storage / Cloudflare R2 as the
-eventual backend for a real deployment - nothing here forecloses that. `save`
-and `read` are the entire contract every caller depends on (persistence.py is
-the only caller), so swapping the implementation later touches this file and
-the one line that constructs it, not every call site.
+eventual backend for a real deployment.
+
+That backend now exists (`s3.py`), and the claim this docstring used to make
+turned out to be true: `save` and `read` were the entire contract, so adding it
+meant a new file and a factory, with no change to `persistence.py` or to the
+artifact endpoint at all. Both backends share the key layout from `base.py`, so
+migrating a filesystem root into a bucket is a recursive copy.
 """
 
 from __future__ import annotations
 
-import hashlib
 import logging
-from dataclasses import dataclass
 from pathlib import Path
 from uuid import UUID
 
+from qagent.modules.storage.base import ArtifactNotFound, StoredArtifact, content_key
+
 logger = logging.getLogger(__name__)
 
-
-class ArtifactNotFound(FileNotFoundError):
-    """No object exists at this storage key."""
-
-
-@dataclass(frozen=True)
-class StoredArtifact:
-    storage_key: str
-    size_bytes: int
+# Re-exported: these moved to `base` when the S3 backend arrived and both
+# backends needed them, and several call sites still import them from here.
+__all__ = ["ArtifactNotFound", "LocalArtifactStore", "StoredArtifact", "store_from_settings"]
 
 
 class LocalArtifactStore:
@@ -54,13 +51,12 @@ class LocalArtifactStore:
     def save(
         self, data: bytes, *, org_id: UUID | str, kind: str, extension: str
     ) -> StoredArtifact:
-        digest = hashlib.sha256(data).hexdigest()
-        relative = Path(str(org_id)) / kind / f"{digest}{extension}"
-        path = self.root / relative
+        key = content_key(data, org_id=org_id, kind=kind, extension=extension)
+        path = self.root / key
         path.parent.mkdir(parents=True, exist_ok=True)
         if not path.exists():  # content-addressed: identical bytes, one file on disk
             path.write_bytes(data)
-        return StoredArtifact(storage_key=relative.as_posix(), size_bytes=len(data))
+        return StoredArtifact(storage_key=key, size_bytes=len(data))
 
     def read(self, storage_key: str) -> bytes:
         path = self._resolve(storage_key)
@@ -82,9 +78,13 @@ class LocalArtifactStore:
         return path
 
 
-def store_from_settings(settings=None) -> LocalArtifactStore:
-    if settings is None:
-        from qagent.config import get_settings
+def store_from_settings(settings=None):
+    """Kept here because half the codebase imports it from this module.
 
-        settings = get_settings()
-    return LocalArtifactStore(settings.qagent_artifact_root)
+    The real implementation lives in `factory.py`, which has to know about both
+    backends; this module should not have to import S3 to hand back a
+    filesystem store.
+    """
+    from qagent.modules.storage.factory import store_from_settings as build
+
+    return build(settings)

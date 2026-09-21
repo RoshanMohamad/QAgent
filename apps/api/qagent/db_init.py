@@ -16,12 +16,15 @@ from __future__ import annotations
 
 import logging
 import re
+from pathlib import Path
 
-from sqlalchemy import Engine, create_engine, text
+from alembic import command
+from alembic.config import Config
+from sqlalchemy import Engine, create_engine, inspect, text
 from sqlalchemy.engine import make_url
 
 from qagent.config import get_settings
-from qagent.models import TENANT_TABLES, Base
+from qagent.models import TENANT_TABLES
 
 logger = logging.getLogger(__name__)
 
@@ -64,9 +67,52 @@ def _admin_engine() -> Engine:
     return create_engine(settings.database_url, future=True)
 
 
+#: The revision describing the schema as it was before Alembic was introduced.
+#: A database that already has tables but no ``alembic_version`` is stamped here
+#: and then upgraded, which is only sound because this project has exactly one
+#: pre-migration schema generation. If that ever stops being true, this becomes
+#: a lie and the stamp has to be done deliberately per deployment instead.
+BASELINE_REVISION = "be76ba4d4b4c"
+
+_MIGRATIONS_DIR = Path(__file__).resolve().parents[1] / "migrations"
+
+
+def _alembic_config(bind: Engine) -> Config:
+    config = Config()
+    config.set_main_option("script_location", str(_MIGRATIONS_DIR))
+    config.set_main_option("sqlalchemy.url", bind.url.render_as_string(hide_password=False))
+    return config
+
+
 def create_schema(bind: Engine) -> None:
-    Base.metadata.create_all(bind=bind)
-    logger.info("schema created")
+    """Bring the schema to head with Alembic.
+
+    This replaced ``Base.metadata.create_all``, and the reason is worth stating:
+    ``create_all`` creates *missing tables* and nothing else. It will not add a
+    column to a table that already exists, so every schema change after the
+    first one silently did nothing on any database that had already been
+    created, and the failure surfaced later as "column does not exist" at
+    runtime rather than at deploy time.
+
+    A database with tables but no ``alembic_version`` predates migrations
+    entirely; it is stamped at the baseline and then upgraded, so existing
+    deployments adopt migrations without being recreated.
+    """
+    inspector = inspect(bind)
+    tables = set(inspector.get_table_names())
+    config = _alembic_config(bind)
+
+    if tables and "alembic_version" not in tables:
+        logger.warning(
+            "database has %d table(s) but no alembic_version: assuming the "
+            "pre-migration schema and stamping %s before upgrading",
+            len(tables),
+            BASELINE_REVISION,
+        )
+        command.stamp(config, BASELINE_REVISION)
+
+    command.upgrade(config, "head")
+    logger.info("schema at head")
 
 
 def ensure_app_role(admin: Engine) -> str:
@@ -148,9 +194,31 @@ def apply_rls(admin: Engine) -> None:
     logger.info("row-level security applied to %d tables", len(TENANT_TABLES))
 
 
+def enable_pgvector(admin: Engine) -> None:
+    """Upgrade code_chunks.embedding to a real vector column, if possible.
+
+    Runs here rather than in the model because ``CREATE EXTENSION`` needs
+    privileges the application role deliberately lacks (ADR-0007), and because
+    stock ``postgres:16-alpine`` - the image this project's compose file ships -
+    has no vector extension at all. When it is absent the schema is still
+    correct and similarity search runs in Python (modules/rag/store.py).
+    """
+    from sqlalchemy.orm import Session
+
+    from qagent.config import get_settings
+    from qagent.modules.rag.store import ensure_vector_support
+
+    with Session(admin) as session:
+        support = ensure_vector_support(
+            session, dimensions=get_settings().qagent_embedding_dimensions
+        )
+    logger.info("vector support: %s", support.to_dict())
+
+
 def init() -> None:
     admin = _admin_engine()
     create_schema(admin)
+    enable_pgvector(admin)
     ensure_app_role(admin)
     apply_rls(admin)
 

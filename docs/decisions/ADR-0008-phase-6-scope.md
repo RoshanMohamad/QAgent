@@ -80,6 +80,24 @@ Deliberately not built:
   ("why is this one request slow across N services") that doesn't arise until there are
   actually N services.
 
+  **Partially superseded.** That reasoning was right about *distributed* tracing and
+  wrong about instrumentation. The question that does arise, with one service and no
+  deployment at all, is "which pipeline stage consumed the run", and the Prometheus
+  counters cannot answer it: they report that a scan took 40 seconds, not whether that
+  was discovery waiting on a slow OpenAPI fetch or triage waiting on a model. Those
+  have completely different fixes.
+
+  `modules/observability/tracing.py` now emits a span per stage. Measured against the
+  reference fixture, discovery is 424ms of a ~600ms run and generation is 0.3ms -
+  which is precisely the kind of thing nobody guesses correctly.
+
+  What this ADR deferred and that module still defers: sampling rates, retention, and
+  which backend to run. Those genuinely do need a real deployment, and exporting OTLP
+  keeps the choice with the operator. Tracing is off by default, the packages are an
+  optional extra, and `span()` is a null context manager when disabled - so the CLI
+  and the eval harness, which run the same pipeline, acquire neither the dependency
+  nor the failure mode.
+
 ## Consequences
 
 - An operator who wants real billing wires a payment provider against `GET

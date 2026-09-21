@@ -14,6 +14,13 @@ import logging
 
 from qagent.modules.llm.client import LlmClient
 from qagent.modules.llm.safety import fence
+from qagent.modules.rag.context import (
+    UNKNOWN_LOCATION,
+    code_evidence_block,
+    location_enum,
+    retrieve_for_failure,
+)
+from qagent.modules.rag.index import Hit, RepositoryIndex
 from qagent.modules.triage.classifier import (
     ARBITRATION_THRESHOLD,
     FailureClass,
@@ -248,12 +255,57 @@ def build_bug_report(
     response: dict,
     failure_message: str | None,
     llm: LlmClient,
+    index: RepositoryIndex | None = None,
+    top_k: int = 4,
 ) -> dict:
-    """Produce a reproducible bug report (CLAUDE.md section 15)."""
+    """Produce a reproducible bug report (CLAUDE.md section 15).
+
+    ``index``, when supplied, is a repository index (modules/rag/). Retrieval
+    runs whether or not a model is configured, because the retrieved locations
+    are useful on their own: even the offline template report can tell a
+    developer which functions to look at, which is most of the value of the
+    "Affected" line in CLAUDE.md section 13's example.
+    """
     baseline = _template_report(case_name, verdict, spec, request, response)
+
+    hits: list[Hit] = []
+    if index is not None and verdict.failure_class is FailureClass.REAL_BUG:
+        try:
+            hits = retrieve_for_failure(
+                index,
+                request=request,
+                response=response,
+                failure_message=failure_message,
+                k=top_k,
+            )
+        except Exception as exc:  # noqa: BLE001 - retrieval is evidence, not a dependency
+            logger.warning("code retrieval failed for %s: %s", case_name, exc)
+
+    if hits:
+        # Ordered by rank, so the first entry is the retriever's best guess and
+        # a reader who only looks at one line looks at the right one.
+        baseline["affected_code"] = [hit.to_dict() for hit in hits]
+        baseline["affected_location"] = hits[0].chunk.location
 
     if not llm.available or verdict.failure_class is not FailureClass.REAL_BUG:
         return baseline
+
+    schema = dict(BUG_SCHEMA)
+    if hits:
+        # A closed enum built from what was actually retrieved. The model cannot
+        # cite a file it was not shown, because no such value exists in the
+        # schema - which is a stronger guarantee than asking it not to.
+        schema["properties"] = {
+            **BUG_SCHEMA["properties"],
+            "affected_location": {
+                "type": "string",
+                "enum": location_enum(hits),
+                "description": (
+                    "The retrieved location that best explains this failure, copied "
+                    f"exactly. Use '{UNKNOWN_LOCATION}' if none of them does."
+                ),
+            },
+        }
 
     data = llm.try_complete_json(
         purpose="bug_report",
@@ -267,13 +319,21 @@ def build_bug_report(
             f"A check named '{case_name}' failed and was classified as a real application "
             f"defect because: {verdict.reason}\n\n"
             f"{_evidence_block(spec, request, response, failure_message)}"
+            f"{code_evidence_block(hits)}"
         ),
-        schema=BUG_SCHEMA,
+        schema=schema,
         max_tokens=1200,
     )
 
     if not data:
         return baseline
+
+    # `unknown` is a real answer - "the retrieved code does not explain this" is
+    # worth recording - but it must not overwrite the retriever's own best guess
+    # with a non-location, so it clears the field instead.
+    if data.get("affected_location") == UNKNOWN_LOCATION:
+        data.pop("affected_location")
+        baseline.pop("affected_location", None)
 
     baseline.update({k: v for k, v in data.items() if v})
     return baseline

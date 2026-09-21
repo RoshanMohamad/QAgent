@@ -12,11 +12,17 @@ rendered to Playwright or pytest later without regenerating anything.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import asdict, dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from qagent.modules.discovery.openapi import EndpointSpec
 from qagent.modules.generator import values
+
+logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from qagent.modules.planner.strategy import TestPlan
 
 #: A 5xx is never a correct answer to a malformed request. Every negative case
 #: asserts this, and it is the assertion that finds real defects most often.
@@ -38,6 +44,11 @@ class GeneratedCase:
     generated_by: str = "rule"
     endpoint_key: str | None = None
     rationale: str = ""
+    #: Which rule function produced this, e.g. ``case_unauthenticated``. The
+    #: planner promises coverage in terms of ``(endpoint_key, rule)`` pairs, so
+    #: this is what lets it verify afterwards that the promise was kept.
+    #: Empty for anything a rule did not produce (LLM-added cases).
+    generated_by_rule: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -336,16 +347,68 @@ RULES = [
     case_invalid_token,
 ]
 
+#: One line per rule, phrased the way CLAUDE.md section 8's planner example
+#: phrases its checklist ("Login success", "Wrong password"). The planner shows
+#: these to a human; the rule names above are what it verifies against.
+RULE_INTENTS: dict[str, str] = {
+    "case_happy_path": "Valid request succeeds",
+    "case_missing_required_field": "Missing required field is rejected",
+    "case_wrong_field_type": "Wrongly typed field is rejected",
+    "case_malformed_path_param": "Malformed identifier is rejected",
+    "case_absent_resource": "Absent resource returns 404",
+    "case_unauthenticated": "Unauthenticated request is refused",
+    "case_invalid_token": "Forged token is refused",
+}
 
-def generate(endpoints: list[EndpointSpec], *, max_cases: int | None = None) -> GenerationReport:
+
+def rule_intent(rule_name: str) -> str:
+    return RULE_INTENTS.get(rule_name, rule_name)
+
+
+def applicable_rules(endpoint: EndpointSpec) -> list[str]:
+    """Which rules produce a case for this endpoint.
+
+    The planner needs to state required coverage *before* anything executes, and
+    the only drift-free way to know what generation will produce is to ask the
+    rules themselves. They are pure dict construction with no I/O, so running
+    them twice costs nothing measurable and removes an entire class of bug where
+    a duplicated applicability predicate quietly disagrees with its rule.
+    """
+    names = []
+    for rule in RULES:
+        try:
+            if rule(endpoint) is not None:
+                names.append(rule.__name__)
+        except Exception as exc:  # noqa: BLE001 - a bad rule must not stop planning
+            # Worth a log line: a rule that raises here but not in generate()
+            # produces a plan that under-promises, which is confusing rather
+            # than merely incomplete.
+            logger.warning(
+                "rule %s raised while planning %s: %s", rule.__name__, endpoint.key(), exc
+            )
+    return names
+
+
+def generate(
+    endpoints: list[EndpointSpec],
+    *,
+    max_cases: int | None = None,
+    plan: TestPlan | None = None,
+) -> GenerationReport:
     """Apply every rule to every endpoint, highest risk first.
 
-    Endpoints arrive pre-sorted by risk, so truncating at max_cases keeps the most
-    valuable coverage rather than an arbitrary alphabetical slice.
+    Endpoints arrive pre-sorted by risk, so truncating at ``max_cases`` keeps the
+    most valuable coverage rather than an arbitrary alphabetical slice. When a
+    ``plan`` is supplied (agent 2, ``modules/planner/strategy.py``) the ordering
+    is taken from it instead, which is strictly better: risk score orders
+    endpoints individually, whereas the plan orders whole *modules* by priority,
+    so a truncated run loses the health check rather than half of the auth
+    surface.
     """
     report = GenerationReport()
+    ordered = plan.order_endpoints(endpoints) if plan is not None else endpoints
 
-    for endpoint in endpoints:
+    for endpoint in ordered:
         for rule in RULES:
             if max_cases is not None and len(report.cases) >= max_cases:
                 report.skipped.append(f"{endpoint.key()} (case limit reached)")
@@ -356,6 +419,9 @@ def generate(endpoints: list[EndpointSpec], *, max_cases: int | None = None) -> 
                 report.skipped.append(f"{endpoint.key()} via {rule.__name__}: {exc}")
                 continue
             if case is not None:
+                # Stamped centrally rather than inside each rule: one place to
+                # keep correct, and no rule can forget.
+                case.generated_by_rule = rule.__name__
                 report.add(case)
 
     return report

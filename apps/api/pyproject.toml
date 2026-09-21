@@ -12,7 +12,13 @@ dependencies = [
     "pydantic>=2.9",
     "pydantic-settings>=2.6",
     "celery>=5.4",
-    "redis>=5.2",
+    # Upper bound is kombu's, not ours: kombu[redis] (celery's broker layer)
+    # declares redis<6.5, and redis-py 8 breaks its transport outright - the
+    # worker never finishes connecting to the broker. Because celery and redis
+    # are declared here as independent requirements, pip never sees kombu's
+    # cap unless we repeat it, so a fresh install would silently resolve to an
+    # unusable pair. Raise this only together with celery/kombu.
+    "redis>=5.2,<6.5",
     "httpx>=0.28",
     "pyyaml>=6.0",
     "structlog>=24.4",
@@ -28,6 +34,23 @@ dependencies = [
 llm = ["anthropic>=0.40"]
 e2e = ["playwright>=1.48"]
 security = ["semgrep>=1.90"]
+# Native vector storage and ANN search. Optional: the default JSON backend
+# works on stock postgres and searches in Python (modules/rag/store.py).
+rag = ["pgvector>=0.3"]
+# S3-compatible evidence storage (S3, Cloudflare R2, MinIO). The default
+# filesystem backend needs nothing (modules/storage/local.py).
+s3 = ["boto3>=1.35"]
+# Distributed tracing. Optional because the CLI and the eval harness run the
+# same pipeline and neither should acquire a tracing dependency to score a
+# fixture (modules/observability/tracing.py).
+otel = [
+    "opentelemetry-sdk>=1.29",
+    "opentelemetry-exporter-otlp-proto-http>=1.29",
+    "opentelemetry-instrumentation-fastapi>=0.50b0",
+    "opentelemetry-instrumentation-httpx>=0.50b0",
+    "opentelemetry-instrumentation-sqlalchemy>=0.50b0",
+    "opentelemetry-instrumentation-celery>=0.50b0",
+]
 dev = ["pytest>=8.3", "pytest-asyncio>=0.24", "ruff>=0.8", "respx>=0.22", "flask>=3.0"]
 
 [project.scripts]
@@ -52,6 +75,10 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
+# Alembic revisions are generated, and their formatting is alembic's, not ours.
+# Reformatting them by hand is churn that makes a future autogenerate diff
+# unreadable for no benefit - nobody reads a migration for its line length.
+"migrations/versions/*.py" = ["E501", "E402", "I001", "UP"]
 # Probe payloads deliberately contain credential-shaped literals.
 "qagent/modules/generator/*" = ["S105", "S106"]
 "tests/*" = ["S105", "S106", "E501"]

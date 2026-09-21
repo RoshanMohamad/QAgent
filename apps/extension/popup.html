@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      :root { color-scheme: light dark; }
+      body {
+        font: 13px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+        margin: 0; padding: 14px; width: 260px;
+      }
+      h1 { font-size: 13px; margin: 0 0 10px; font-weight: 600; }
+      button {
+        width: 100%; padding: 8px 10px; margin-bottom: 8px; border-radius: 6px;
+        border: 1px solid rgba(128,128,128,.4); background: transparent;
+        font: inherit; cursor: pointer;
+      }
+      button:disabled { opacity: .45; cursor: default; }
+      #record[data-recording="true"] { border-color: #d33; color: #d33; }
+      #stats { opacity: .75; margin: 6px 0 10px; }
+      #status { min-height: 1.4em; }
+    </style>
+  </head>
+  <body>
+    <h1>QAgent Recorder</h1>
+    <div id="stats">Not recording.</div>
+    <button id="record">Record</button>
+    <button id="export" disabled>Export session</button>
+    <div id="status"></div>
+    <script src="popup.js"></script>
+  </body>
+</html>

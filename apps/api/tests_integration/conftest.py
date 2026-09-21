@@ -153,23 +153,36 @@ def live_worker(tmp_path_factory):
                 "-A", "qagent.worker.tasks.celery_app",
                 "worker", "--loglevel=info", "-Q", "qagent.scan,qagent.performance",
                 "--concurrency=1", "--pool=solo",
+                # Mingle and gossip exist so that a worker can discover and sync
+                # state with its peers at startup. This fixture runs exactly one
+                # worker, so both are pure startup cost with nobody to talk to -
+                # and mingle's pidbox broadcast is precisely where startup stalls
+                # when the rest of the suite has been hammering the same Redis:
+                # the log stops at "mingle: searching for neighbors" and the
+                # worker never reaches "ready." Skipping them removes a
+                # round-trip this fixture has no use for.
+                "--without-mingle", "--without-gossip",
             ],
             cwd=str(_API_ROOT),
             stdout=log_file,
             stderr=subprocess.STDOUT,
         )
 
-    from qagent.worker.tasks import celery_app
-
-    deadline = time.monotonic() + 30
+    # Readiness is read from the worker's own log rather than asked for over the
+    # network. `control.ping` is a pidbox broadcast, and in a full-suite run it
+    # goes unanswered for the whole 30s window even when the worker is up and
+    # serving - the same ping answers immediately when this module runs alone.
+    # The log needs no connection at all, and "ready." is written at exactly the
+    # point the consumer is listening, which is the state these tests wait for.
+    deadline = time.monotonic() + 60
     ready = False
     while time.monotonic() < deadline:
-        if celery_app.control.ping(timeout=1.0):
+        if " ready." in log_path.read_text(encoding="utf-8", errors="replace"):
             ready = True
             break
         if proc.poll() is not None:
             break
-        time.sleep(1.0)
+        time.sleep(0.5)
 
     _wait_or_fail(proc, ready, "celery worker", log_path)
     proc.log_path = log_path  # type: ignore[attr-defined]

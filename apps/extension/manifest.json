@@ -1,0 +1,38 @@
+{
+  "manifest_version": 3,
+  "name": "QAgent Recorder",
+  "version": "0.1.0",
+  "description": "Record a session in the browser and turn it into a QAgent test.",
+  "permissions": [
+    "activeTab",
+    "storage",
+    "webRequest",
+    "downloads",
+    "tabs"
+  ],
+  "host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "QAgent Recorder"
+  }
+}

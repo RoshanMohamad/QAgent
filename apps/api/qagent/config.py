@@ -35,6 +35,41 @@ class Settings(BaseSettings):
     qagent_llm_model: str = "claude-sonnet-5"
     qagent_llm_base_url: str | None = None
 
+    # --- Repository RAG (modules/rag/) ---
+    # "null" means lexical-only retrieval, which is a real retriever and the
+    # default: BM25 over code is strong precisely because the identifiers being
+    # searched for appear verbatim in the code that implements them. Embeddings
+    # are an upgrade for the paraphrase cases, not a prerequisite.
+    qagent_embedding_provider: Literal["openai_compatible", "null"] = "null"
+    qagent_embedding_base_url: str | None = None
+    qagent_embedding_api_key: str | None = None
+    qagent_embedding_model: str = "text-embedding-3-small"
+    qagent_embedding_dimensions: int = 1536
+    # How vectors are stored. "json" works on stock postgres:16-alpine - the
+    # image this project's own compose file runs - and searches in Python, which
+    # at a few thousand chunks per project is milliseconds. "pgvector" needs
+    # both the `pgvector` Python package (pip install qagent[rag]) and the
+    # `vector` extension in the database, and gives native ANN search.
+    #
+    # This is a declared choice rather than an automatic upgrade on purpose. The
+    # physical column type is fixed when SQLAlchemy defines the model, so a
+    # runtime ALTER leaves the ORM still binding JSON into a vector column and
+    # every insert fails. Either the deployment opts in and both prerequisites
+    # are checked at init, or it does not and nothing mutates underneath it.
+    qagent_vector_backend: Literal["json", "pgvector"] = "json"
+    #: Chunks of repository source attached to a bug report as "affected code".
+    #: Small on purpose: the point is to name the function, not to paste a file.
+    qagent_rag_top_k: int = 4
+
+    # --- Tracing (CLAUDE.md section 21) ---
+    # Off by default and genuinely free when off: `span()` is a null context
+    # manager and nothing imports opentelemetry. ADR-0008 deferred tracing
+    # because sampling and backend choices need a real deployment - those are
+    # still the operator's, which is what OTLP buys. Needs qagent[otel].
+    qagent_tracing_enabled: bool = False
+    qagent_tracing_endpoint: str = "http://localhost:4318/v1/traces"
+    qagent_tracing_service_name: str = "qagent"
+
     # --- Budgets, enforced per agent run (see modules/llm/budget.py) ---
     qagent_max_llm_calls: int = 40
     qagent_max_llm_tokens: int = 200_000
@@ -46,9 +81,21 @@ class Settings(BaseSettings):
     qagent_egress_allowlist: str = ""
 
     # --- Evidence artifacts (CLAUDE.md section 15) ---
-    # Local-filesystem backend for MVP; README's stack lists S3-compatible
-    # storage / Cloudflare R2 for a real deployment (modules/storage/local.py).
+    # "local" is a directory on disk and needs nothing. "s3" is any
+    # S3-compatible service - S3 itself, Cloudflare R2, MinIO - and needs
+    # `pip install qagent[s3]` plus a bucket. Both share one key layout
+    # (modules/storage/base.py), so moving between them is a recursive copy.
+    qagent_storage_backend: Literal["local", "s3"] = "local"
     qagent_artifact_root: str = "./data/artifacts"
+    qagent_s3_bucket: str | None = None
+    #: Unset for AWS; set for R2, MinIO, or any other S3-compatible endpoint.
+    qagent_s3_endpoint_url: str | None = None
+    qagent_s3_region: str | None = None
+    #: Leave unset on AWS so boto3's own credential chain (environment, shared
+    #: config, instance role) applies - that is what a real deployment should
+    #: use. These exist for MinIO and local development.
+    qagent_s3_access_key: str | None = None
+    qagent_s3_secret_key: str | None = None
 
     @property
     def egress_allowlist(self) -> list[str]:

@@ -3,8 +3,9 @@
 CLAUDE.md's own guidance for this feature is "integrate security scanners rather
 than trying to reinvent everything" - so this module shells out to Semgrep, a
 scanner maintained by people who track OWASP/CWE rule coverage full time, and
-turns its findings into the same Severity vocabulary every other defect source
-in this platform uses. It is static analysis only: it parses source, it never
+turns its findings into the shared vocabulary in `base.py` that Trivy and ZAP
+also report into, so a quality gate counts one kind of row regardless of which
+tool produced it. It is static analysis only: it parses source, it never
 executes the repository's code, so none of the sandboxing section 22 requires
 for the runner/browser/explorer stages applies here.
 
@@ -19,48 +20,23 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
-from dataclasses import dataclass, field
 from pathlib import Path
+
+from qagent.modules.security.base import (
+    ScannerError,
+    ScannerUnavailable,
+    ScanResult,
+    SecurityFinding,
+)
 
 logger = logging.getLogger(__name__)
 
 
-class SemgrepUnavailable(RuntimeError):
-    """Semgrep is not installed or not on PATH."""
-
-
-class SemgrepError(RuntimeError):
-    """Semgrep ran but exited with an error unrelated to findings."""
-
-
-@dataclass
-class SecurityFinding:
-    rule_id: str
-    title: str
-    severity: str  # critical | high | medium | low | info
-    path: str
-    line: int
-    message: str
-    confidence: str | None = None
-    cwe: list[str] = field(default_factory=list)
-    owasp: list[str] = field(default_factory=list)
-
-    def dedupe_key(self) -> tuple[str, str, int]:
-        """Same rule at the same location is the same finding across re-scans."""
-        return (self.rule_id, self.path, self.line)
-
-
-@dataclass
-class ScanResult:
-    root: str
-    findings: list[SecurityFinding] = field(default_factory=list)
-    scan_errors: list[str] = field(default_factory=list)
-
-    def counts_by_severity(self) -> dict[str, int]:
-        counts: dict[str, int] = {}
-        for finding in self.findings:
-            counts[finding.severity] = counts.get(finding.severity, 0) + 1
-        return counts
+#: Semgrep-specific aliases for the shared exceptions. They existed before
+#: Trivy and ZAP arrived and several call sites still catch them by these
+#: names; the shared types in `base` are what everything new should use.
+SemgrepUnavailable = ScannerUnavailable
+SemgrepError = ScannerError
 
 
 _SEVERITY_MAP = {"ERROR": "high", "WARNING": "medium", "INFO": "low"}
@@ -145,6 +121,8 @@ def run_semgrep(
         raise SemgrepError(f"could not parse semgrep output: {exc}") from exc
 
     findings = [_parse_result(r) for r in payload.get("results", [])]
+    for finding in findings:
+        finding.scanner = "semgrep"
     scan_errors = [str(e.get("message", e)) for e in payload.get("errors", [])]
     logger.info("semgrep found %d finding(s) under %s", len(findings), repo_path)
 

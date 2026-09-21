@@ -35,6 +35,7 @@ from qagent.modules.auth.security import (
     verify_password,
 )
 from qagent.modules.observability import metrics
+from qagent.modules.observability.tracing import setup_tracing
 from qagent.modules.ratelimit.limiter import RateLimiter
 from qagent.persistence import persist_security_findings
 
@@ -46,6 +47,11 @@ app = FastAPI(
     version="0.1.0",
     description="Autonomous AI software quality engineering platform.",
 )
+
+# No-op unless QAGENT_TRACING_ENABLED is set, and it swallows its own failures:
+# an observability dependency that can stop the API from serving is a liability
+# (modules/observability/tracing.py).
+_tracing_active = setup_tracing(app=app)
 
 _ORG_SLUG_RE = re.compile(r"^[a-z0-9-]{2,100}$")
 
@@ -231,6 +237,57 @@ class SecurityScanIn(BaseModel):
 
 class AnalyzeRepoIn(BaseModel):
     repo_path: str = Field(min_length=1)
+
+
+class ConnectRepoIn(BaseModel):
+    """Connect a GitHub repository (CLAUDE.md section 6).
+
+    ``token`` is a PAT used for the clone and nothing else: it is never written
+    to the database and never logged, and the request model excludes it from
+    ``repr`` so it cannot reach a traceback or a debug dump. Omitted, the server
+    falls back to ``$GITHUB_TOKEN`` - the same contract ``qagent report-issues``
+    already uses - and a public repository needs neither.
+    """
+
+    repo_url: str = Field(min_length=1, max_length=500)
+    branch: str | None = None
+    token: str | None = Field(default=None, repr=False, exclude=True)
+
+
+class BugCommentIn(BaseModel):
+    body: str = Field(min_length=1, max_length=10_000)
+
+
+class GateRecordIn(BaseModel):
+    """A gate decision made elsewhere - typically by `qagent gate` in CI.
+
+    The decision is recorded with the policy and per-check numbers it was made
+    from, because recomputing it later against today's open defects gives a
+    different and useless answer (models.QualityGate).
+    """
+
+    run_id: UUID | None = None
+    result: str = Field(pattern="^(pass|block|error)$")
+    reason: str | None = None
+    commit_sha: str | None = Field(default=None, max_length=64)
+    trigger: str = Field(default="ci", max_length=32)
+    policy: dict = Field(default_factory=dict)
+    checks: list[dict] = Field(default_factory=list)
+
+
+class DeploymentIn(BaseModel):
+    environment_id: UUID | None = None
+    quality_gate_id: UUID | None = None
+    commit_sha: str | None = Field(default=None, max_length=64)
+    version: str | None = Field(default=None, max_length=100)
+    status: str = Field(default="pending", pattern="^(pending|deployed|blocked|rolled_back)$")
+
+
+class NotificationIn(BaseModel):
+    event: str = Field(min_length=1, max_length=64)
+    channel: str = Field(pattern="^(slack|webhook)$")
+    target: str = Field(min_length=1, max_length=500)
+    data: dict = Field(default_factory=dict)
 
 
 class PerformanceScanIn(BaseModel):
@@ -465,6 +522,69 @@ def analyze_project(
     return {"id": str(project.id), "stack": project.stack}
 
 
+@app.post("/api/v1/projects/{project_id}/connect", tags=["projects"])
+def connect_repository(
+    project_id: UUID,
+    payload: ConnectRepoIn,
+    org_id: UUID = Depends(current_org),
+    session: Session = Depends(get_db),
+    _owner: Principal = Depends(require_owner),
+) -> dict:
+    """Clone a GitHub repository and run the Project Analyst over it.
+
+    ``analyze`` above requires the checkout to already be on a disk the API can
+    read, which makes "connect a repository" a manual step the operator does
+    first. This does that step: shallow-clone into a temporary directory, run
+    the identical ``analyze_repository`` (one analyzer, not two), persist the
+    result plus the repository it came from, and delete the checkout - it is
+    never kept, because nothing downstream reads source after analysis, and a
+    retained third-party checkout is standing risk for no benefit (ADR-0004).
+
+    Owner-only for the same reasons ``analyze`` is, plus one more: it makes the
+    server open an outbound connection and may carry a credential.
+    """
+    import os
+
+    from qagent.modules.analyzer.analyst import analyze_repository
+    from qagent.modules.provisioning.clone import (
+        CloneError,
+        cloned_repository,
+        head_commit,
+        parse_repo_url,
+    )
+
+    project = session.get(models.Project, project_id)
+    if project is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "project not found")
+
+    token = payload.token or os.environ.get("GITHUB_TOKEN") or None
+
+    try:
+        ref = parse_repo_url(payload.repo_url)
+        with cloned_repository(payload.repo_url, branch=payload.branch, token=token) as repo_dir:
+            analysis = analyze_repository(repo_dir)
+            commit_sha = head_commit(repo_dir)
+    except CloneError as exc:
+        # 422, not 500: every CloneError is something about the caller's
+        # request - the URL, the branch, or the credential - not a server fault.
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+
+    project.repo_url = ref.https_url
+    if payload.branch:
+        project.default_branch = payload.branch
+    project.stack = analysis.to_dict()
+    session.commit()
+
+    return {
+        "id": str(project.id),
+        "repo_url": project.repo_url,
+        "branch": project.default_branch,
+        "commit_sha": commit_sha,
+        "summary": analysis.summary(),
+        "stack": project.stack,
+    }
+
+
 @app.post("/api/v1/projects/{project_id}/environments", status_code=201, tags=["projects"])
 def create_environment(
     project_id: UUID,
@@ -559,7 +679,29 @@ def get_run(
         "classifications": {
             (k.value if hasattr(k, "value") else str(k)): v for k, v in classifications.items()
         },
+        # The plan itself can be long; the run view wants the shape, not every
+        # check. `GET /runs/{id}/plan` returns the full document.
+        "plan": (run.plan or {}).get("summary"),
+        "coverage": run.coverage or {},
     }
+
+
+@app.get("/api/v1/runs/{run_id}/plan", tags=["runs"])
+def get_run_plan(
+    run_id: UUID, org_id: UUID = Depends(current_org), session: Session = Depends(get_db)
+) -> dict:
+    """The full test strategy this run was held to (agent 2, CLAUDE.md section 8).
+
+    Separate from the run view because it answers a different question: not
+    "what happened" but "what was this run supposed to cover, and what did it
+    leave out". A run that passed every check it ran while skipping the auth
+    module is not a green run, and this is where that shows.
+    """
+    run = session.get(models.TestRun, run_id)
+    if run is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "run not found")
+
+    return {"run_id": str(run.id), "plan": run.plan or {}, "coverage": run.coverage or {}}
 
 
 @app.get("/api/v1/runs/{run_id}/results", tags=["runs"])
@@ -635,6 +777,227 @@ def list_bugs(
         }
         for b in bugs
     ]
+
+
+@app.get("/api/v1/bugs/{bug_id}/history", tags=["bugs"])
+def bug_history(
+    bug_id: UUID, org_id: UUID = Depends(current_org), session: Session = Depends(get_db)
+) -> dict:
+    """A defect's lifecycle: when it opened, reproduced, changed or regressed.
+
+    The `Bug` row carries only the current status, which cannot answer "how long
+    has this been open" or "did it come back after we closed it". This can.
+    """
+    bug = session.get(models.Bug, bug_id)
+    if bug is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "bug not found")
+
+    events = session.execute(
+        select(models.BugEvent)
+        .where(models.BugEvent.bug_id == bug_id)
+        .order_by(models.BugEvent.created_at)
+    ).scalars().all()
+
+    comments = session.execute(
+        select(models.BugComment)
+        .where(models.BugComment.bug_id == bug_id)
+        .order_by(models.BugComment.created_at)
+    ).scalars().all()
+
+    return {
+        "bug": {
+            "id": str(bug.id),
+            "reference": bug.reference,
+            "title": bug.title,
+            "severity": bug.severity.value,
+            "status": bug.status,
+            "first_seen": bug.created_at,
+        },
+        "events": [
+            {
+                "event": e.event,
+                "from": e.from_value,
+                "to": e.to_value,
+                "run_id": str(e.run_id) if e.run_id else None,
+                "at": e.created_at,
+            }
+            for e in events
+        ],
+        "comments": [
+            {
+                "id": str(c.id),
+                "body": c.body,
+                "generated": c.generated,
+                "author_user_id": str(c.author_user_id) if c.author_user_id else None,
+                "at": c.created_at,
+            }
+            for c in comments
+        ],
+        # The number a triage meeting actually asks for.
+        "reopen_count": sum(1 for e in events if e.event == "reopened"),
+    }
+
+
+@app.post("/api/v1/bugs/{bug_id}/comments", status_code=201, tags=["bugs"])
+def add_bug_comment(
+    bug_id: UUID,
+    payload: BugCommentIn,
+    principal: Principal = Depends(current_principal),
+    session: Session = Depends(get_db),
+) -> dict:
+    bug = session.get(models.Bug, bug_id)
+    if bug is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "bug not found")
+
+    comment = models.BugComment(
+        org_id=principal.org_id,
+        bug_id=bug_id,
+        author_user_id=principal.user_id,
+        body=payload.body,
+        generated=False,
+    )
+    session.add(comment)
+    session.commit()
+    return {"id": str(comment.id), "at": comment.created_at}
+
+
+@app.post("/api/v1/projects/{project_id}/gates", status_code=201, tags=["quality"])
+def record_gate(
+    project_id: UUID,
+    payload: GateRecordIn,
+    org_id: UUID = Depends(current_org),
+    session: Session = Depends(get_db),
+) -> dict:
+    """Record a gate decision made in CI, with the inputs it was made from.
+
+    `GET /projects/{id}/quality` computes a verdict on demand; this stores one.
+    Both are needed: the computed one gates the deploy, the stored one answers
+    "what did the gate say when we shipped the release that broke production".
+    """
+    gate = models.QualityGate(
+        org_id=org_id,
+        project_id=project_id,
+        run_id=payload.run_id,
+        result=payload.result,
+        reason=payload.reason,
+        commit_sha=payload.commit_sha,
+        trigger=payload.trigger,
+        policy=payload.policy,
+        checks=payload.checks,
+    )
+    session.add(gate)
+    session.commit()
+    return {"id": str(gate.id), "result": gate.result, "at": gate.created_at}
+
+
+@app.get("/api/v1/projects/{project_id}/gates", tags=["quality"])
+def list_gates(
+    project_id: UUID,
+    limit: int = 20,
+    org_id: UUID = Depends(current_org),
+    session: Session = Depends(get_db),
+) -> list[dict]:
+    rows = session.execute(
+        select(models.QualityGate)
+        .where(models.QualityGate.project_id == project_id)
+        .order_by(models.QualityGate.created_at.desc())
+        .limit(min(limit, 100))
+    ).scalars().all()
+
+    return [
+        {
+            "id": str(g.id),
+            "result": g.result,
+            "reason": g.reason,
+            "commit_sha": g.commit_sha,
+            "trigger": g.trigger,
+            "checks": g.checks,
+            "at": g.created_at,
+        }
+        for g in rows
+    ]
+
+
+@app.post("/api/v1/projects/{project_id}/deployments", status_code=201, tags=["quality"])
+def record_deployment(
+    project_id: UUID,
+    payload: DeploymentIn,
+    org_id: UUID = Depends(current_org),
+    session: Session = Depends(get_db),
+) -> dict:
+    """Record a release, so defects can later be correlated with what broke."""
+    deployment = models.Deployment(
+        org_id=org_id,
+        project_id=project_id,
+        environment_id=payload.environment_id,
+        quality_gate_id=payload.quality_gate_id,
+        commit_sha=payload.commit_sha,
+        version=payload.version,
+        status=payload.status,
+        deployed_at=datetime.now(UTC) if payload.status == "deployed" else None,
+    )
+    session.add(deployment)
+    session.commit()
+    return {"id": str(deployment.id), "status": deployment.status}
+
+
+@app.post("/api/v1/projects/{project_id}/notifications", status_code=202, tags=["notifications"])
+def send_notification(
+    project_id: UUID,
+    payload: NotificationIn,
+    principal: Principal = Depends(require_owner),
+    session: Session = Depends(get_db),
+) -> dict:
+    """Send an alert and record whether it actually arrived.
+
+    Owner-gated because the target is a user-supplied URL that this server will
+    then fetch - the same reason `analyze` and `performance/scan` are gated. The
+    egress guard refuses link-local and private addresses regardless.
+
+    Returns 202 with the delivery status rather than failing on a dead webhook:
+    the notification is recorded either way, and a caller that needs to know can
+    read `delivered`.
+    """
+    from qagent.modules.notify.dispatch import render, send, slack_payload, webhook_payload
+
+    title, lines = render(payload.event, payload.data)
+    body = (
+        slack_payload(event=payload.event, title=title, lines=lines)
+        if payload.channel == "slack"
+        else webhook_payload(event=payload.event, title=title, lines=lines, data=payload.data)
+    )
+
+    notification = models.Notification(
+        org_id=principal.org_id,
+        project_id=project_id,
+        event=payload.event,
+        channel=payload.channel,
+        target=payload.target,
+        payload=body,
+        status="pending",
+    )
+    session.add(notification)
+    session.flush()
+
+    result = send(
+        channel=payload.channel,
+        target=payload.target,
+        payload=body,
+        allow_private=not settings.is_production,
+    )
+
+    notification.attempts += 1
+    notification.status = "delivered" if result.delivered else "failed"
+    notification.last_error = result.error
+    notification.delivered_at = result.delivered_at
+    session.commit()
+
+    return {
+        "id": str(notification.id),
+        "status": notification.status,
+        "delivered": result.delivered,
+        "error": result.error,
+    }
 
 
 @app.get("/api/v1/artifacts/{artifact_id}", tags=["bugs"])
@@ -965,6 +1328,18 @@ def dashboard(org_id: UUID = Depends(current_org), session: Session = Depends(ge
     spend = session.execute(select(func.coalesce(func.sum(models.LlmCall.usd), 0.0))).scalar_one()
     flaky = session.query(models.TestCase).filter(models.TestCase.quarantined.is_(True)).count()
 
+    # Surface coverage, from what was persisted rather than from one run: every
+    # endpoint discovery has ever recorded, against those some test case is
+    # linked to. See modules/coverage/surface.py for why this is not called
+    # "backend coverage" - QAgent never instruments the application, so it
+    # cannot report line coverage and must not appear to.
+    endpoints_total = session.query(models.ApiEndpoint).count()
+    endpoints_covered = session.execute(
+        select(func.count(func.distinct(models.TestCase.endpoint_id))).where(
+            models.TestCase.endpoint_id.isnot(None)
+        )
+    ).scalar_one()
+
     return {
         "projects": session.query(models.Project).count(),
         "runs": totals[0],
@@ -972,6 +1347,17 @@ def dashboard(org_id: UUID = Depends(current_org), session: Session = Depends(ge
         "bugs": {(k.value if hasattr(k, "value") else str(k)): v for k, v in severities.items()},
         "security_findings": {
             (k.value if hasattr(k, "value") else str(k)): v for k, v in security.items()
+        },
+        "coverage": {
+            "endpoints_total": endpoints_total,
+            "endpoints_covered": endpoints_covered,
+            "endpoint_percent": (
+                100 if endpoints_total == 0 else round(100 * endpoints_covered / endpoints_total)
+            ),
+            "measures": (
+                "Share of the discovered API surface that some test case exercises. "
+                "Not line coverage: QAgent tests the application as a black box."
+            ),
         },
         "llm_spend_usd": round(float(spend), 4),
         "generated_at": datetime.now(UTC),

@@ -7,21 +7,27 @@ and executes checks against it, and then does the part that actually matters:
 it decides *why* each failure happened and reports only the ones that are real defects.
 
 ```
-Discover  →  Generate  →  Execute  →  Triage  →  Report
+Discover  →  Plan  →  Generate  →  Execute  →  Triage  →  Report
 ```
 
 ---
 
 ## Status
 
-Phase 1 (API quality loop), the dashboard, `compose` mode, static route parsing,
-a first browser E2E layer, an Explorer Agent — link-crawl and interactive
-(form filling, clicking, inferred state transitions) — self-healing selector
-proposals, issue tracker sync (GitHub and Jira), a repository analyzer / Project
-Analyst agent, evidence artifacts on browser-found bugs, and a scoped Phase 6
-(RBAC, rate limiting, `/metrics`, usage tracking, job-queue separation) are
-implemented and measured. See [Roadmap](#roadmap) for what's done versus what's
-still open.
+**Phases 1-5 are implemented, plus a scoped Phase 6.** Grouped rather than listed
+as one sentence, because the list stopped being readable:
+
+| Area | What exists |
+|---|---|
+| Core loop | Discovery (OpenAPI + static route parsing), Test Planner (agent 2), rule-based generation, SSRF-guarded execution, rules-first triage, defect reports |
+| Agents | Project Analyst (1), Test Planner (2), Generator + pytest emitter (3), Explorer — link-crawl and interactive (4), Bug Hunter / Failure Analyzer |
+| Repository intelligence | Stack detection, module tree, [repository RAG](#repository-rag) — symbol-level chunking, BM25 + optional embeddings, pgvector when configured — feeding root-cause evidence into bug reports |
+| Browser | E2E page checks, interactive exploration, self-healing selector proposals, [recorder extension](#browser-recorder) |
+| Security | Semgrep, Trivy and OWASP ZAP behind one severity vocabulary |
+| CI/CD | [Quality gate](#quality-gate-and-ci) + GitHub Action, gate/deployment history, notifications |
+| Platform | Multi-tenancy with Postgres RLS, RBAC, rate limiting, `/metrics`, usage tracking, queue separation, [Alembic migrations](#schema-migrations), S3-compatible storage, OpenTelemetry spans |
+
+See [Roadmap](#roadmap) for what is deliberately *not* built and what remains open.
 
 Current measured performance against the reference fixture:
 
@@ -39,10 +45,11 @@ fixture, a different framework (Flask) with a deliberately *harder* defect — s
 scores 5 of 6 (83%), because it seeds one defect (an IDOR) the rule set honestly
 cannot catch yet, still at 0% false positives.
 
-**Verified:** the pipeline (discovery, generation, execution, triage, reporting), the
-CLI, the eval harness, 280 unit tests and lint — all run green without a database. The
-dashboard was rendered against real pipeline output through the documented API
-contract: all three pages, the setup state, and the failure-analysis chart.
+**Verified:** the pipeline (discovery, planning, generation, execution, triage,
+reporting), the CLI, the eval harness, **543 unit tests** and lint — all run
+green with no database and no API key. The dashboard was rendered against real
+pipeline output through the documented API contract: all three pages, the setup
+state, and the failure-analysis chart.
 
 **Verified against a real Postgres and Redis** (`db-integration` in CI,
 [ADR-0007](docs/decisions/ADR-0007-rls-requires-an-unprivileged-role.md)): schema
@@ -148,6 +155,278 @@ qagent scan --url ... --repo ./path/to/checkout  # fall back to route parsing if
 ```
 
 `qagent scan` exits non-zero when a defect is found, so it drops straight into CI.
+
+### Test planning
+
+Ask what QAgent *would* test, and in what order, before committing to a run:
+
+```bash
+qagent plan --url http://127.0.0.1:8080
+```
+
+```text
+8 endpoints in 6 modules, 18 required checks
+
+priority   module     endpoints  checks  why
+critical   admin              1       3  Elevated-privilege surface: a defect here
+                                         bypasses normal authorization.
+critical   orders             2       6  Money movement: a defect risks financial
+                                         loss or double charges.
+high       users              1       1  Account data: a defect risks cross-tenant
+                                         or cross-user data exposure.
+low        products           2       4  Low risk (0.25): read-only, unauthenticated.
+low        me                 1       3  Low risk (0.20): read-only, unauthenticated.
+low        health             1       1  Low risk (0.10): read-only, unauthenticated.
+```
+
+Every priority names the reason that produced it, so the ranking is a claim you
+can check rather than an opinion.
+
+`--max-cases` answers the question the case limit used to hide — what a budgeted
+run is about to leave untested:
+
+```bash
+qagent plan --url http://127.0.0.1:8080 --max-cases 5
+# at --max-cases 5: 5/18 planned checks would run (28%)
+#   left untested: users, products, me, health
+```
+
+Both critical modules survive the cut; the health check does not. That ordering
+is the planner's main job — before it existed, `--max-cases` truncated in
+discovery order and could spend the whole budget on `/health`.
+
+`--checks` lists every required check, `--json` writes the plan as a document,
+and `--enrich` spends one model call letting a review raise a module's priority
+(never lower one, never remove a check). `qagent scan` builds the same plan
+automatically and prints a coverage line whenever a run covered less than it
+planned; `GET /api/v1/runs/{id}/plan` returns the stored plan for a persisted run.
+
+### Repository RAG
+
+A bug report that says "the handler crashed" is a claim. One that says
+`app.py:98-115 (create_order)` is a lead. Point `scan` at a checkout and QAgent
+indexes it, then uses each failure as a retrieval query against it:
+
+```bash
+qagent scan --url http://127.0.0.1:8080 --repo packages/fixtures/buggy-shop
+```
+
+```text
+indexed 20 chunks from 1 files for root-cause evidence
+
+GET /admin/users requires authentication        -> app.py:118-128 (admin_list_users)
+POST /orders returns 201 for a valid request    -> app.py:98-115  (create_order)
+POST /users returns 201 for a valid request     -> app.py:131-139 (create_user)
+GET /products/{product_id} rejects a malformed  -> app.py:84-95   (get_product)
+```
+
+All four seeded defects cite the exact function that causes them. Three things
+make that work, and each of them was a real failure first:
+
+- **Symbol-level chunks, decorators included.** Python's AST puts a function's
+  `lineno` at `def`, which splits `@app.get("/admin/users")` — the single most
+  identifying line an endpoint has — away from its handler.
+- **The culprit frame, not the whole trace.** A FastAPI 500 carries a dozen
+  `starlette` and `uvicorn` frames wrapping one line of application code.
+  Querying on all of them retrieves opinions about starlette. QAgent keeps only
+  non-vendor frames and weights the deepest — the same heuristic error trackers
+  use. Traces arrive escaped inside JSON bodies, so they are unescaped first;
+  without that the frame pattern matches nothing at all.
+- **Weighted route paths.** An authorization bypass leaks exactly the data some
+  *other* handler returns, so the response body points confidently at the wrong
+  function. The route path appears verbatim in the right handler's decorator,
+  so it outweighs the body.
+
+Search the index directly to see why a report cited what it did:
+
+```bash
+qagent search "create order price" --repo packages/fixtures/buggy-shop --code
+qagent index --repo packages/fixtures/buggy-shop
+```
+
+**Retrieval is BM25 by default — no provider, no network, no API key.** That is
+not a degraded mode: on code, identifier overlap is a strong signal precisely
+because the thing you are searching for appears verbatim in the code that
+implements it. Configure `QAGENT_EMBEDDING_PROVIDER=openai_compatible` and
+embeddings are fused in by reciprocal rank fusion, which adds the paraphrase
+cases lexical search cannot reach ("payment fails" → `ChargeService`). There is
+deliberately no Anthropic embedder: Anthropic serves no embeddings API, and
+hashed pseudo-vectors would be noise wearing the costume of a result.
+
+**pgvector is opt-in, not automatic.** CLAUDE.md names pgvector; this project's
+own compose file runs stock `postgres:16-alpine`, which does not have it.
+`QAGENT_VECTOR_BACKEND` picks:
+
+| | `json` (default) | `pgvector` |
+|---|---|---|
+| Requires | nothing | `pip install qagent[rag]` + the `vector` extension |
+| Column | `JSON` | `vector(n)` with an IVFFlat index |
+| Search | Python cosine | native `<=>` in Postgres |
+
+Both are covered by the same integration suite, run twice in CI — once per
+backend.
+
+The first attempt at this was cleverer and wrong: store JSON, then `ALTER` the
+column to `vector` at init if the extension turned out to be present. The ALTER
+succeeds and then **every insert fails** with *"column is of type vector but
+expression is of type json"*, because SQLAlchemy still binds the type the model
+was defined with. A physical schema that disagrees with the mapper is not a
+graceful degradation, it is an outage. So the column type is a declared choice
+made once, and `db_init` checks both prerequisites and says so loudly when the
+configuration asks for pgvector and the database cannot provide it.
+
+Testing the native path also caught two bugs that the default path hides
+completely: a type modifier bound as a query parameter (`vector(:dims)` is a
+syntax error, not a slow path), and a `uuid = varchar` comparison that made
+every native query fail and fall back forever — silently, because the fallback
+works. That is why CI runs both.
+
+Chunks are stored with a content digest, so re-scanning an unchanged checkout
+re-embeds nothing, and a chunk whose code has moved is deleted rather than left
+to cite a line number that is no longer there.
+
+### Emitting real test files
+
+The generator produces declarative documents, and that stays the default — a
+document is diffable, reviewable, safe to execute without `eval`, and it is what
+the runner, the triage stage and the eval harness all consume. `qagent emit` is
+the other half of that promise: it renders the same documents as **standalone
+pytest files that do not import QAgent at all.**
+
+```bash
+qagent emit --url http://127.0.0.1:8080 --out ./tests/generated
+QAGENT_BASE_URL=http://127.0.0.1:8080 python -m pytest ./tests/generated
+```
+
+```text
+18 test(s) across 6 file(s)
+
+file              tests
+test_admin.py         3
+test_orders.py        6
+test_products.py      4
+...
+```
+
+One module per API module, the same grouping the planner and the dashboard use.
+The suite needs only `pytest` and `httpx`, so it keeps working if QAgent is
+uninstalled tomorrow — a test that only exists inside a tool is a test the
+developer cannot step through or keep.
+
+**The emitted suite reaches the same verdicts as the in-process runner** — 7
+passed, 11 failed against the buggy fixture, identical to `qagent scan`. CI
+asserts that equality, because "similar checks" would mean one of the two is
+lying to a developer.
+
+Nothing from a spec reaches the output as executable text. Every value goes
+through `repr()` into a string literal, so a path of
+`/x"); import os; os.system(...)` renders as data; the test suite asserts that
+directly by parsing the output and checking no such call node exists.
+
+### Quality gate and CI
+
+`qagent gate` runs QA and exits non-zero when the result should stop a deploy.
+It needs no database, no project and no org — a pull request has none of those,
+and requiring them would mean standing up Postgres to find out whether a branch
+is safe to merge.
+
+```bash
+qagent gate --url http://127.0.0.1:8080 --repo . --min-coverage 0.9
+```
+
+```text
+QUALITY GATE
+
+  critical_defects  FAIL  2 critical defect(s), limit 0
+  high_defects      FAIL  5 high defect(s), limit 0
+  plan_coverage     PASS  100% of the test plan ran, minimum 90%
+
+RESULT: BLOCK
+```
+
+Exit codes: **0** deploy, **1** block, **2** nothing could be tested. That third
+code matters more than it looks — a gate that reports success because it never
+managed to reach the application is worse than no gate, so "I tested nothing" is
+never allowed to look like "I found nothing".
+
+Three deliberate choices:
+
+- **It blocks on classified defects, not on red tests.** A check that failed
+  because staging was down is not a reason to stop a release. Triage already
+  separates the two; the gate consumes that judgement instead of re-deriving it.
+- **It can block on coverage.** Once the planner can say "this run covered 40%
+  of its plan", green stops meaning *nothing is wrong* and starts meaning
+  *nothing that ran is wrong*. Only one of those should gate a release.
+- **Every check prints its threshold and its actual value, passing or not.** A
+  gate that shows only failures cannot be tuned, because nobody can see how
+  close the passing checks came.
+
+As a GitHub Action ([`action.yml`](action.yml)):
+
+```yaml
+- uses: RoshanMohamad/QAgent@master
+  with:
+    url: http://127.0.0.1:8080
+    repo-path: .
+    min-coverage: "0.9"
+    # header: Authorization: Bearer ${{ secrets.QA_TOKEN }}
+```
+
+It writes a check table to the job summary and fails the job on a block; set
+`fail-on-block: false` to report without failing while adopting it on an
+existing codebase. Headers are passed through the environment rather than argv,
+because argv is visible to every process on the runner and may carry a token.
+
+QAgent's CI runs this action against its own buggy fixture and **asserts that it
+blocks** — a gate that cannot say "no" is decoration — then runs it again with
+thresholds that permit the known defects and asserts it passes.
+
+### Browser recorder
+
+A Chrome extension ([`apps/extension/`](apps/extension/)) records a session and
+`qagent record-import` turns it into tests.
+
+```bash
+# Record → Stop → Export in the extension, then:
+qagent record-import qagent-session.json --url http://127.0.0.1:8080 --out ./tests/recorded
+```
+
+```text
+4 UI action(s), 5 request(s) → 3 API check(s)
+
+method  path       body      asserts
+GET     /products  none      status in [200, 201, 202, 204]
+POST    /users     recorded  status in [200, 201, 202, 204]
+POST    /orders    none      never a 5xx
+
+observed  console_error: TypeError: cart is undefined
+warning   1 action(s) recorded a positional selector; add a data-testid
+```
+
+The clicks become a UI flow document. **The traffic those clicks provoked
+becomes API checks** — and that second half is the reason this exists. A
+recorded session reaches requests static discovery cannot: they need a logged-in
+user, a cart with something in it, an order that already exists.
+
+Four things it refuses to do, each of which was a bug first:
+
+- **Assert success for a request it cannot replay.** A `POST` whose body was not
+  captured gets replayed empty, the application correctly answers 422, and a
+  check asserting 2xx fails on every run while nothing is wrong. That is a false
+  positive — the metric this project optimises against — so those checks assert
+  only the invariant that holds regardless of input: never a 5xx.
+- **Record a password.** Password-like inputs record the *action* and not the
+  value, and secret-looking body fields are redacted by key name, in the
+  extension and again server-side.
+- **Emit a positional selector silently.** Selector priority is
+  `data-testid` → stable `id` → link/button text → role → path, matching what
+  [self-healing](#self-healing-selectors) scores against. A positional fallback
+  is recorded as `fragile` and warned about.
+- **Replay a logout.** It would invalidate the session every later check depends
+  on, and the failure would read as an auth bug.
+
+Console errors seen while recording are reported as observations: a flow that
+logs an uncaught `TypeError` has already found something before a test exists.
 
 ### Compose mode
 
@@ -281,16 +560,81 @@ match" rather than a guess — a wrong high-confidence proposal is worse than an
 honest failure, since a human reviews either way. Every proposal is printed for
 manual approval; nothing here ever touches a test file.
 
-### Security scanning
+### Schema migrations
 
-Static analysis, not a live-target scanner (CLAUDE.md §16) — QAgent shells out
-to Semgrep rather than reimplementing SAST rule coverage:
+`db_init` brings the schema to head with Alembic. It used to call
+`Base.metadata.create_all`, and replacing that was not housekeeping — it was a
+correctness fix:
+
+> `create_all` creates **missing tables** and nothing else. It will not add a
+> column to a table that already exists. So the first schema change after a
+> database was created worked on a fresh machine and silently did nothing
+> everywhere else, surfacing much later as `column "plan" of relation
+> "test_runs" does not exist` at runtime instead of at deploy time.
+
+That is exactly how it was found here: adding the planner's `plan`/`coverage`
+columns broke every already-created database while passing on a new one.
 
 ```bash
-pip install -e ./apps/api[security]   # or a system semgrep install
-
-qagent security --repo . --fail-on high
+cd apps/api
+ADMIN_DATABASE_URL=... alembic upgrade head     # or just run db_init
+ADMIN_DATABASE_URL=... alembic revision --autogenerate -m "what changed"
 ```
+
+Migrations run as the bootstrap superuser (`ADMIN_DATABASE_URL`), never as the
+application role, which deliberately cannot issue DDL (ADR-0007).
+
+Three paths are exercised against a real Postgres:
+
+- **Fresh database** — both revisions apply, 18 tables, RLS on 16.
+- **Already at head** — idempotent, no-op.
+- **Pre-Alembic database with rows in it** — it has tables but no
+  `alembic_version`, so `db_init` stamps the baseline and upgrades. CI asserts
+  the rows survive *and* that the new `NOT NULL` columns land with a usable
+  default. (`ADD COLUMN ... NOT NULL` with no default fails outright on a
+  populated table — the migration adds a `server_default`, then drops it so the
+  mapper stays the single source of the default.)
+
+---
+
+## Security scanning
+
+Three scanners, three different questions, one vocabulary (CLAUDE.md §16).
+QAgent shells out to tools maintained by people who track rule and CVE coverage
+full time rather than reimplementing any of it:
+
+| Scanner | Reads | Finds |
+|---|---|---|
+| **Semgrep** | source | bugs in the code this project wrote |
+| **Trivy** | lockfiles | known CVEs in the code it *imported* |
+| **OWASP ZAP** | the running app | missing headers, insecure cookies, reflected input |
+
+```bash
+qagent security --repo .                 # semgrep + trivy
+qagent dast --url http://127.0.0.1:8080  # zap, against a running app
+```
+
+They disagree about everything — Semgrep says `ERROR`, Trivy says `CRITICAL`,
+ZAP says `riskcode: 3` — so every finding is normalised into one severity scale
+and deduplicated across tools, with the *higher* severity winning a
+disagreement, because under-reporting a real vulnerability is the more expensive
+mistake.
+
+Two choices worth stating:
+
+- **A missing scanner is a recorded skip, not a failure.** They have three
+  different installation stories and almost nobody has all three on day one; a
+  scan that refuses to start is a scan that gets deleted from CI. But the skip
+  is never silent, and when nothing ran at all the report says so outright —
+  *"no security scanner could run; this result says nothing about the project"*.
+  "No findings" and "nothing ran" must never look the same.
+- **ZAP is passive by default.** `--active` sends injection and traversal
+  payloads and can mutate state, so it is opt-in and announced. A QA tool that
+  attacks a host because a flag defaulted to true is a liability.
+
+ZAP alerts the scanner *itself* marks as false positives are dropped rather than
+reported: false-positive rate is this project's primary metric (ADR-0003), and
+rows the tool disbelieves must not attack it.
 
 Semgrep's own ERROR/WARNING/INFO severities map to
 critical/high/medium/low/info; a SQL-injection- or access-control-shaped
@@ -302,6 +646,56 @@ section 22 requires for the runner/browser/explorer stages applies here, so it
 also runs synchronously via `POST /api/v1/projects/{id}/security/scan` (given
 a `repo_path` readable by the API process), persisting findings the same way a
 bug does: they show up in the dashboard and count toward the quality gate.
+
+### Coverage, storage, tracing
+
+Three smaller pieces, each with one decision worth stating.
+
+**Coverage is *surface* coverage, and says so.** CLAUDE.md's dashboard mock asks
+for "Backend 82%", which reads as line coverage — a number this tool cannot
+honestly produce, because it tests the application as a black box and never
+instruments it. So what is reported is the share of the discovered API surface
+that a check actually ran against, and the payload carries the sentence *"Not
+line coverage"* so the figure cannot be misread:
+
+```text
+surface 2/8 discovered endpoints exercised (25%)
+  untouched: POST /orders, POST /users, GET /products/{product_id}, GET /me
+```
+
+The percentage is the headline; the `untouched` list is the actual next action.
+Coverage is credited only for endpoints a check *executed* against — never for
+ones merely discovered or merely planned — so a run truncated by `--max-cases`
+shows as missing surface rather than as success.
+
+**Artifact storage is pluggable.** `QAGENT_STORAGE_BACKEND=s3` switches evidence
+to any S3-compatible service (S3, R2, MinIO); the default is a directory on
+disk. Both backends share one key layout (`<org>/<kind>/<sha256><ext>`), so
+migrating a filesystem root into a bucket is a recursive copy rather than a
+script. Content-addressed, so the same screenshot captured by two checks is
+stored once. Configuring `s3` without a bucket is refused rather than silently
+demoted to local storage — a deployment that believes its evidence is durable,
+and is really writing to a container filesystem, loses exactly what a bug report
+depends on.
+
+**Tracing answers the question the counters cannot.** Prometheus says a scan
+took 40 seconds; it cannot say whether that was discovery waiting on a slow
+OpenAPI fetch or triage waiting on a model, and those have opposite fixes. A
+span per stage says it directly:
+
+```text
+qagent.discover   423.7ms  {endpoints: 8, spec_url: .../openapi.json}
+qagent.plan         0.6ms  {modules: 6, required_checks: 18}
+qagent.generate     0.3ms  {cases: 18, coverage_ratio: 1.0}
+qagent.execute    176.5ms  {cases: 18, passed: 7, failed: 11}
+```
+
+Off by default and genuinely free when off: `span()` is a null context manager
+and nothing imports `opentelemetry`. This partially supersedes
+[ADR-0008](docs/decisions/ADR-0008-phase-6-scope.md), which deferred tracing —
+that reasoning was right about *distributed* tracing and sampling policy, and
+wrong about instrumentation. Sampling, retention and backend choice are still
+deferred; OTLP keeps them the operator's.
 
 ### Performance testing
 
@@ -341,6 +735,43 @@ app running:
 ```bash
 qagent analyze --repo ./path/to/checkout
 ```
+
+Or connect a GitHub repository directly and let QAgent fetch it:
+
+```bash
+qagent connect --repo https://github.com/pallets/flask      # or just pallets/flask
+qagent connect --repo me/private-app --token $GITHUB_TOKEN  # private
+```
+
+```text
++------------------- QAgent connect -------------------+
+| https://github.com/pallets/flask @ d73fa1cd          |
+| 6 technologies - 137 endpoints - 0 frontend routes   |
++------------------------------------------------------+
+  Flask 2.3.2 - Redis 4.5.4 - Celery 5.2.7 - pytest
+```
+
+The same thing over the API, which also persists the result to the project:
+
+```bash
+curl -X POST $API/api/v1/projects/$PID/connect -H "Authorization: Bearer $TOKEN" \
+  -d '{"repo_url": "https://github.com/me/app", "branch": "main"}'
+# -> {"repo_url": ..., "commit_sha": "d73fa1cd...", "summary": {...}}
+```
+
+The clone is shallow, single-branch, submodule-free, pinned to `github.com`,
+and **deleted as soon as the analysis finishes** — nothing downstream reads
+source after Agent 1, and checks run against a running application, not files.
+Only https `github.com` URLs are accepted: `git clone` otherwise honours
+transports that execute commands (`ext::`), read local files (`file://`), or
+reach internal hosts the API process can see and the caller should not, and one
+host allowlist removes all three at once. A token is used for the clone and
+nothing else — it is passed through a 0600 credential file rather than argv (so
+it is not in `ps`), stripped from git's own error output, and never written to
+the database (ADR-0009).
+
+Analysis is a snapshot, not a subscription: a later push does not update it.
+Webhook-driven re-analysis needs a public callback and is deferred with Phase 5.
 
 Detection reads manifests and config files only (`package.json`,
 `pyproject.toml`/`requirements.txt`, `docker-compose.yml`, framework config
@@ -471,7 +902,30 @@ strings in a recognised call shape are found, never a dynamically built path or 
 route table loaded from config — but recovering *some* of the surface beats
 requiring every project to publish an OpenAPI document before QAgent is useful.
 
-### 2. Generate
+### 2. Plan
+
+The **Test Planner** (agent 2) groups the discovered endpoints into modules —
+the same grouping the analyst report and the dashboard show — ranks each module
+`critical`/`high`/`medium`/`low`, and states the checks that module requires.
+Every priority carries the reason that produced it: a matched risk keyword
+(`auth`, `payment`, `admin`) or the numeric risk score.
+
+The plan then does two things generation could not do on its own:
+
+- **It orders the case budget.** `--max-cases` used to truncate in discovery
+  order, so a capped run could spend everything on a health check and never
+  reach the auth module. It now truncates lowest-priority-first.
+- **It reports what it left out.** `coverage` matches the plan's
+  `(endpoint, rule)` pairs against what generation actually emitted, so a run
+  that covered 60% of its plan says so and names the untested modules. A tool
+  that silently covers less than it claimed is worse than one that covers less
+  and says so.
+
+The plan is rules-derived and free. `--enrich` spends one model call letting a
+review *raise* a module's priority; it can never lower one or remove a check,
+so a prompt-injected repository cannot talk the planner out of testing auth.
+
+### 3. Generate
 
 Seven deterministic rules per endpoint, including the ones that find real defects
 most reliably:
@@ -487,15 +941,23 @@ Generated cases are **declarative documents, not emitted code**: diffable, revie
 and safe to execute without `eval`. The same spec can be rendered to Playwright or
 pytest later without regenerating anything.
 
-### 3. Execute
+### 4. Execute
 
 An SSRF-guarded HTTP runner. Assertions are data, never expressions, so a generated
 or model-suggested test can never execute arbitrary logic inside the platform.
 
-### 4. Triage & report
+### 5. Triage & report
 
 Rules classify, the model arbitrates ambiguity, and only real defects become bug
 reports with reproduction steps, expected vs. actual, root cause and a suggested fix.
+
+When a checkout is available, the failure is also used as a retrieval query
+against the indexed source, and the matching functions are attached as
+`affected_code` — the "Affected: `OrderService.createOrder()`" line CLAUDE.md
+section 13 asks for. The location the model may cite is a **closed enum built
+from what was actually retrieved**, plus `unknown`: it cannot name a file it was
+not shown, because the schema has no value for one. That turns "please do not
+hallucinate a filename" from an instruction into an impossibility.
 
 ---
 
@@ -531,6 +993,7 @@ The CLI, the worker and the eval harness all run the identical loop — which me
 | [0006](docs/decisions/ADR-0006-repository-analyzer.md) | The repository analyzer reads and parses text only — never executes a checkout's own tooling — and every detection carries its evidence. |
 | [0007](docs/decisions/ADR-0007-rls-requires-an-unprivileged-role.md) | The API/worker connect as a separate, unprivileged role — never the superuser that bootstraps the schema — or row-level security is silently bypassed. |
 | [0008](docs/decisions/ADR-0008-phase-6-scope.md) | Phase 6 built RBAC, rate limiting, metrics, usage tracking and queue separation now; payment integration, cluster autoscaling and distributed tracing stay deferred until there's a real deployment to size them against. |
+| [0009](docs/decisions/ADR-0009-github-checkouts-are-ephemeral-and-host-pinned.md) | A connected repository is cloned from `github.com` only, with command-executing and local-file git transports disabled, and the checkout is deleted once analysed — tokens never reach argv or the database. |
 
 ---
 
@@ -611,7 +1074,7 @@ docs/decisions/            ADRs
 ## Tests
 
 ```bash
-cd apps/api && pytest tests -q     # 280 tests, no database needed
+cd apps/api && pytest tests -q     # 318 tests, no database needed
 ```
 
 Against a real Postgres + Redis (`db-integration` in CI, ADR-0007):
@@ -654,18 +1117,26 @@ a change that degrades detection or raises false positives fails the build.
 Phase 1, the dashboard, `compose` mode, route parsing, a first browser E2E
 layer, the Explorer Agent (link-crawl and interactive), self-healing selector
 proposals, GitHub + Jira issue sync, the repository analyzer / Project Analyst
-agent (`qagent analyze`, agent 1), and evidence artifacts on browser-found bugs
+agent (`qagent analyze`, agent 1), the Test Planner (`qagent plan`, agent 2),
+repository RAG (`qagent index` / `qagent search`, root-cause evidence on bug
+reports), the quality gate and GitHub Action (`qagent gate`, `action.yml`),
+the pytest emitter (`qagent emit`, agent 3), Alembic migrations, Trivy and ZAP
+(`qagent security`, `qagent dast`), S3-compatible storage, OpenTelemetry spans,
+surface coverage, defect history (`bug_events`), notifications, the browser
+recorder (`apps/extension/`, `qagent record-import`),
+and evidence artifacts on browser-found bugs
 (screenshot + scrubbed console log, real storage, `GET /api/v1/artifacts/{id}`)
 are done and tested.
 
-Still open within CLAUDE.md phases 1-5: the Test Planner (agent 2) and a real
-Playwright/pytest emitter for generated specs (agent 3 currently ships
-declarative test documents, not files, by design — see [How it works](#how-it-works));
-Repository RAG; HAR/trace evidence and evidence on API/interactive-exploration
-bugs, not just browser-E2E ones (the same `Artifact` mechanism, extended); the
-browser extension and its recorder; and OWASP ZAP/Trivy alongside the existing
-Semgrep SAST integration and the IDOR-shaped gap
-[task-tracker](packages/fixtures/task-tracker)'s BUG-201 documents.
+Still open within CLAUDE.md phases 1-5: a **Playwright emitter** for the browser
+layer — the pytest emitter covers API checks (`qagent emit`) and the recorder
+produces a UI-flow document, but nothing yet renders that document to a
+`.spec.ts`; **HAR/trace evidence**, and evidence on API and
+interactive-exploration bugs rather than only browser-E2E ones (the same
+`Artifact` mechanism, extended); and the **IDOR-shaped gap** that
+[task-tracker](packages/fixtures/task-tracker)'s BUG-201 documents — no
+generator rule yet compares two identities, which is the one seeded defect the
+rules honestly cannot catch.
 
 Phase 6 (CLAUDE.md §23) is scoped, not skipped — see
 [ADR-0008](docs/decisions/ADR-0008-phase-6-scope.md). Built: RBAC (`require_owner`
@@ -682,15 +1153,8 @@ manifests or autoscaling policies, and distributed tracing — all three need a
 real deployment or real load to size against, and ADR-0001 is exactly the
 argument against building them on guesses.
 
-Still open elsewhere: within CLAUDE.md phases 1-5, the Test Planner (agent 2)
-and a real Playwright/pytest emitter for generated specs (agent 3 currently
-ships declarative test documents, not files, by design — see
-[How it works](#how-it-works)); Repository RAG; HAR/trace evidence and evidence
-on API/interactive-exploration bugs, not just browser-E2E ones (the same
-`Artifact` mechanism, extended); the browser extension and its recorder; and
-OWASP ZAP/Trivy alongside the existing Semgrep SAST integration and the
-IDOR-shaped gap [task-tracker](packages/fixtures/task-tracker)'s BUG-201
-documents.
+Everything still open across phases 1-5 is listed once, above — this paragraph
+used to repeat that list and the two copies had already started to disagree.
 
 More fixtures are the highest-leverage work at any point: every metric above is only
 as trustworthy as the ground truth behind it.

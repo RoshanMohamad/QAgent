@@ -1,0 +1,147 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: qagent-api
+  namespace: qagent
+  labels:
+    app.kubernetes.io/name: qagent
+    app.kubernetes.io/component: api
+spec:
+  # TUNE: two, so a rolling update and a single node failure are both survivable.
+  # The HPA below owns the number after that; this is only the floor.
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: qagent
+      app.kubernetes.io/component: api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: qagent
+        app.kubernetes.io/component: api
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: api
+          image: ghcr.io/example/qagent:latest
+          command: ["uvicorn", "qagent.main:app", "--host", "0.0.0.0", "--port", "8000"]
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: qagent-config
+          env:
+            # No ADMIN_DATABASE_URL here, deliberately: see migration-job.yaml.
+            - name: DATABASE_URL
+              valueFrom: { secretKeyRef: { name: qagent-secrets, key: database-url } }
+            - name: REDIS_URL
+              valueFrom: { secretKeyRef: { name: qagent-secrets, key: redis-url } }
+            - name: CELERY_BROKER_URL
+              valueFrom: { secretKeyRef: { name: qagent-secrets, key: celery-broker-url } }
+            - name: CELERY_RESULT_BACKEND
+              valueFrom: { secretKeyRef: { name: qagent-secrets, key: celery-result-backend } }
+            - name: QAGENT_SECRET_KEY
+              valueFrom: { secretKeyRef: { name: qagent-secrets, key: secret-key } }
+          # /health touches no dependency, so a Postgres blip does not cascade
+          # into the kubelet killing every API pod at once.
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            # TUNE: requests sized for an idle-to-moderate API that does little
+            # CPU work of its own — it waits on Postgres and hands scans to the
+            # queue. No CPU limit on purpose: throttling a latency-sensitive
+            # request path to enforce a number nobody measured trades real
+            # latency for a tidier dashboard.
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 512Mi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: qagent-api
+  namespace: qagent
+  labels:
+    app.kubernetes.io/name: qagent
+    app.kubernetes.io/component: api
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: qagent
+    app.kubernetes.io/component: api
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: qagent-api
+  namespace: qagent
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: qagent-api
+  minReplicas: 2
+  # TUNE: every number below is a guess until there is real traffic. 70% CPU is
+  # the common starting point; the scale-down window is deliberately long so a
+  # brief lull does not remove capacity a moment before it is needed again.
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: qagent-api
+  namespace: qagent
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: qagent
+      app.kubernetes.io/component: api

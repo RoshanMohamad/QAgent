@@ -1,0 +1,21 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: qagent
+
+# secrets.example.yaml is deliberately NOT listed: it documents the shape of the
+# required secrets and contains placeholders. Applying it would create a
+# deployment whose signing key is the literal string CHANGE_ME.
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - migration-job.yaml
+  - api.yaml
+  - worker.yaml
+
+# `labels`, not the deprecated `commonLabels`: the latter also rewrites
+# selectors, which silently breaks a rolling update on an existing Deployment.
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: qagent
+    includeSelectors: false

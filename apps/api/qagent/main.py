@@ -1549,6 +1549,40 @@ def dashboard(org_id: UUID = Depends(current_org), session: Session = Depends(ge
     }
 
 
+@app.get("/api/v1/billing/statement", tags=["usage"])
+def billing_statement(
+    since: datetime | None = None,
+    org_id: UUID = Depends(current_org),
+    session: Session = Depends(get_db),
+) -> dict:
+    """Metered usage, priced against the configured rate card.
+
+    Reads the exact payload `/usage` returns, so billing and the dashboard
+    cannot disagree about what happened in a period.
+
+    **This does not charge anyone.** ADR-0008 cut the seam between metering and
+    settlement here deliberately: a payment provider integration written against
+    a pricing page that does not exist would look finished and be discarded by
+    the first real pricing decision. Every rate defaults to zero, so an
+    unconfigured deployment gets a statement with no amounts on it.
+    """
+    from decimal import Decimal
+
+    from qagent.modules.billing.statement import RateCard, build_statement
+
+    metered = usage(since=since, org_id=org_id, session=session)
+    rates = RateCard(
+        currency=settings.qagent_billing_currency,
+        per_run=Decimal(settings.qagent_billing_per_run),
+        per_defect=Decimal(settings.qagent_billing_per_defect),
+        llm_markup=Decimal(settings.qagent_billing_llm_markup),
+        included_runs=settings.qagent_billing_included_runs,
+    )
+
+    statement = build_statement(metered, rates=rates, period_end=datetime.now(UTC))
+    return {"statement": statement.to_dict(), "rate_card": rates.to_dict(), "usage": metered}
+
+
 @app.get("/api/v1/usage", tags=["usage"])
 def usage(
     since: datetime | None = None,

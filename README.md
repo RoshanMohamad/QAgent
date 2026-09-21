@@ -26,6 +26,7 @@ as one sentence, because the list stopped being readable:
 | Security | Semgrep, Trivy and OWASP ZAP behind one severity vocabulary, plus a two-identity [IDOR probe](#broken-access-control-idor) |
 | CI/CD | [Quality gate](#quality-gate-and-ci) + GitHub Action, recorded gate/deployment history, [automatic alerts](#defect-history-and-alerts) with delivery tracking and retry |
 | Performance | k6 and Apache JMeter behind one metric shape |
+| Deployment | [Validated Kubernetes manifests](#deployment), per-PR [ephemeral environments](#ephemeral-environments-per-pull-request), usage [priced into a statement](#billing) |
 | Platform | Multi-tenancy with Postgres RLS, RBAC, rate limiting, `/metrics`, usage tracking, queue separation, [Alembic migrations](#schema-migrations), S3-compatible storage, OpenTelemetry spans |
 | Dashboard | [Quality score](#quality-score), pass rate, defects and findings by severity, surface coverage, failure analysis, gate history |
 
@@ -572,7 +573,91 @@ match" rather than a guess — a wrong high-confidence proposal is worse than an
 honest failure, since a human reviews either way. Every proposal is printed for
 manual approval; nothing here ever touches a test file.
 
-### Schema migrations
+### Deployment
+
+`deploy/kubernetes/` carries manifests for the API, both worker pools, the
+migration Job, autoscaling and a default-deny `NetworkPolicy`.
+
+> **Validated, not proven.** Every manifest is checked by `kubeconform` in
+> strict mode against the real Kubernetes schemas in CI — as raw files *and* as
+> the built kustomization, since a kustomization can emit something no
+> individual file contained. Strict mode is the point: it rejects unknown
+> fields, the typo class that otherwise survives review and surfaces as a
+> silently ignored setting in production.
+>
+> **Nothing here has run in a cluster under load.** Replica counts, HPA
+> thresholds and resource limits are marked `# TUNE:` and carry the reasoning
+> behind the starting value rather than a number dressed up as a measurement.
+> Treat them as a correct starting point that still needs an SRE.
+
+Two security properties are asserted by CI rather than trusted, because both
+carry over from decisions that are already load-bearing:
+
+- **The admin database credential reaches only the migration Job.** A superuser
+  bypasses RLS unconditionally ([ADR-0007](docs/decisions/ADR-0007-rls-requires-an-unprivileged-role.md)),
+  and the worker fetches user-supplied URLs. CI parses the built manifests and
+  fails if `ADMIN_DATABASE_URL` appears anywhere else — a check verified by
+  injecting a violation and confirming it failed.
+- **The placeholder secret can never be applied.** `secrets.example.yaml`
+  documents the required shape and contains `CHANGE_ME`; it is excluded from the
+  kustomization, and CI greps the built output to keep it that way.
+
+### Ephemeral environments per pull request
+
+Reference image 02 draws a per-PR cloud environment. `ephemeral-environment.yml`
+implements its shape — provision, migrate, deploy, gate, comment on the PR,
+destroy — with docker compose on the runner:
+
+```text
+provision → migrate (the same db_init a rollout runs) → deploy
+  → quality gate → comment → destroy   (always(), even on cancel)
+```
+
+The property that matters is that a PR is tested against a real, isolated,
+freshly-migrated deployment of itself, and compose delivers that. Cloud
+provisioning would add a public URL; it would also add a cloud account, a cost
+owner and a teardown guarantee that survives a cancelled job. An orphaned EKS
+cluster is a bill, not a bug. The provision and destroy steps are two steps —
+swapping them for Terraform later changes those two and nothing else.
+
+### On the twelve microservices
+
+Reference image 03 draws twelve. This ships one API and two worker pools, and
+[ADR-0010](docs/decisions/ADR-0010-infrastructure-is-validated-not-proven.md)
+records why: splitting adds eleven deployment units, eleven failure modes, a
+network hop where there is now a function call, and a tracing requirement to
+debug what a stack trace answers today — without adding a capability.
+
+What *is* built is the part carrying the actual benefit. `qagent.scan` and
+`qagent.performance` are separate queues with separate Deployments and separate
+autoscaling, because a load test and an API check have nothing in common
+operationally. That is image 06's fan-out expressed as queue routing: a second
+worker pool is a manifest, not a rewrite.
+
+### Billing
+
+`GET /api/v1/billing/statement` prices metered usage into line items and a
+total:
+
+```text
+  QA runs                        12  USD     1.20
+  AI analysis (pass-through)      1  USD     3.00
+  Total                              USD     4.20
+```
+
+**It does not charge anyone.** ADR-0008 cut the seam between metering and
+settlement here, and this stops at the same line: no payment provider, no card,
+no tax, no currency decision. Those are a business-model decision that does not
+exist yet, and an integration written against an imagined pricing page would
+look finished and be discarded by the first real one. Every rate defaults to
+zero, so an unconfigured deployment gets a statement with no amounts on it.
+
+Money is `Decimal` throughout — a float subtotal is how an invoice ends up a
+cent off from its own line items, and the first person to notice is a customer.
+
+---
+
+## Schema migrations
 
 `db_init` brings the schema to head with Alembic. It used to call
 `Base.metadata.create_all`, and replacing that was not housekeeping — it was a
@@ -1191,6 +1276,7 @@ The CLI, the worker and the eval harness all run the identical loop — which me
 | [0006](docs/decisions/ADR-0006-repository-analyzer.md) | The repository analyzer reads and parses text only — never executes a checkout's own tooling — and every detection carries its evidence. |
 | [0007](docs/decisions/ADR-0007-rls-requires-an-unprivileged-role.md) | The API/worker connect as a separate, unprivileged role — never the superuser that bootstraps the schema — or row-level security is silently bypassed. |
 | [0008](docs/decisions/ADR-0008-phase-6-scope.md) | Phase 6 built RBAC, rate limiting, metrics, usage tracking and queue separation now; payment integration, cluster autoscaling and distributed tracing stay deferred until there's a real deployment to size them against. |
+| [0010](docs/decisions/ADR-0010-infrastructure-is-validated-not-proven.md) | Infrastructure is schema-validated in CI, never described as proven; billing prices but never settles; the twelve-microservice split stays unbuilt and the queue split is the fan-out that carries its benefit. |
 | [0009](docs/decisions/ADR-0009-github-checkouts-are-ephemeral-and-host-pinned.md) | A connected repository is cloned from `github.com` only, with command-executing and local-file git transports disabled, and the checkout is deleted once analysed — tokens never reach argv or the database. |
 
 ---
@@ -1328,7 +1414,12 @@ that would come next, none of which are CLAUDE.md requirements:
   of tens of megabytes per failure — worth doing once there is a retention
   policy to size it against.
 - **GitLab and Bitbucket** (§5 says GitHub first, and only GitHub is built).
-- **More fixtures**, which is the highest-leverage work at any point.
+- **Settlement.** The statement is priced; wiring a payment provider needs a
+  pricing decision that does not exist yet ([ADR-0010](docs/decisions/ADR-0010-infrastructure-is-validated-not-proven.md)).
+- **Tuning the manifests against a real cluster.** They are schema-valid; the
+  numbers marked `# TUNE:` are starting points, not measurements.
+- **More fixtures**, which is the highest-leverage work at any point — every
+  metric in this README is only as trustworthy as the ground truth behind it.
 
 Phase 6 (CLAUDE.md §23) is scoped, not skipped — see
 [ADR-0008](docs/decisions/ADR-0008-phase-6-scope.md). Built: RBAC (`require_owner`

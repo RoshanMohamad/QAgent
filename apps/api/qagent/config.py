@@ -70,6 +70,18 @@ class Settings(BaseSettings):
     qagent_tracing_endpoint: str = "http://localhost:4318/v1/traces"
     qagent_tracing_service_name: str = "qagent"
 
+    # --- Billing (CLAUDE.md section 23) ---
+    # QAgent meters and prices; it never settles. Every rate defaults to zero,
+    # so an unconfigured deployment produces a statement with no amounts on it
+    # rather than quietly billing something nobody decided
+    # (modules/billing/statement.py, ADR-0008).
+    qagent_billing_currency: str = "USD"
+    qagent_billing_per_run: str = "0"
+    qagent_billing_per_defect: str = "0"
+    #: 0 means AI spend is not charged on; 1 is at-cost pass-through.
+    qagent_billing_llm_markup: str = "0"
+    qagent_billing_included_runs: int = 0
+
     # --- Budgets, enforced per agent run (see modules/llm/budget.py) ---
     qagent_max_llm_calls: int = 40
     qagent_max_llm_tokens: int = 200_000

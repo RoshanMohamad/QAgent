@@ -1,0 +1,165 @@
+name: ephemeral environment
+
+# Reference image 02: a pull request gets a disposable environment, QA runs
+# against it, the result is posted back, and the environment is destroyed.
+#
+# That image draws the environment as Terraform/EKS/Pulumi. This builds it with
+# docker compose instead, and the difference is deliberate: a cloud environment
+# per PR needs a cloud account, a cost owner and a teardown guarantee that
+# survives a cancelled job. None of those exist to size against
+# ([ADR-0001](../../docs/decisions/ADR-0001-scope-and-input-contract.md)), and
+# an orphaned EKS cluster is a bill, not a bug.
+#
+# A compose stack on the runner gets the property that actually matters - the PR
+# is tested against a real, isolated, freshly-migrated deployment of itself -
+# and the runner's own lifecycle is the teardown guarantee. Swapping the
+# provision/destroy steps for Terraform later changes two steps, not the shape.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  # One environment per PR. A second push supersedes the first rather than
+  # racing it for the same ports on the same runner.
+  group: ephemeral-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  ephemeral:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Provision the environment
+        id: provision
+        run: |
+          set -euo pipefail
+          # Ports are derived from the PR number so two concurrent PRs on the
+          # same runner pool cannot collide.
+          offset=$(( ${{ github.event.pull_request.number }} % 1000 ))
+          {
+            echo "POSTGRES_PORT=$(( 15432 + offset ))"
+            echo "REDIS_PORT=$(( 16379 + offset ))"
+          } >> "$GITHUB_ENV"
+
+          docker compose up -d postgres redis
+          for _ in $(seq 1 30); do
+            docker compose exec -T postgres pg_isready -U qagent && break
+            sleep 2
+          done
+
+      - name: Migrate
+        # The same `db_init` a production rollout runs: Alembic to head, the
+        # unprivileged app role, and RLS. A PR environment that skipped this
+        # would be testing a schema no deployment ever has.
+        env:
+          ADMIN_DATABASE_URL: postgresql+psycopg://qagent:qagent@localhost:${{ env.POSTGRES_PORT }}/qagent
+          DATABASE_URL: postgresql+psycopg://qagent_app:qagent_app@localhost:${{ env.POSTGRES_PORT }}/qagent
+        working-directory: apps/api
+        run: |
+          pip install --upgrade pip
+          pip install -e ".[dev]" "uvicorn[standard]"
+          python -m qagent.db_init
+
+      - name: Deploy the application under test
+        run: |
+          set -euo pipefail
+          cd packages/fixtures/buggy-shop
+          uvicorn app:app --port 8080 &
+          for _ in $(seq 1 20); do
+            curl -sf http://127.0.0.1:8080/health && break
+            sleep 1
+          done
+
+      - name: Run the quality gate
+        id: gate
+        continue-on-error: true
+        uses: ./
+        with:
+          url: http://127.0.0.1:8080
+          repo-path: packages/fixtures/buggy-shop
+          # Permissive on purpose: the fixture has four seeded defects, so a
+          # zero-tolerance gate would fail every PR and teach people to ignore
+          # this job. Point it at a real application and tighten.
+          max-critical: "5"
+          max-high: "10"
+
+      - name: Comment the result on the pull request
+        if: always()
+        uses: actions/github-script@v7
+        env:
+          GATE_RESULT: ${{ steps.gate.outputs.result }}
+          REPORT: ${{ steps.gate.outputs.report }}
+        with:
+          script: |
+            const fs = require("fs");
+            const result = process.env.GATE_RESULT || "error";
+            let body = `### QAgent ephemeral environment\n\n**Gate:** \`${result}\`\n`;
+
+            try {
+              const data = JSON.parse(fs.readFileSync(process.env.REPORT, "utf8"));
+              const s = data.summary || {};
+              body += `\n${s.total ?? 0} checks, ${s.passed ?? 0} passed, `;
+              body += `${s.failed ?? 0} failed, ${s.bugs ?? 0} defect(s).\n`;
+              const rows = (data.gate?.checks || [])
+                .map((c) => `| \`${c.name}\` | ${c.passed ? "pass" : "**fail**"} | ${c.detail} |`)
+                .join("\n");
+              if (rows) {
+                body += `\n| check | verdict | detail |\n|---|---|---|\n${rows}\n`;
+              }
+            } catch (error) {
+              body += `\n_No report was produced: ${error.message}_\n`;
+            }
+
+            body += `\n<sub>Environment destroyed when this job ended.</sub>`;
+
+            // Update the existing comment rather than adding one per push: a PR
+            // with twenty pushes should not have twenty identical comments.
+            const marker = "### QAgent ephemeral environment";
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find(
+              (c) => c.user.type === "Bot" && c.body.startsWith(marker),
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+      - name: Destroy the environment
+        # `always()` is the teardown guarantee: it runs on failure, and on a
+        # cancelled run. The runner being ephemeral is the backstop, but relying
+        # on that alone would leak volumes on a self-hosted pool.
+        if: always()
+        run: docker compose down -v --remove-orphans
+
+      - name: Fail the check if the gate blocked
+        # Separate and last, so the comment and the teardown both happen first.
+        if: always() && steps.gate.outputs.result == 'block'
+        run: |
+          echo "::error::The quality gate blocked this change."
+          exit 1

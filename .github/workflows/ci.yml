@@ -143,6 +143,72 @@ jobs:
           max-critical: "2"
           max-high: "5"
 
+  manifests:
+    # ADR-0008 deferred Kubernetes manifests because untested infrastructure
+    # code is a liability. This job is what keeps that from being true of these:
+    # every manifest is validated against the real Kubernetes OpenAPI schemas in
+    # strict mode (which rejects unknown fields - the typo class that otherwise
+    # surfaces as a silently ignored setting in production).
+    #
+    # It does NOT prove they run. Replica counts, HPA thresholds and resource
+    # limits still need a real cluster under load, and are marked `# TUNE:`.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install kubeconform
+        run: |
+          curl -sSL -o kubeconform.tar.gz             https://github.com/yannh/kubeconform/releases/latest/download/kubeconform-linux-amd64.tar.gz
+          tar xf kubeconform.tar.gz kubeconform
+          sudo mv kubeconform /usr/local/bin/
+
+      - name: Validate raw manifests
+        run: |
+          kubeconform -strict -summary             -ignore-filename-pattern kustomization.yaml             deploy/kubernetes/base/
+
+      - name: Validate the built kustomization
+        # The built output is what actually reaches a cluster, so it is what
+        # has to be valid - a kustomization can produce something no individual
+        # file contained.
+        run: kubectl kustomize deploy/kubernetes/base | kubeconform -strict -summary -
+
+      - name: The placeholder secret must never be applied
+        # secrets.example.yaml documents the required shape and contains
+        # CHANGE_ME. A kustomization that included it would deploy an API whose
+        # signing key is a literal string in a public repository.
+        run: |
+          if kubectl kustomize deploy/kubernetes/base | grep -q "CHANGE_ME"; then
+            echo "::error::placeholder secrets reached the built manifests"
+            exit 1
+          fi
+
+      - name: The worker must never receive the admin database credential
+        # ADR-0007: a superuser bypasses RLS unconditionally. The worker fetches
+        # user-supplied URLs, so this is the one credential separation that
+        # cannot be allowed to regress silently.
+        run: |
+          python - <<'PY'
+          import subprocess, sys, yaml
+          built = subprocess.run(
+              ["kubectl", "kustomize", "deploy/kubernetes/base"],
+              capture_output=True, text=True, check=True,
+          ).stdout
+          bad = []
+          for doc in yaml.safe_load_all(built):
+              if not doc or doc.get("kind") not in {"Deployment", "Job"}:
+                  continue
+              name = doc["metadata"]["name"]
+              spec = doc["spec"]["template"]["spec"]
+              for container in spec.get("containers", []):
+                  names = {e["name"] for e in container.get("env", [])}
+                  if "ADMIN_DATABASE_URL" in names and "migrate" not in name:
+                      bad.append(name)
+          if bad:
+              print(f"::error::admin credential reaches non-migration workloads: {bad}")
+              sys.exit(1)
+          print("admin credential is confined to the migration Job")
+          PY
+
   db-integration:
     # Everything in `test` runs green with no database (README). This job is the
     # other half: a real Postgres + Redis, proving row-level security actually

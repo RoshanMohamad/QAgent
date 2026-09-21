@@ -1,0 +1,73 @@
+# Schema, application role and RLS policies, run before any rollout.
+#
+# The ONLY workload that receives the admin (superuser) DSN. Everything else
+# connects as the unprivileged role this Job creates — a superuser bypasses RLS
+# unconditionally, `FORCE` included, so handing that credential to the API or
+# the worker would silently disable tenant isolation (ADR-0007).
+#
+# Idempotent: `db_init` stamps and upgrades with Alembic, resets the app role's
+# privileges, and re-applies every policy on every run.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: qagent-migrate
+  namespace: qagent
+  labels:
+    app.kubernetes.io/name: qagent
+    app.kubernetes.io/component: migrate
+  annotations:
+    # Run before the Deployments in a Helm/ArgoCD sync. Plain `kubectl apply`
+    # ignores this, so apply the Job and wait for it first.
+    "helm.sh/hook": pre-install,pre-upgrade
+    "argocd.argoproj.io/sync-wave": "-1"
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 604800
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: qagent
+        app.kubernetes.io/component: migrate
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: migrate
+          image: ghcr.io/example/qagent:latest
+          command: ["python", "-m", "qagent.db_init"]
+          envFrom:
+            - configMapRef:
+                name: qagent-config
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: qagent-secrets
+                  key: database-url
+            - name: ADMIN_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: qagent-admin-secrets
+                  key: admin-database-url
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 256Mi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

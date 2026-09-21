@@ -351,10 +351,18 @@ def _persist_artifacts(
     column is what makes the difference machine-checkable rather than a claim
     in a docstring.
     """
+    #: Text evidence, all of which is scrubbed before it is stored. A HAR is
+    #: the one most worth getting right: it records headers verbatim by design,
+    #: so an unscrubbed one is a bearer token in a file built to be shared.
+    #: `modules/evidence/har.py` already redacts on the way in; scrubbing again
+    #: here is deliberate defence in depth, and it is what lets the `scrubbed`
+    #: column be true rather than aspirational.
+    scrubbable = {"log", "har", "trace"}
+
     for artifact in artifacts:
         data = artifact.data
         scrubbed = False
-        if artifact.kind == "log":
+        if artifact.kind in scrubbable:
             data = scrub(data.decode("utf-8", errors="replace")).encode("utf-8")
             scrubbed = True
 

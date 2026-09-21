@@ -177,6 +177,7 @@ def _execute_action(
     except Exception:  # noqa: BLE001 - reading .url is cosmetic; never worth aborting on
         resulting_url = None
 
+    errors = list(console_buffer) + list(page_error_buffer)
     return ActionOutcome(
         action=action,
         ok=True,
@@ -184,7 +185,25 @@ def _execute_action(
         resulting_fingerprint=None,
         console_errors=list(console_buffer),
         page_errors=list(page_error_buffer),
+        # Only when something went wrong. A screenshot of every successful
+        # click on a 40-action crawl is storage cost with no reader, and the
+        # capture itself costs a round trip to the renderer.
+        screenshot_png=_capture_screenshot(page) if errors else None,
     )
+
+
+def _capture_screenshot(page: Any) -> bytes | None:
+    """Best-effort evidence, never a reason to fail the action.
+
+    Mirrors `modules/browser/runner._capture_screenshot`, and for the same
+    reason: a page broken enough to be worth photographing is also a page whose
+    screenshot call can hang. That failure is not new information.
+    """
+    try:
+        return page.screenshot(type="png", timeout=5000)
+    except Exception as exc:  # noqa: BLE001 - see docstring
+        logger.warning("interactive screenshot capture failed: %s", exc)
+        return None
 
 
 def _interact(

@@ -320,6 +320,7 @@ def run_pipeline(
                 llm=llm,
                 auth_configured=auth_configured,
                 history=(history or {}).get(case.name, []),
+                base_url=base_url,
                 code_index=code_index,
             )
             result.outcomes.append(outcome)
@@ -560,7 +561,45 @@ def _action_outcome_to_case_outcome(outcome: ActionOutcome, llm: LlmClient) -> C
             failure_message=outcome.error,
             llm=llm,
         )
+        # The same evidence a page-load defect gets. Interactive defects went
+        # without it for no better reason than that nothing had wired it up,
+        # which left the hardest-to-reproduce findings the least documented.
+        case_outcome.artifacts.extend(
+            _browser_artifacts(
+                screenshot=outcome.screenshot_png,
+                log_lines=outcome.console_errors + outcome.page_errors,
+            )
+        )
     return case_outcome
+
+
+def _browser_artifacts(*, screenshot: bytes | None, log_lines: list[str]) -> list[ArtifactBytes]:
+    """Screenshot and console log, for whichever browser stage produced them.
+
+    Shared so the two stages cannot drift into documenting their defects
+    differently - which is exactly what had happened.
+    """
+    artifacts: list[ArtifactBytes] = []
+    if screenshot:
+        artifacts.append(
+            ArtifactBytes(
+                kind="screenshot",
+                content_type="image/png",
+                extension=".png",
+                data=screenshot,
+            )
+        )
+    log = "\n".join(line for line in log_lines if line)
+    if log:
+        artifacts.append(
+            ArtifactBytes(
+                kind="log",
+                content_type="text/plain",
+                extension=".log",
+                data=log.encode("utf-8"),
+            )
+        )
+    return artifacts
 
 
 def _page_check_to_outcome(check: PageCheckResult, llm: LlmClient) -> CaseOutcome:
@@ -602,25 +641,12 @@ def _page_check_to_outcome(check: PageCheckResult, llm: LlmClient) -> CaseOutcom
         )
         # Evidence, only for what actually became a bug report - a screenshot on
         # every passing page load would be pure storage cost for no reader.
-        if check.screenshot_png:
-            outcome.artifacts.append(
-                ArtifactBytes(
-                    kind="screenshot",
-                    content_type="image/png",
-                    extension=".png",
-                    data=check.screenshot_png,
-                )
+        outcome.artifacts.extend(
+            _browser_artifacts(
+                screenshot=check.screenshot_png,
+                log_lines=check.console_errors + check.page_errors,
             )
-        console_log = "\n".join(check.console_errors + check.page_errors)
-        if console_log:
-            outcome.artifacts.append(
-                ArtifactBytes(
-                    kind="log",
-                    content_type="text/plain",
-                    extension=".log",
-                    data=console_log.encode("utf-8"),
-                )
-            )
+        )
     return outcome
 
 
@@ -631,6 +657,7 @@ def _execute_and_triage(
     llm: LlmClient,
     auth_configured: bool,
     history: list[str],
+    base_url: str,
     code_index: RepositoryIndex | None = None,
 ) -> CaseOutcome:
     execution = runner.execute(case.spec)
@@ -684,5 +711,28 @@ def _execute_and_triage(
             llm=llm,
             index=code_index,
         )
+        # A HAR, not prose. "The handler returned 500" is a claim the reader has
+        # to take on faith and retype by hand; a HAR drops straight into Chrome
+        # DevTools, Insomnia or Postman and replays. Attached only to defects -
+        # one per passing check would be storage cost with no reader.
+        outcome.artifacts.append(
+            _har_artifact(base_url, execution, duration_ms=outcome.duration_ms)
+        )
 
     return outcome
+
+
+def _har_artifact(base_url: str, execution, *, duration_ms: int) -> ArtifactBytes:
+    from qagent.modules.evidence.har import har_for_check
+
+    return ArtifactBytes(
+        kind="har",
+        content_type="application/json",
+        extension=".har",
+        data=har_for_check(
+            base_url=base_url,
+            request=execution.request,
+            response=execution.response,
+            duration_ms=duration_ms,
+        ),
+    )

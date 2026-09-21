@@ -1810,6 +1810,9 @@ def perf(
         "100,500,1000,5000", "--vus", help="Comma-separated VU levels, one scenario each."
     ),
     duration: float = typer.Option(30.0, "--duration", help="Seconds per scenario."),
+    tool: str = typer.Option(
+        "k6", "--tool", help="Load generator: k6 (default) or jmeter."
+    ),
     path: list[str] = typer.Option(
         ["/"], "--path", "-p", help="GET path to hit, relative to --url. Repeatable."
     ),
@@ -1821,7 +1824,7 @@ def perf(
     ),
     output: Path | None = typer.Option(None, "--json", help="Write all scenario results as JSON."),
 ) -> None:
-    """Load testing via k6 (CLAUDE.md section 17): `qagent perf`.
+    """Load testing (CLAUDE.md section 17): `qagent perf`.
 
     Runs one scenario per VU level, sequentially, so degradation as load rises is
     visible scenario-to-scenario rather than confounded by simultaneous runs
@@ -1833,13 +1836,47 @@ def perf(
     (also named in CLAUDE.md section 17) need an agent on the target host, which
     a load generator has no way to provide - out of scope here for that reason,
     not from an oversight.
+
+    `--tool jmeter` runs the same scenarios through Apache JMeter instead. k6 is
+    the better default - one binary, JSON summary, no XML - but a team with
+    existing JMeter expertise and CI should not have to abandon it to use
+    QAgent. Both report into one metric shape, so thresholds and the quality
+    gate cannot tell which generator ran.
     """
-    from qagent.modules.performance.k6 import K6Error, K6Unavailable, run_load_test
+    from qagent.modules.performance.k6 import K6Error, K6Unavailable, LoadTestResult, run_load_test
 
     vus_levels = _parse_vus_levels(vus)
 
+    if tool not in {"k6", "jmeter"}:
+        console.print(f"[red]unknown load generator {tool!r}; expected k6 or jmeter[/red]")
+        raise typer.Exit(code=2)
+
     try:
-        result = run_load_test(url, vus_levels=vus_levels, duration_seconds=duration, paths=path)
+        if tool == "jmeter":
+            from qagent.modules.performance.jmeter import (
+                JMeterError,
+                JMeterUnavailable,
+                run_jmeter,
+            )
+
+            try:
+                result = LoadTestResult(
+                    base_url=url,
+                    scenarios=[
+                        run_jmeter(url, vus=level, duration_seconds=duration, paths=path)
+                        for level in vus_levels
+                    ],
+                )
+            except JMeterUnavailable as exc:
+                console.print(f"[red]{exc}[/red]")
+                raise typer.Exit(code=2) from exc
+            except JMeterError as exc:
+                console.print(f"[red]jmeter error:[/red] {exc}")
+                raise typer.Exit(code=2) from exc
+        else:
+            result = run_load_test(
+                url, vus_levels=vus_levels, duration_seconds=duration, paths=path
+            )
     except K6Unavailable as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=2) from exc
@@ -1848,7 +1885,11 @@ def perf(
         raise typer.Exit(code=2) from exc
 
     console.print(
-        Panel(f"[bold]{result.base_url}[/bold]", title="QAgent perf", border_style="blue")
+        Panel(
+            f"[bold]{result.base_url}[/bold]\ngenerator: {tool}",
+            title="QAgent perf",
+            border_style="blue",
+        )
     )
 
     table = Table(show_header=True, header_style="bold")

@@ -1500,9 +1500,34 @@ def dashboard(org_id: UUID = Depends(current_org), session: Session = Depends(ge
         )
     ).scalar_one()
 
+    # CLAUDE.md section 4's headline number. Computed from what this
+    # organization has actually measured, and returned with the breakdown -
+    # a score nobody can trace becomes dashboard decoration
+    # (modules/quality/score.py).
+    from qagent.modules.quality.score import compute as compute_score
+
+    quality = compute_score(
+        defects={
+            (k.value if hasattr(k, "value") else str(k)): v for k, v in severities.items()
+        }
+        if totals[0]
+        else None,
+        security_findings=(
+            {(k.value if hasattr(k, "value") else str(k)): v for k, v in security.items()}
+            if endpoints_total
+            else None
+        ),
+        coverage_ratio=(
+            None if endpoints_total == 0 else endpoints_covered / endpoints_total
+        ),
+        total_checks=int(totals[1] or 0),
+        flaky_checks=flaky,
+    )
+
     return {
         "projects": session.query(models.Project).count(),
         "runs": totals[0],
+        "quality": quality.to_dict(),
         "tests": {"total": totals[1], "passed": totals[2], "failed": totals[3], "flaky": flaky},
         "bugs": {(k.value if hasattr(k, "value") else str(k)): v for k, v in severities.items()},
         "security_findings": {

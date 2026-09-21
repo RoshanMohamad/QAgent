@@ -19,14 +19,15 @@ as one sentence, because the list stopped being readable:
 
 | Area | What exists |
 |---|---|
-| Core loop | Discovery (OpenAPI + static route parsing), Test Planner (agent 2), rule-based generation, SSRF-guarded execution, rules-first triage, defect reports |
+| Core loop | Discovery (OpenAPI + static route parsing), Test Planner (agent 2), rule-based generation, SSRF-guarded execution, rules-first triage, defect reports with [HAR evidence](#evidence-on-every-defect) |
 | Agents | Project Analyst (1), Test Planner (2), Generator + pytest emitter (3), Explorer — link-crawl and interactive (4), Bug Hunter / Failure Analyzer |
 | Repository intelligence | Stack detection, module tree, [repository RAG](#repository-rag) — symbol-level chunking, BM25 + optional embeddings, pgvector when configured — feeding root-cause evidence into bug reports |
-| Browser | E2E page checks, interactive exploration, self-healing selector proposals, [recorder extension](#browser-recorder) |
-| Security | Semgrep, Trivy and OWASP ZAP behind one severity vocabulary |
+| Browser | E2E page checks, interactive exploration, self-healing selector proposals, [recorder extension](#browser-recorder) → Playwright spec |
+| Security | Semgrep, Trivy and OWASP ZAP behind one severity vocabulary, plus a two-identity [IDOR probe](#broken-access-control-idor) |
 | CI/CD | [Quality gate](#quality-gate-and-ci) + GitHub Action, recorded gate/deployment history, [automatic alerts](#defect-history-and-alerts) with delivery tracking and retry |
+| Performance | k6 and Apache JMeter behind one metric shape |
 | Platform | Multi-tenancy with Postgres RLS, RBAC, rate limiting, `/metrics`, usage tracking, queue separation, [Alembic migrations](#schema-migrations), S3-compatible storage, OpenTelemetry spans |
-| Dashboard | Pass rate, defects and findings by severity, surface coverage, failure analysis, gate history |
+| Dashboard | [Quality score](#quality-score), pass rate, defects and findings by severity, surface coverage, failure analysis, gate history |
 
 See [Roadmap](#roadmap) for what is deliberately *not* built and what remains open.
 
@@ -43,8 +44,10 @@ Current measured performance against the reference fixture:
 Reproduce these numbers yourself with the [two commands below](#try-it). A second
 fixture, a different framework (Flask) with a deliberately *harder* defect — see
 [Evaluating against a second fixture](#evaluating-against-a-second-fixture) —
-scores 5 of 6 (83%), because it seeds one defect (an IDOR) the rule set honestly
-cannot catch yet, still at 0% false positives.
+now scores **6 of 6 at 0% false positives**. It read 5 of 6 for a long time: the
+sixth is an IDOR, and no generator rule could reach it because every rule tests
+one identity at a time. It is now found by a [probe](#broken-access-control-idor)
+that compares two.
 
 **Verified:** the pipeline (discovery, planning, generation, execution, triage,
 reporting), the CLI, the eval harness, **543 unit tests** and lint — all run
@@ -134,17 +137,25 @@ cd packages/fixtures/task-tracker && flask --app app run --port 8081 &
 qagent evaluate --url http://127.0.0.1:8081 --name task-tracker --fixtures packages/fixtures
 ```
 
+> **Restart the fixture between runs.** Generation deliberately produces
+> destructive cases, and `DELETE /tasks/1` removes the row the IDOR probe uses
+> as evidence — so a second `evaluate` against the same process reads 5/6
+> instead of 6/6. The fixture holds its data in memory, so restarting it is the
+> reset. CI starts a fresh one per job and is unaffected; this bites only when
+> re-running locally.
+
 Five of the six are the same categories the seven generator rules already catch
 (missing/wrong-type fields, a malformed or absent identifier, unenforced auth),
 seeded independently to show the rules generalise rather than being tuned to one
-app. The sixth, BUG-201, is seeded deliberately because the rules **cannot**
-catch it: it's an IDOR — any authenticated user can read any other user's task
-by id — and every one of the seven rules tests one identity at a time, never two
-identities' access to the same resource (CLAUDE.md section 12 names IDOR
-explicitly; it isn't implemented). The endpoint passes every other generated
-check, which is exactly the point: `seeded_defects.yaml` records it as a known,
-honest miss rather than quietly avoiding the one case that would expose the gap.
-Reported: 5/6 detected, **0% false positives**.
+app. The sixth, BUG-201, is an IDOR — any authenticated user can read any other
+user's task by id — and it passes every generated check, because each rule tests
+one identity at a time.
+
+It was recorded in `seeded_defects.yaml` as a known, honest miss for as long as
+that was true, rather than quietly dropping the one case that exposed the gap.
+It is now detected by the [IDOR probe](#broken-access-control-idor), and the
+fixture declares the two identities that make it detectable at all. Reported:
+**6/6 detected, 0% false positives.**
 
 Other commands:
 
@@ -697,6 +708,125 @@ made from*, because recomputing it later against today's open defects gives a
 different and useless answer. Reporting can never fail the gate: a QAgent API
 having a bad minute must not turn a passing build red.
 
+### Broken access control (IDOR)
+
+The one class of defect a generator rule cannot reach. Every rule builds one
+self-contained request from an endpoint's shape; IDOR is by definition the
+*difference between what two identities can reach*, and confirming it needs
+state — you must learn an identifier belonging to user A before asking whether
+user B can read it.
+
+So it is a probe, not a rule:
+
+```bash
+qagent idor --url http://127.0.0.1:8081   -H "Authorization: Bearer alice-token"   --header2 "Authorization: Bearer bob-token"
+```
+
+```text
+1 endpoint(s) probed with two identities
+1 finding(s)
+
+Broken object-level authorization (IDOR)
+endpoint   GET /tasks/{task_id}
+severity   high        cwe  CWE-639
+
+A second authenticated identity received the identical response for /tasks/1 as
+the identity that owns it (HTTP 200).
+```
+
+Three steps: list a collection as A, take an identifier, request it as B. Four
+things it refuses to do, because an access-control scanner that cries wolf gets
+switched off:
+
+- **A 200 is not evidence.** Plenty of APIs legitimately return a shared or
+  filtered resource to anyone authenticated. Only an *equal* response —
+  compared as parsed JSON, so formatting can neither hide a leak nor fake one —
+  proves B read A's row.
+- **Write methods are never probed.** Confirming that B can `DELETE` A's order
+  requires deleting A's order.
+- **An unprotected endpoint is not an authorization failure**, it is a public
+  endpoint.
+- **"Could not check" is never reported as "clean."** An endpoint with no
+  listable collection comes back `inconclusive`, with the reason.
+
+Supply a second identity to `run_pipeline` and the probe joins the normal loop,
+folding findings in as `api_security` so they share one persistence path, one
+dashboard and one quality gate with everything else.
+
+**It runs before the generated cases, not after** — which was a bug first. The
+probe is read-only and needs the application's data as it found it; generation
+deliberately produces destructive cases, and `DELETE /tasks/1` had already
+removed the row the probe was about to use as evidence. A read-only check
+downstream of a destructive one is measuring a different application.
+
+### Evidence on every defect
+
+A defect report that says "the handler returned 500" is a claim the reader has
+to take on faith and retype by hand to reproduce. Every defect now ships with a
+**HAR** — the format Chrome DevTools, Insomnia, Postman, Charles and Fiddler all
+import — so reproducing it is dropping a file into a tool the developer already
+has open, with no QAgent involved.
+
+| Defect from | Evidence |
+|---|---|
+| API check | HAR (replayable request + response) |
+| Browser page check | Screenshot, console log |
+| Interactive exploration | Screenshot, console log |
+
+The last row is new, and its absence was not a decision — nothing had wired it
+up, which left the hardest-to-reproduce findings the least documented. Both
+browser stages now share one helper so they cannot drift apart again.
+
+**A HAR records headers verbatim; that is the point of the format and also the
+risk.** An unscrubbed one is a live bearer token in a file built to be shared.
+So credential-bearing headers are replaced outright rather than pattern-matched
+(a session cookie has no shape to recognise), the body scrubber runs over
+everything else, bodies are truncated, and `persistence.py` scrubs again on the
+way to storage — which is what lets the `scrubbed` column be true rather than
+aspirational.
+
+Evidence is attached only to outcomes that became defects. A screenshot of every
+passing page load is storage cost with no reader.
+
+### Quality score
+
+CLAUDE.md section 4 puts `87/100` at the top of the dashboard. A single number
+summarising a codebase is the easiest thing in this project to do badly — done
+badly it moves for reasons nobody can trace, and becomes decoration.
+
+```text
+QA HEALTH
+
+Overall Score                 78/100  (watch)
+
+  defects       -10.0 pts     3 open (1 at high or critical)
+  security       -2.0 pts     2 open finding(s)
+  coverage       -4.0 pts     80% of the discovered API surface exercised
+  reliability    -1.0 pts     2 flaky, 0 errored of 40
+  performance   not measured  no load test has run
+
+Fix first: defects
+```
+
+Three rules keep it honest:
+
+- **Every point lost is attributable.** The score is 100 minus *named*
+  penalties, returned with the breakdown and a `fix_first`. "87/100" alone is
+  not a product; the breakdown is.
+- **Nothing unmeasured is scored.** A project with no load test is not penalised
+  for it — the dimension is marked `not_measured` and the remaining weights
+  renormalise. Otherwise the score rewards running scanners rather than fixing
+  defects, and a team that cannot run one watches it sit low forever.
+- **An unmeasured project is `not measured`, not `critical`.** It scores 0 —
+  a new project must not look perfect — but grading that "critical" is a
+  different lie, and one that teaches the user to distrust the number before it
+  has told them anything.
+
+Weights are stated in `modules/quality/score.py` rather than hidden. They are a
+judgement call, and writing them where they can be argued with is the honest
+form of that. Open defects dominate deliberately: a score where "we ran a load
+test" offsets "two critical bugs are open" is measuring the wrong thing.
+
 ### Coverage, storage, tracing
 
 Three smaller pieces, each with one decision worth stating.
@@ -748,6 +878,24 @@ wrong about instrumentation. Sampling, retention and backend choice are still
 deferred; OTLP keeps them the operator's.
 
 ### Performance testing
+
+Two generators, one metric shape:
+
+```bash
+qagent perf --url http://127.0.0.1:8080 --vus 100,500,1000
+qagent perf --url http://127.0.0.1:8080 --tool jmeter
+```
+
+k6 stays the default — one Go binary, a JSON summary, no XML. JMeter is
+supported because CLAUDE.md names it and because a team with existing JMeter
+expertise, test plans and CI should not have to abandon them to use QAgent.
+
+They report differently and the difference is not cosmetic: k6 hands back
+pre-aggregated metrics, JMeter writes a per-sample CSV and expects the reader to
+aggregate. So QAgent computes JMeter's percentiles itself, using nearest-rank to
+match JMeter's own HTML report — two tools disagreeing about what "p95" means
+while writing into the same column would make the number incomparable across
+runs with nothing looking wrong.
 
 Load testing against a live target via k6 (CLAUDE.md §17):
 
@@ -1164,29 +1312,23 @@ a change that degrades detection or raises false positives fails the build.
 
 ## Roadmap
 
-Phase 1, the dashboard, `compose` mode, route parsing, a first browser E2E
-layer, the Explorer Agent (link-crawl and interactive), self-healing selector
-proposals, GitHub + Jira issue sync, the repository analyzer / Project Analyst
-agent (`qagent analyze`, agent 1), the Test Planner (`qagent plan`, agent 2),
-repository RAG (`qagent index` / `qagent search`, root-cause evidence on bug
-reports), the quality gate and GitHub Action (`qagent gate`, `action.yml`),
-the pytest emitter (`qagent emit`, agent 3), Alembic migrations, Trivy and ZAP
-(`qagent security`, `qagent dast`), S3-compatible storage, OpenTelemetry spans,
-surface coverage, defect history (`bug_events`), notifications, the browser
-recorder (`apps/extension/`, `qagent record-import`),
-and evidence artifacts on browser-found bugs
-(screenshot + scrubbed console log, real storage, `GET /api/v1/artifacts/{id}`)
-are done and tested.
+**CLAUDE.md phases 1-5 are complete.** The last items closed were the Playwright
+emitter (`qagent record-import --playwright`, verified driving a real browser),
+the IDOR probe ([`qagent idor`](#broken-access-control-idor)) which took
+[task-tracker](packages/fixtures/task-tracker) from 5/6 to 6/6,
+[HAR evidence](#evidence-on-every-defect) on every defect, the
+[quality score](#quality-score), and JMeter alongside k6.
 
-Still open within CLAUDE.md phases 1-5: a **Playwright emitter** for the browser
-layer — the pytest emitter covers API checks (`qagent emit`) and the recorder
-produces a UI-flow document, but nothing yet renders that document to a
-`.spec.ts`; **HAR/trace evidence**, and evidence on API and
-interactive-exploration bugs rather than only browser-E2E ones (the same
-`Artifact` mechanism, extended); and the **IDOR-shaped gap** that
-[task-tracker](packages/fixtures/task-tracker)'s BUG-201 documents — no
-generator rule yet compares two identities, which is the one seeded defect the
-rules honestly cannot catch.
+What remains is deliberately deferred rather than pending — see below, and
+[ADR-0008](docs/decisions/ADR-0008-phase-6-scope.md). The honest list of things
+that would come next, none of which are CLAUDE.md requirements:
+
+- **Playwright `trace.zip`** on browser defects. The HAR covers the network
+  side; a trace adds DOM snapshots and is strictly better evidence, at the cost
+  of tens of megabytes per failure — worth doing once there is a retention
+  policy to size it against.
+- **GitLab and Bitbucket** (§5 says GitHub first, and only GitHub is built).
+- **More fixtures**, which is the highest-leverage work at any point.
 
 Phase 6 (CLAUDE.md §23) is scoped, not skipped — see
 [ADR-0008](docs/decisions/ADR-0008-phase-6-scope.md). Built: RBAC (`require_owner`

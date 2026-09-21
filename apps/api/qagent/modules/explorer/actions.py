@@ -92,6 +92,11 @@ class ActionOutcome:
     error: str | None = None
     console_errors: list[str] = field(default_factory=list)
     page_errors: list[str] = field(default_factory=list)
+    #: In-memory only, exactly as `PageCheckResult.screenshot_png` is: this
+    #: module has no database and no storage import. Captured here because an
+    #: interactive defect deserves the same evidence a page-load defect gets,
+    #: and `pipeline.py` decides whether it became a bug worth storing one for.
+    screenshot_png: bytes | None = None
 
 
 @dataclass

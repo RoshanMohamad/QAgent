@@ -155,6 +155,18 @@ class Project(Base, TimestampMixin):
     # Output of the Project Analyst agent (CLAUDE.md section 8, agent 1).
     stack: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
 
+    #: Where to send alerts, and for which events:
+    #: ``{"channel": "slack", "target": "https://...", "events": [...]}``.
+    #:
+    #: Per project rather than per deployment because this platform is
+    #: multi-tenant: one org's defects must not page another org's channel.
+    #: Empty means notifications are off, which is the default - a QA tool that
+    #: starts posting to a webhook nobody configured is a tool people mute.
+    #:
+    #: The target is a URL this server will fetch, so it goes through the same
+    #: SSRF guard as every other user-supplied address (modules/notify).
+    notify: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+
     organization: Mapped[Organization] = relationship(back_populates="projects")
     environments: Mapped[list[Environment]] = relationship(
         back_populates="project", cascade="all, delete-orphan"

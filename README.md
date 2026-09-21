@@ -24,8 +24,9 @@ as one sentence, because the list stopped being readable:
 | Repository intelligence | Stack detection, module tree, [repository RAG](#repository-rag) — symbol-level chunking, BM25 + optional embeddings, pgvector when configured — feeding root-cause evidence into bug reports |
 | Browser | E2E page checks, interactive exploration, self-healing selector proposals, [recorder extension](#browser-recorder) |
 | Security | Semgrep, Trivy and OWASP ZAP behind one severity vocabulary |
-| CI/CD | [Quality gate](#quality-gate-and-ci) + GitHub Action, gate/deployment history, notifications |
+| CI/CD | [Quality gate](#quality-gate-and-ci) + GitHub Action, recorded gate/deployment history, [automatic alerts](#defect-history-and-alerts) with delivery tracking and retry |
 | Platform | Multi-tenancy with Postgres RLS, RBAC, rate limiting, `/metrics`, usage tracking, queue separation, [Alembic migrations](#schema-migrations), S3-compatible storage, OpenTelemetry spans |
+| Dashboard | Pass rate, defects and findings by severity, surface coverage, failure analysis, gate history |
 
 See [Roadmap](#roadmap) for what is deliberately *not* built and what remains open.
 
@@ -646,6 +647,55 @@ section 22 requires for the runner/browser/explorer stages applies here, so it
 also runs synchronously via `POST /api/v1/projects/{id}/security/scan` (given
 a `repo_path` readable by the API process), persisting findings the same way a
 bug does: they show up in the dashboard and count toward the quality gate.
+
+### Defect history and alerts
+
+A `Bug` row carries the current status and nothing else, which cannot answer the
+questions a defect is actually asked: how long has this been open, and did it
+come back after we closed it. `bug_events` answers both.
+
+It also fixed a real miscount. Persistence used to insert a defect row
+unconditionally, so one bug surviving ten runs became ten `BUG-` references and
+the dashboard counted it ten times. Identity is now the *test case* — not the
+title, which a model rewrites between runs — so a repeat is an update plus a
+history entry:
+
+```text
+GET /bugs/{id}/history
+
+opened          → high
+reproduced
+reopened        closed → open     ← a regression, not a new defect
+severity_changed  high → critical
+reopen_count: 1
+```
+
+The retrieved "affected code" from [repository RAG](#repository-rag) is written
+alongside as a **generated comment** (`generated: true`), so a machine's opinion
+sits next to the human discussion and is never mistaken for it.
+
+**Alerts fire on their own.** A blocked gate and a critical defect send to a
+Slack or webhook target configured per *project* — per deployment would let one
+org's defects page another org's channel. The default event set is short on
+purpose: a notifier that fires on everything gets muted, and a muted notifier is
+worse than none because the team stops watching the dashboard expecting to be
+paged.
+
+Delivery is recorded rather than assumed. A failed send leaves a row with the
+error and an attempt count, and `qagent.retry_notifications` turns that row back
+into an attempt — up to five, after which it is marked `abandoned` rather than
+sitting at `failed` forever, indistinguishable from one still waiting.
+
+```bash
+PUT /api/v1/projects/{id}/notify-config   # where alerts go
+GET /api/v1/projects/{id}/notifications   # what was delivered, and what failed
+```
+
+Gate decisions are recorded the same way. `qagent gate --report-to $QAGENT_API_URL
+--project $ID` stores the verdict *with the policy and per-check numbers it was
+made from*, because recomputing it later against today's open defects gives a
+different and useless answer. Reporting can never fail the gate: a QAgent API
+having a bad minute must not turn a passing build red.
 
 ### Coverage, storage, tracing
 

@@ -6,15 +6,25 @@
 # generator's seven rules already catch, seeded independently here to show the
 # rules generalise rather than being fit to buggy-shop specifically.
 #
-# BUG-201 is different on purpose: it is a real defect (an IDOR - any
-# authenticated user can read any other user's task by id) that the current rule
-# set cannot detect, because every rule in generator/rules.py tests one identity
-# at a time. Catching it needs a check that compares what *two different*
-# credentials can read - CLAUDE.md section 12 lists IDOR by name as an API
-# security test, and it is explicitly not implemented yet (see README Roadmap).
-# `expected_class: real_bug` and `detected: false` on this entry is not a bug in
-# the harness; it is the harness telling the truth about a known gap instead of
-# a fixture quietly avoiding the one case that would surface it.
+# BUG-201 is an IDOR: any authenticated user can read any other user's task by
+# id. It was a documented detection gap for a long time, because every rule in
+# generator/rules.py tests one identity at a time and IDOR is by definition the
+# difference between what *two* identities can reach.
+#
+# It is now detected, by a probe rather than a rule
+# (modules/security/idor.py): list a collection as the first identity, take an
+# identifier, request it as the second, and compare the bodies. That needs two
+# sets of credentials, which is why this file declares `identities` below - a
+# fixture seeding an authorization defect has to say who the second caller is,
+# or the harness would score the pipeline against a defect it was never given
+# the means to see.
+
+# Two real users, both valid. Alice owns task 1, Bob owns task 2 (app.py).
+identities:
+  primary:
+    Authorization: "Bearer task-tracker-alice-token"
+  secondary:
+    Authorization: "Bearer task-tracker-bob-token"
 
 fixture: task-tracker
 description: Flask task tracker with six seeded defects, one of them (BUG-201) a
@@ -26,8 +36,7 @@ defects:
     title: Any authenticated user can read any other user's task (IDOR)
     expected_class: real_bug
     expected_severity: high
-    detect_with: "known gap: requires comparing two distinct identities"
-    known_undetectable: true
+    detect_with: "IDOR probe: two identities receive the identical body"
     notes: >
       The handler authenticates the caller correctly and validates the identifier
       correctly (malformed -> 400, absent -> 404, no/invalid token -> 401), so

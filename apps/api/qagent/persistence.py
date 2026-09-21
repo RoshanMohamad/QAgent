@@ -181,6 +181,62 @@ def _record_event(
     )
 
 
+def _record_code_evidence(
+    session: Session, *, bug: models.Bug, report: dict, is_new: bool
+) -> None:
+    """Persist the retrieved "affected code" as a machine-authored comment.
+
+    Repository RAG (modules/rag/) works out which function explains a defect,
+    and until now that answer only ever reached the terminal - nothing wrote it
+    down, so the dashboard and the API never saw it. A generated comment is the
+    right home: it is attributable (``generated=True`` distinguishes a
+    machine's opinion from a colleague's), it lives alongside the human
+    discussion, and it does not pretend to be part of the defect's definition.
+
+    Written once per distinct location rather than on every run, because a
+    defect that reproduces fifty times should not accumulate fifty identical
+    comments.
+    """
+    location = report.get("affected_location")
+    if not location:
+        return
+
+    if not is_new:
+        already = session.execute(
+            select(models.BugComment).where(
+                models.BugComment.bug_id == bug.id,
+                models.BugComment.generated.is_(True),
+                models.BugComment.body.contains(str(location)),
+            )
+        ).first()
+        if already:
+            return
+
+    others = [
+        entry.get("location")
+        for entry in (report.get("affected_code") or [])
+        if entry.get("location") and entry.get("location") != location
+    ]
+
+    body = f"Likely cause: `{location}`"
+    if report.get("root_cause"):
+        body += f"\n\n{report['root_cause']}"
+    if others:
+        body += "\n\nAlso retrieved: " + ", ".join(f"`{o}`" for o in others[:3])
+
+    session.add(
+        models.BugComment(
+            org_id=bug.org_id,
+            bug_id=bug.id,
+            # No author: QAgent wrote this, and attributing it to whoever last
+            # logged in would misrepresent where the claim came from.
+            author_user_id=None,
+            body=body,
+            generated=True,
+        )
+    )
+
+
 def _upsert_bug(
     session: Session,
     *,
@@ -223,6 +279,7 @@ def _upsert_bug(
         _record_event(
             session, bug=bug, event="opened", run_id=run.id, to_value=severity.value
         )
+        _record_code_evidence(session, bug=bug, report=report, is_new=True)
         metrics.DEFECTS_TOTAL.labels(severity=severity.value).inc()
         return bug
 
@@ -265,6 +322,11 @@ def _upsert_bug(
         )
     else:
         _record_event(session, bug=existing, event="reproduced", run_id=run.id)
+
+    # Re-checked on every run, not just on open: if the code moved, the
+    # retrieved location changed, and the old comment now points at a line
+    # that means something else.
+    _record_code_evidence(session, bug=existing, report=report, is_new=False)
 
     session.flush()
     return existing

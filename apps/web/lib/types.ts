@@ -20,12 +20,28 @@ export type RunStatus =
   | "error"
   | "cancelled";
 
+/**
+ * Coverage of the API *surface*, not of lines.
+ *
+ * QAgent tests the application as a black box and never instruments it, so it
+ * cannot produce line coverage. `measures` carries that sentence from the API
+ * and the UI shows it, because "82%" on a dashboard is read as a claim about
+ * tested code paths and this is not one.
+ */
+export interface SurfaceCoverage {
+  endpoints_total: number;
+  endpoints_covered: number;
+  endpoint_percent: number;
+  measures: string;
+}
+
 export interface DashboardSummary {
   projects: number;
   runs: number;
   tests: { total: number; passed: number; failed: number; flaky: number };
   bugs: Partial<Record<Severity, number>>;
   security_findings: Partial<Record<Severity, number>>;
+  coverage: SurfaceCoverage;
   llm_spend_usd: number;
   generated_at: string;
 }
@@ -107,6 +123,48 @@ export interface PerformanceRun {
   latency_max_ms: number;
   passed: boolean;
   created_at: string;
+}
+
+export interface BugEvent {
+  event: string;
+  from: string | null;
+  to: string | null;
+  run_id: string | null;
+  at: string;
+}
+
+export interface BugComment {
+  id: string;
+  body: string;
+  /** True when QAgent wrote it - a machine's opinion, not a colleague's. */
+  generated: boolean;
+  author_user_id: string | null;
+  at: string;
+}
+
+export interface BugHistory {
+  bug: {
+    id: string;
+    reference: string;
+    title: string;
+    severity: Severity;
+    status: string;
+    first_seen: string;
+  };
+  events: BugEvent[];
+  comments: BugComment[];
+  /** How often this defect came back after being closed. */
+  reopen_count: number;
+}
+
+export interface GateRecord {
+  id: string;
+  result: "pass" | "block" | "error";
+  reason: string | null;
+  commit_sha: string | null;
+  trigger: string;
+  checks: { name: string; passed: boolean; detail: string }[];
+  at: string;
 }
 
 export interface QualityGate {

@@ -36,6 +36,23 @@ _CLASS_STYLE = {
 }
 
 
+def _parse_headers(items: list[str]) -> dict[str, str]:
+    """Parse `--header "Name: value"` pairs.
+
+    A malformed entry is reported and skipped rather than raising: losing one
+    header should not discard a whole command's invocation, and the warning
+    makes the omission visible.
+    """
+    headers: dict[str, str] = {}
+    for item in items:
+        if ":" not in item:
+            console.print(f"[red]ignoring malformed header:[/red] {item}")
+            continue
+        name, _, value = item.partition(":")
+        headers[name.strip()] = value.strip()
+    return headers
+
+
 def _render(result: PipelineResult, *, verbose: bool) -> None:
     summary = result.summary()
 
@@ -202,13 +219,7 @@ def scan(
     ),
 ) -> None:
     """Discover, generate, execute and triage API checks against a running app."""
-    auth_headers: dict[str, str] = {}
-    for item in header:
-        if ":" not in item:
-            console.print(f"[red]ignoring malformed header:[/red] {item}")
-            continue
-        name, _, value = item.partition(":")
-        auth_headers[name.strip()] = value.strip()
+    auth_headers = _parse_headers(header)
 
     settings = get_settings()
     result = run_pipeline(
@@ -748,6 +759,9 @@ def record_import(
     out: Path | None = typer.Option(
         None, "--out", "-o", help="Directory to emit runnable pytest files into."
     ),
+    playwright_out: Path | None = typer.Option(
+        None, "--playwright", help="Directory to emit the UI flow as a Playwright spec into."
+    ),
     output: Path | None = typer.Option(None, "--json", help="Write the converted session."),
 ) -> None:
     """Turn a recorded browser session into tests (CLAUDE.md section 10).
@@ -827,6 +841,21 @@ def record_import(
             cases, base_url=base_url or session.start_url or "http://localhost", out_dir=out
         )
         console.print(f"\n[dim]wrote {report.case_count} test(s) to {out}[/dim]")
+
+    if playwright_out:
+        from qagent.modules.emitter.playwright_emitter import emit as emit_playwright
+
+        spec = emit_playwright(flow, out_dir=playwright_out)
+        console.print(
+            f"[dim]wrote a {spec.step_count}-step Playwright spec to "
+            f"{playwright_out / spec.path}[/dim]"
+        )
+        if spec.required_env:
+            # Surfaced rather than buried: a spec that needs a secret nobody
+            # set fails in a way that reads like an application bug.
+            console.print(
+                f"  [yellow]set before running:[/yellow] {', '.join(spec.required_env)}"
+            )
 
     if output:
         output.write_text(
@@ -929,6 +958,18 @@ def gate(
     max_errors: int | None = typer.Option(
         None, "--max-errors", help="Errored checks allowed (usually infrastructure, not defects)."
     ),
+    report_to: str | None = typer.Option(
+        None, "--report-to", help="QAgent API to record this decision against ($QAGENT_API_URL)."
+    ),
+    project: str | None = typer.Option(
+        None, "--project", help="Project id to record the decision under ($QAGENT_PROJECT_ID)."
+    ),
+    api_token: str | None = typer.Option(
+        None, "--api-token", help="Bearer token for the QAgent API ($QAGENT_TOKEN)."
+    ),
+    commit: str | None = typer.Option(
+        None, "--commit", help="Commit SHA this gate ran against, recorded with the decision."
+    ),
     output: Path | None = typer.Option(None, "--json", help="Write the decision as JSON."),
 ) -> None:
     """Run QA and exit non-zero if the result should block a deploy.
@@ -941,13 +982,7 @@ def gate(
     """
     from qagent.modules.gate.policy import GatePolicy, evaluate, render
 
-    auth_headers: dict[str, str] = {}
-    for item in header:
-        if ":" not in item:
-            console.print(f"[red]ignoring malformed header:[/red] {item}")
-            continue
-        name, _, value = item.partition(":")
-        auth_headers[name.strip()] = value.strip()
+    auth_headers = _parse_headers(header)
 
     settings = get_settings()
     result = run_pipeline(
@@ -1001,7 +1036,50 @@ def gate(
         )
         console.print(f"[dim]wrote {output}[/dim]")
 
+    _report_gate(decision, report_to=report_to, project=project, token=api_token, commit=commit)
+
     raise typer.Exit(code=decision.exit_code)
+
+
+def _report_gate(
+    decision: Any,
+    *,
+    report_to: str | None,
+    project: str | None,
+    token: str | None,
+    commit: str | None,
+) -> None:
+    """Record the verdict against a QAgent deployment, if one is configured.
+
+    Deliberately after the report is printed and before the exit code is
+    raised, and deliberately incapable of failing the gate: a QAgent API having
+    a bad minute must not turn a passing build red. Reporting is bookkeeping;
+    the exit code is the decision.
+    """
+    import os
+
+    from qagent.modules.client import QAgentClient
+
+    project_id = project or os.environ.get("QAGENT_PROJECT_ID")
+    client = QAgentClient.from_env(report_to, token)
+
+    if client is None or not project_id:
+        if client is not None and not project_id:
+            console.print(
+                "[yellow]--report-to given without --project; decision not recorded[/yellow]"
+            )
+        return
+
+    outcome = client.record_gate(
+        project_id,
+        decision=decision.to_dict(),
+        commit_sha=commit or os.environ.get("GITHUB_SHA"),
+        trigger="ci" if os.environ.get("CI") else "manual",
+    )
+    if outcome.ok:
+        console.print(f"[dim]recorded gate decision {outcome.record_id or ''}[/dim]")
+    else:
+        console.print(f"[yellow]could not record the decision:[/yellow] {outcome.detail}")
 
 
 @app.command()
@@ -1518,6 +1596,116 @@ def security(
 
     threshold = _SEVERITY_RANK.get(fail_on, 3)
     if any(_SEVERITY_RANK.get(sev, 0) >= threshold and n for sev, n in counts.items()):
+        raise typer.Exit(code=1)
+
+
+@app.command()
+def idor(
+    url: str = typer.Option(..., "--url", "-u", help="Base URL of the running application."),
+    header: list[str] = typer.Option(
+        [], "--header", "-H", help="First identity's auth header."
+    ),
+    header2: list[str] = typer.Option(
+        [], "--header2", help="Second identity's auth header. Required."
+    ),
+    spec: str | None = typer.Option(None, "--spec", "-s", help="Explicit OpenAPI document URL."),
+    repo: Path | None = typer.Option(None, "--repo", help="Repo root for static route parsing."),
+    timeout: float = typer.Option(30.0, "--timeout", help="Per-request timeout in seconds."),
+    output: Path | None = typer.Option(None, "--json", help="Write findings as JSON."),
+) -> None:
+    """Probe for broken object-level authorization (CLAUDE.md section 12).
+
+    Needs two real identities, which is why it is a separate command: every
+    generated rule tests one identity at a time, and IDOR is by definition the
+    difference between what two of them can reach.
+
+    Three steps per endpoint: list a collection as the first identity, take an
+    identifier from it, then request that identifier as the second. A match
+    between the two responses is the defect. Only safe methods are probed -
+    confirming a write-side IDOR would mean writing to someone else's data.
+    """
+    import httpx
+
+    from qagent.modules.runner.executor import TargetRejected, guard_target
+    from qagent.modules.security.idor import probe_endpoints
+    from qagent.pipeline import discover
+
+    primary = _parse_headers(header)
+    secondary = _parse_headers(header2)
+
+    if not secondary:
+        console.print(
+            "[red]--header2 is required:[/red] an IDOR probe compares two identities, "
+            "and with only one there is nothing to compare."
+        )
+        raise typer.Exit(code=2)
+    if primary == secondary:
+        # Silently probing one identity against itself would report a clean
+        # result that means nothing at all.
+        console.print("[red]both identities are identical; nothing would be proven[/red]")
+        raise typer.Exit(code=2)
+
+    settings = get_settings()
+    try:
+        guard_target(
+            url, allow_private=not settings.is_production, allowlist=settings.egress_allowlist
+        )
+    except TargetRejected as exc:
+        console.print(f"[red]target rejected by egress policy:[/red] {exc}")
+        raise typer.Exit(code=2) from exc
+
+    endpoints, _ = discover(url, spec, repo)
+    if not endpoints:
+        console.print("[red]no endpoints discovered; nothing to probe[/red]")
+        raise typer.Exit(code=2)
+
+    identities = {"primary": primary, "secondary": secondary}
+
+    with httpx.Client(base_url=url.rstrip("/"), timeout=timeout) as client:
+
+        def request(method: str, path: str, identity: str):
+            try:
+                response = client.request(method, path, headers=identities[identity])
+            except httpx.HTTPError:
+                return None, None, None
+            try:
+                parsed = response.json()
+            except ValueError:
+                parsed = None
+            return response.status_code, response.text, parsed
+
+        result = probe_endpoints(endpoints, request=request)
+
+    console.print(
+        Panel(
+            f"[bold]{url}[/bold]\n{result.probed} endpoint(s) probed with two identities\n"
+            f"{len(result.findings)} finding(s)",
+            title="QAgent IDOR",
+            border_style="blue",
+        )
+    )
+
+    for endpoint_key, reason in sorted(result.inconclusive.items()):
+        console.print(f"[yellow]inconclusive[/yellow] {endpoint_key}: {reason}")
+
+    for finding in result.findings:
+        console.print(
+            Panel(
+                f"[bold]{finding.title}[/bold]\n\n"
+                f"endpoint   {finding.path}\n"
+                f"severity   {finding.severity}\n"
+                f"cwe        {', '.join(finding.cwe)}\n\n"
+                f"{finding.message}",
+                border_style="red",
+                title="broken access control",
+            )
+        )
+
+    if output:
+        output.write_text(json.dumps(result.to_dict(), indent=2), encoding="utf-8")
+        console.print(f"\n[dim]wrote {output}[/dim]")
+
+    if result.findings:
         raise typer.Exit(code=1)
 
 

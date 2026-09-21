@@ -1,6 +1,8 @@
 import type {
   Bug,
+  BugHistory,
   DashboardSummary,
+  GateRecord,
   Project,
   QualityGate,
   PerformanceRun,
@@ -61,6 +63,9 @@ export const api = {
     get<PerformanceRun[]>(`/api/v1/projects/${projectId}/performance`),
   quality: (projectId: string) =>
     get<QualityGate>(`/api/v1/projects/${projectId}/quality`),
+  gates: (projectId: string) =>
+    get<GateRecord[]>(`/api/v1/projects/${projectId}/gates`),
+  bugHistory: (bugId: string) => get<BugHistory>(`/api/v1/bugs/${bugId}/history`),
   run: (runId: string) => get<Run>(`/api/v1/runs/${runId}`),
   results: (runId: string, onlyFailed = true) =>
     get<Result[]>(`/api/v1/runs/${runId}/results?only_failed=${onlyFailed}`),

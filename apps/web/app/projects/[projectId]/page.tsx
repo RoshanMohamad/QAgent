@@ -22,11 +22,12 @@ export default async function ProjectPage({
 }) {
   const { projectId } = await params;
 
-  const [gate, bugs, findings, performance] = await Promise.all([
+  const [gate, bugs, findings, performance, gates] = await Promise.all([
     settle(api.quality(projectId)),
     settle(api.bugs(projectId)),
     settle(api.securityFindings(projectId)),
     settle(api.performanceRuns(projectId)),
+    settle(api.gates(projectId)),
   ]);
 
   if (gate.error && bugs.error) {
@@ -250,6 +251,55 @@ export default async function ProjectPage({
               </tbody>
             </table>
           </div>
+        )}
+      </Card>
+
+      <Card
+        title="Gate history"
+        description="What the gate decided at the moment each change shipped - recorded with the numbers it saw, because recomputing it later gives a different answer."
+      >
+        {(gates.data ?? []).length === 0 ? (
+          <Empty>
+            No decisions recorded. Run <code>qagent gate --report-to</code> in CI
+            to start keeping this history.
+          </Empty>
+        ) : (
+          <ul className="space-y-2">
+            {(gates.data ?? []).map((record) => (
+              <li
+                key={record.id}
+                className="flex flex-wrap items-baseline justify-between gap-2 border-b pb-2 last:border-0"
+                style={{ borderColor: "var(--border)" }}
+              >
+                <span className="flex items-baseline gap-2">
+                  <span
+                    className="text-sm font-medium"
+                    style={{
+                      color:
+                        record.result === "block"
+                          ? "var(--critical)"
+                          : record.result === "pass"
+                            ? "var(--good)"
+                            : "var(--warning)",
+                    }}
+                  >
+                    {record.result}
+                  </span>
+                  {record.commit_sha ? (
+                    <code className="tabular text-xs" style={{ color: "var(--text-secondary)" }}>
+                      {record.commit_sha.slice(0, 8)}
+                    </code>
+                  ) : null}
+                  <span className="text-xs" style={{ color: "var(--text-secondary)" }}>
+                    {record.trigger}
+                  </span>
+                </span>
+                <span className="text-xs" style={{ color: "var(--text-secondary)" }}>
+                  {record.reason ?? "no blocking defects"}
+                </span>
+              </li>
+            ))}
+          </ul>
         )}
       </Card>
     </div>

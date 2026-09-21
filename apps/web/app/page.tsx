@@ -27,6 +27,13 @@ export default async function DashboardPage() {
 
   const data = summary.data;
   const { total, passed, failed } = data.tests;
+  // Older deployments predate this field; the UI must not crash on them.
+  const coverage = data.coverage ?? {
+    endpoints_total: 0,
+    endpoints_covered: 0,
+    endpoint_percent: 0,
+    measures: "",
+  };
   const passRate = total > 0 ? Math.round((passed / total) * 100) : null;
 
   const openBugs = SEVERITY_ORDER.reduce(
@@ -100,11 +107,37 @@ export default async function DashboardPage() {
           detail="quarantined, not blocking"
         />
         <StatTile
+          label="API surface"
+          value={
+            coverage.endpoints_total === 0
+              ? "--"
+              : `${coverage.endpoint_percent}%`
+          }
+          accent={
+            coverage.endpoints_total > 0 && coverage.endpoint_percent < 80
+              ? "var(--warning)"
+              : undefined
+          }
+          detail={
+            coverage.endpoints_total === 0
+              ? "nothing discovered yet"
+              : `${coverage.endpoints_covered} of ${coverage.endpoints_total} endpoints`
+          }
+        />
+        <StatTile
           label="AI spend"
           value={`$${data.llm_spend_usd.toFixed(2)}`}
           detail="across all runs"
         />
       </div>
+
+      {/* The label is doing real work here. "82%" on a dashboard reads as line
+          coverage, and this is not that - QAgent never instruments the app. */}
+      {coverage.endpoints_total > 0 ? (
+        <p className="text-xs" style={{ color: "var(--text-secondary)" }}>
+          {coverage.measures}
+        </p>
+      ) : null}
 
       <div className="grid gap-6 md:grid-cols-3">
         <Card
@@ -134,7 +167,7 @@ export default async function DashboardPage() {
 
         <Card
           title="Security findings"
-          description="Static analysis (Semgrep). Critical/high count toward the quality gate."
+          description="Semgrep, Trivy and ZAP. Critical/high count toward the quality gate."
         >
           {openFindings === 0 ? (
             <Empty>No open findings.</Empty>

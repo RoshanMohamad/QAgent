@@ -27,6 +27,7 @@ from qagent import models
 from qagent.config import get_settings
 from qagent.db import session_scope
 from qagent.modules.llm.client import LlmClient
+from qagent.modules.notify.events import notify_run_finished, retry_failed
 from qagent.persistence import (
     persist_agent_run,
     persist_performance_runs,
@@ -121,7 +122,32 @@ def run_scan(self, org_id: str, project_id: str, run_id: str) -> dict:
             records=llm.records,
         )
 
+        # After persistence, inside the same transaction: a notification that
+        # claims a defect was found must not outlive a rollback that means it
+        # wasn't. Sends nothing unless the project configured a target, and
+        # never raises - the scan already succeeded.
+        notify_run_finished(
+            session,
+            org_id=org,
+            project_id=project,
+            run=run,
+            result=result,
+            allow_private=not settings.is_production,
+        )
+
     return result.summary()
+
+
+@celery_app.task(name="qagent.retry_notifications")
+def retry_notifications(org_id: str) -> dict:
+    """Re-attempt deliveries that failed (modules/notify/events.py).
+
+    Separate from the scan so a webhook outage is recovered from on its own
+    schedule rather than only when the next scan happens to run. Schedule it
+    with celery beat, or call it after fixing a misconfigured target.
+    """
+    with session_scope(UUID(org_id)) as session:
+        return retry_failed(session, allow_private=not settings.is_production)
 
 
 @celery_app.task(

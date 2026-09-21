@@ -160,8 +160,20 @@ def run_evaluation(
     llm: LlmClient | None = None,
 ) -> EvaluationReport:
     ground_truth = load_ground_truth(fixtures_dir, fixture_name)
+
+    # A fixture may declare two identities, which is what enables the IDOR probe
+    # (modules/security/idor.py). Broken object-level authorization cannot be
+    # found with one set of credentials by definition, so a fixture that seeds
+    # one has to say who the second caller is - otherwise the harness would be
+    # scoring the pipeline against a defect it was never given the means to see.
+    identities = ground_truth.get("identities") or {}
+    primary = dict(identities.get("primary") or {})
+    secondary = dict(identities.get("secondary") or {})
+
     result = run_pipeline(
         base_url=base_url,
+        auth_headers=primary or None,
+        secondary_auth_headers=secondary or None,
         llm=llm or LlmClient.from_settings(),
         allow_private=True,
     )

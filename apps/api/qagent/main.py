@@ -290,6 +290,18 @@ class NotificationIn(BaseModel):
     data: dict = Field(default_factory=dict)
 
 
+class NotifyConfigIn(BaseModel):
+    """Where this project's alerts go, and for which events.
+
+    Empty `target` turns notifications off, which is the default: a QA tool
+    that starts posting to a webhook nobody configured is a tool people mute.
+    """
+
+    channel: str = Field(default="webhook", pattern="^(slack|webhook)$")
+    target: str = Field(default="", max_length=500)
+    events: list[str] = Field(default_factory=lambda: ["gate_blocked", "critical_defect"])
+
+
 class PerformanceScanIn(BaseModel):
     base_url: str = Field(min_length=1)
     vus_levels: list[int] = Field(default_factory=lambda: [100, 500, 1000, 5000])
@@ -573,16 +585,71 @@ def connect_repository(
     if payload.branch:
         project.default_branch = payload.branch
     project.stack = analysis.to_dict()
+
+    # Recorded as a `Repository` row as well as on the project. `repo_url` holds
+    # the single-repo case and stays for compatibility; this is what lets a
+    # project have a frontend repo and a backend repo without a schema change,
+    # and it is where the analysed commit is tracked so a re-analysis can tell
+    # whether anything actually moved.
+    #
+    # No token is stored, ever: ADR-0009 keeps credentials out of argv and out
+    # of the database alike. A connected repository holds a secret *reference*.
+    repository = session.execute(
+        select(models.Repository).where(
+            models.Repository.project_id == project_id,
+            models.Repository.url == ref.https_url,
+        )
+    ).scalar_one_or_none()
+
+    if repository is None:
+        repository = models.Repository(
+            org_id=org_id,
+            project_id=project_id,
+            provider="github",
+            url=ref.https_url,
+            default_branch=payload.branch or project.default_branch,
+        )
+        session.add(repository)
+
+    repository.default_branch = payload.branch or repository.default_branch
+    repository.last_analyzed_sha = commit_sha
+    repository.last_analyzed_at = datetime.now(UTC)
     session.commit()
 
     return {
         "id": str(project.id),
+        "repository_id": str(repository.id),
         "repo_url": project.repo_url,
         "branch": project.default_branch,
         "commit_sha": commit_sha,
         "summary": analysis.summary(),
         "stack": project.stack,
     }
+
+
+@app.get("/api/v1/projects/{project_id}/repositories", tags=["projects"])
+def list_repositories(
+    project_id: UUID, org_id: UUID = Depends(current_org), session: Session = Depends(get_db)
+) -> list[dict]:
+    """Every repository connected to this project, and when each was analysed."""
+    rows = session.execute(
+        select(models.Repository)
+        .where(models.Repository.project_id == project_id)
+        .order_by(models.Repository.created_at)
+    ).scalars().all()
+
+    return [
+        {
+            "id": str(r.id),
+            "provider": r.provider,
+            "url": r.url,
+            "default_branch": r.default_branch,
+            "subdirectory": r.subdirectory,
+            "last_analyzed_sha": r.last_analyzed_sha,
+            "last_analyzed_at": r.last_analyzed_at,
+        }
+        for r in rows
+    ]
 
 
 @app.post("/api/v1/projects/{project_id}/environments", status_code=201, tags=["projects"])
@@ -886,8 +953,36 @@ def record_gate(
         checks=payload.checks,
     )
     session.add(gate)
+    session.flush()
+
+    # A blocked deploy is the event most worth interrupting someone for, so it
+    # fires here rather than waiting for anyone to open the dashboard. Silent
+    # unless the project configured a target, and it cannot fail the record.
+    notified = None
+    if gate.result == "block":
+        from qagent.modules.notify.events import notify
+
+        notification = notify(
+            session,
+            org_id=org_id,
+            project_id=project_id,
+            event="gate_blocked",
+            data={
+                "project": str(project_id),
+                "reasons": [payload.reason] if payload.reason else [],
+                "commit_sha": payload.commit_sha,
+            },
+            allow_private=not settings.is_production,
+        )
+        notified = notification.status if notification else None
+
     session.commit()
-    return {"id": str(gate.id), "result": gate.result, "at": gate.created_at}
+    return {
+        "id": str(gate.id),
+        "result": gate.result,
+        "at": gate.created_at,
+        "notified": notified,
+    }
 
 
 @app.get("/api/v1/projects/{project_id}/gates", tags=["quality"])
@@ -939,6 +1034,71 @@ def record_deployment(
     session.add(deployment)
     session.commit()
     return {"id": str(deployment.id), "status": deployment.status}
+
+
+@app.put("/api/v1/projects/{project_id}/notify-config", tags=["notifications"])
+def set_notify_config(
+    project_id: UUID,
+    payload: NotifyConfigIn,
+    principal: Principal = Depends(require_owner),
+    session: Session = Depends(get_db),
+) -> dict:
+    """Configure where this project's alerts go.
+
+    Owner-gated: the target is a URL this server will then fetch on the
+    project's behalf, which is the same reason `analyze` and `performance/scan`
+    are gated. The egress guard refuses link-local and private addresses at
+    send time regardless of what is stored here.
+    """
+    project = session.get(models.Project, project_id)
+    if project is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "project not found")
+
+    project.notify = (
+        {}
+        if not payload.target.strip()
+        else {
+            "channel": payload.channel,
+            "target": payload.target.strip(),
+            "events": payload.events,
+        }
+    )
+    session.commit()
+    return {"notify": project.notify or {"enabled": False}}
+
+
+@app.get("/api/v1/projects/{project_id}/notifications", tags=["notifications"])
+def list_notifications(
+    project_id: UUID,
+    limit: int = 20,
+    org_id: UUID = Depends(current_org),
+    session: Session = Depends(get_db),
+) -> list[dict]:
+    """Delivery history, including what failed and why.
+
+    The point of storing delivery status is being able to read it: "we notified
+    the team" is a claim a webhook outage silently falsifies.
+    """
+    rows = session.execute(
+        select(models.Notification)
+        .where(models.Notification.project_id == project_id)
+        .order_by(models.Notification.created_at.desc())
+        .limit(min(limit, 100))
+    ).scalars().all()
+
+    return [
+        {
+            "id": str(n.id),
+            "event": n.event,
+            "channel": n.channel,
+            "status": n.status,
+            "attempts": n.attempts,
+            "last_error": n.last_error,
+            "delivered_at": n.delivered_at,
+            "at": n.created_at,
+        }
+        for n in rows
+    ]
 
 
 @app.post("/api/v1/projects/{project_id}/notifications", status_code=202, tags=["notifications"])

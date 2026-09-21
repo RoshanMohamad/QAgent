@@ -22,7 +22,12 @@ from qagent.modules.planner.strategy import CoverageReport, TestPlan, build_plan
 from qagent.modules.rag.index import RepositoryIndex
 from qagent.modules.runner.executor import ApiTestRunner, RunnerConfig, TargetRejected
 from qagent.modules.triage.agent import arbitrate, build_bug_report
-from qagent.modules.triage.classifier import FailureClass, classify, extract_signals
+from qagent.modules.triage.classifier import (
+    FailureClass,
+    Verdict,
+    classify,
+    extract_signals,
+)
 
 if TYPE_CHECKING:
     from qagent.modules.browser.runner import PageCheckResult
@@ -176,6 +181,7 @@ def run_pipeline(
     interaction_policy: InteractionPolicy | None = None,
     plan_enrichment: bool = False,
     code_index: RepositoryIndex | None = None,
+    secondary_auth_headers: dict[str, str] | None = None,
 ) -> PipelineResult:
     """Run the full loop against one environment.
 
@@ -204,6 +210,13 @@ def run_pipeline(
     and the matching functions are attached to the bug report as ``affected_code``
     - the "Affected: OrderService.createOrder()" line CLAUDE.md section 13 asks
     for. Retrieval runs with or without a model configured.
+
+    ``secondary_auth_headers`` is a *second* identity's credentials. Supplying
+    them enables the IDOR probe (modules/security/idor.py), which is the one
+    check that cannot be a generator rule: broken object-level authorization is
+    by definition the difference between what two identities can reach, and
+    every rule tests one at a time. Without a second identity the stage is
+    skipped and recorded as such.
 
     ``run_interactive`` additionally fills forms and clicks through same-origin pages
     (modules/explorer/interact.py) instead of only following links, folding any defect
@@ -283,6 +296,22 @@ def run_pipeline(
 
     auth_configured = bool(auth_headers)
 
+    # Before the generated cases run, not after. The probe is read-only and
+    # needs the application's data as it found it - and generation deliberately
+    # produces destructive cases (`DELETE /tasks/{id}`) that had already removed
+    # the row the probe was about to use as evidence. A read-only check that
+    # runs downstream of a destructive one is measuring the wrong application.
+    if secondary_auth_headers:
+        _run_idor_stage(
+            result,
+            base_url=base_url,
+            endpoints=endpoints,
+            primary=auth_headers or {},
+            secondary=secondary_auth_headers,
+            timeout_seconds=timeout_seconds,
+            llm=llm,
+        )
+
     with span("qagent.execute", cases=len(generation.cases)) as active, runner:
         for case in generation.cases:
             outcome = _execute_and_triage(
@@ -321,6 +350,90 @@ def run_pipeline(
     result.finished_at = datetime.now(UTC)
     result.llm_totals = llm.totals()
     return result
+
+
+def _run_idor_stage(
+    result: PipelineResult,
+    *,
+    base_url: str,
+    endpoints: list[EndpointSpec],
+    primary: dict[str, str],
+    secondary: dict[str, str],
+    timeout_seconds: float,
+    llm: LlmClient,
+) -> None:
+    """Probe for broken object-level authorization with two identities.
+
+    Folded into ``outcomes`` as ``kind="api_security"`` so an IDOR shares one
+    persistence path, one dashboard and one quality gate with everything else -
+    the same reason the browser stages fold their findings in rather than
+    reporting separately.
+
+    Isolated in its own function, like the browser stages, so a failure here
+    never loses the API results already collected above it.
+    """
+    import httpx
+
+    from qagent.modules.security.idor import probe_endpoints
+
+    try:
+        identities = {"primary": primary, "secondary": secondary}
+        with httpx.Client(base_url=base_url.rstrip("/"), timeout=timeout_seconds) as client:
+
+            def request(method: str, path: str, identity: str):
+                try:
+                    response = client.request(method, path, headers=identities[identity])
+                except httpx.HTTPError:
+                    return None, None, None
+                try:
+                    parsed = response.json()
+                except ValueError:
+                    parsed = None
+                return response.status_code, response.text, parsed
+
+            probe = probe_endpoints(endpoints, request=request)
+    except Exception as exc:  # noqa: BLE001 - never sink results already collected
+        logger.exception("IDOR probe failed")
+        result.errors.append(f"IDOR probe failed: {exc}")
+        return
+
+    for finding in probe.findings:
+        outcome = CaseOutcome(
+            name=f"{finding.path} enforces object-level authorization",
+            kind="api_security",
+            endpoint_key=finding.path,
+            status="failed",
+            duration_ms=0,
+            request={"method": "GET", "path": finding.path, "auth": "secondary"},
+            response={"status": 200},
+            assertions=[],
+            failure_message=finding.message,
+        )
+        # Rules-derived and certain: the probe only reports when two identities
+        # received the same body, so there is nothing for the classifier to be
+        # unsure about and no reason to spend a model call arbitrating it.
+        verdict = Verdict(
+            failure_class=FailureClass.REAL_BUG,
+            confidence=0.95,
+            reason=finding.message,
+        )
+        outcome.verdict = verdict.to_dict()
+        outcome.bug = build_bug_report(
+            case_name=outcome.name,
+            verdict=verdict,
+            spec={"expectation": "A resource is readable only by the identity that owns it.",
+                  "kind": "api_security"},
+            request=outcome.request,
+            response=outcome.response,
+            failure_message=finding.message,
+            llm=llm,
+        )
+        result.outcomes.append(outcome)
+
+    for endpoint_key, reason in probe.inconclusive.items():
+        # Recorded, not silent: "no IDOR found" and "could not check" are
+        # different claims and a security result must not conflate them.
+        result.skipped.append(f"IDOR probe inconclusive for {endpoint_key}: {reason}")
 
 
 def _run_e2e_stage(

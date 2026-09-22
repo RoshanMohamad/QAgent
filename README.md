@@ -28,6 +28,7 @@ as one sentence, because the list stopped being readable:
 | Performance | k6 and Apache JMeter behind one metric shape |
 | Deployment | [Validated Kubernetes manifests](#deployment), per-PR [ephemeral environments](#ephemeral-environments-per-pull-request), usage [priced into a statement](#billing) |
 | Platform | Multi-tenancy with Postgres RLS, RBAC, rate limiting, `/metrics`, usage tracking, queue separation, [Alembic migrations](#schema-migrations), S3-compatible storage, OpenTelemetry spans |
+| Tooling | `qagent doctor` — [environment diagnosis](#when-the-integration-suite-misbehaves) in one command |
 | Dashboard | [Quality score](#quality-score), pass rate, defects and findings by severity, surface coverage, failure analysis, gate history |
 
 See [Roadmap](#roadmap) for what is deliberately *not* built and what remains open.
@@ -1358,7 +1359,7 @@ docs/decisions/            ADRs
 ## Tests
 
 ```bash
-cd apps/api && pytest tests -q     # 318 tests, no database needed
+cd apps/api && pytest tests -q     # 665 tests, no database and no API key needed
 ```
 
 Against a real Postgres + Redis (`db-integration` in CI, ADR-0007):
@@ -1372,6 +1373,51 @@ export CELERY_BROKER_URL=redis://localhost:56379/1
 export CELERY_RESULT_BACKEND=redis://localhost:56379/2
 cd apps/api && pytest tests_integration -q
 ```
+
+### When the integration suite misbehaves
+
+Run `qagent doctor` first. It exists because of a long, expensive debugging
+session where every failure looked like a dead Redis — a timeout deep inside a
+client library — while the container was healthy and `redis-cli ping` answered
+in milliseconds.
+
+```text
+ok    redis 6.4.0     <6.5,>=5.2
+ok    postgres        reachable as the application role
+warn  semgrep         absent: static analysis (`qagent security`)
+warn  playwright      absent: browser E2E, exploration and the recorder
+```
+
+It checks installed versions against the constraints `pyproject.toml` declares,
+whether Postgres and Redis actually answer, and which optional binaries are
+present. It is read-only — a diagnostic that repairs things is one whose output
+nobody can trust.
+
+Two failure modes it was built to catch, both real:
+
+- **A violated pin that nothing complains about.** `redis-py` 8 in *user*
+  site-packages satisfies the import while breaking this project's `redis<6.5`
+  bound, and `pip check` stays quiet when the editable install's metadata is
+  stale. The remedy it prints uses `--force-reinstall` for exactly that reason:
+  a plain install is a no-op against a shadowing copy.
+- **A host that breaks the connection, not a service that is down.** On this
+  project's Windows development machine, Docker Desktop's port proxy degrades
+  under sustained use: the same suite took 14 minutes early in a session and
+  over two hours later with no code change, and eventually every command failed
+  with `Connection closed by server` / `WinError 10053` while the container
+  stayed healthy and `redis-cli ping` answered instantly from inside it.
+
+  That was confirmed by running the same calls *outside pytest entirely* — 12 of
+  12 failed — which is what ruled out the three plausible-sounding culprits
+  (Python 3.14, pytest, a `redis-py` version). `doctor` recognises that
+  signature and says so, because "start the container" is precisely the wrong
+  advice when the container is already running.
+
+The integration conftest holds one Redis client for the whole session with an
+explicit `socket_timeout`, rather than building one per test. Both halves
+matter: a connection per test is a second per test through that proxy, and
+redis-py's default is to block *forever*, so a Redis that accepts a connection
+and then stops answering hangs the run with no output at all.
 
 The dashboard has its own suite — component/unit tests (Vitest + React Testing
 Library), independent of the Python one above:

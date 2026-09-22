@@ -711,6 +711,63 @@ def connect(
 
 
 @app.command()
+def doctor(
+    output: Path | None = typer.Option(None, "--json", help="Write the report as JSON."),
+) -> None:
+    """Check that this environment matches what the project declares.
+
+    Written after a specific, expensive failure: `redis-py` 8 was installed in
+    user site-packages while `pyproject.toml` pins `redis<6.5`. That satisfies
+    the import, `pip check` stays quiet, and the only symptom was the
+    integration suite hanging inside redis-py's RESP3 handshake - which reads
+    exactly like a dead Redis, while the container was perfectly healthy.
+
+    Read-only. It installs nothing and changes nothing: a diagnostic that
+    repairs things is one whose output nobody can trust.
+
+    Exits non-zero when a declared constraint is violated or a required service
+    is unreachable. Missing optional tools are warnings, never failures.
+    """
+    from qagent.modules.doctor import FAIL, OK, WARN, run
+
+    report = run()
+
+    style = {OK: "green", WARN: "yellow", FAIL: "bold red"}
+    mark = {OK: "ok", WARN: "warn", FAIL: "FAIL"}
+
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("", width=5)
+    table.add_column("check", overflow="fold")
+    table.add_column("detail", overflow="fold")
+    for check in report.checks:
+        table.add_row(
+            f"[{style[check.status]}]{mark[check.status]}[/]",
+            check.name,
+            check.detail,
+        )
+    console.print(table)
+
+    remedies = [c for c in report.checks if c.remedy]
+    if remedies:
+        console.print("\n[bold]To fix:[/bold]")
+        for check in remedies:
+            console.print(f"  [dim]{check.name}:[/dim] {check.remedy}")
+
+    console.print(
+        f"\n[{'green' if report.healthy else 'bold red'}]"
+        f"{'environment looks healthy' if report.healthy else 'environment has problems'}[/]"
+        f"  ({len(report.failed)} failure(s), {len(report.warnings)} warning(s))"
+    )
+
+    if output:
+        output.write_text(json.dumps(report.to_dict(), indent=2), encoding="utf-8")
+        console.print(f"[dim]wrote {output}[/dim]")
+
+    if not report.healthy:
+        raise typer.Exit(code=1)
+
+
+@app.command()
 def endpoints(
     url: str = typer.Option(..., "--url", "-u"),
     spec: str | None = typer.Option(None, "--spec", "-s"),

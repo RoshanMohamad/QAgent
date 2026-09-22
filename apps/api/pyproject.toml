@@ -18,6 +18,14 @@ dependencies = [
     # are declared here as independent requirements, pip never sees kombu's
     # cap unless we repeat it, so a fresh install would silently resolve to an
     # unusable pair. Raise this only together with celery/kombu.
+    #
+    # Worth catching, and easy to violate silently: redis-py 8 in a machine's
+    # *user* site-packages satisfies the import while breaking this bound, and
+    # `pip check` stays quiet when the editable install's metadata is stale.
+    # `qagent doctor` reports it. (The integration-suite timeouts that first
+    # drew attention here turned out to be Docker's port proxy rather than this
+    # pin - they persisted after correcting it - but a violated constraint is a
+    # real problem regardless of which one bit first.)
     "redis>=5.2,<6.5",
     "httpx>=0.28",
     "pyyaml>=6.0",

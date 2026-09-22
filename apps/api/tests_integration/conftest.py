@@ -203,8 +203,48 @@ def _clean_tenant_tables(admin_engine):
         connection.execute(text("TRUNCATE organizations CASCADE"))
 
 
+@pytest.fixture(scope="session")
+def rate_limit_redis():
+    """One Redis client for the whole session.
+
+    Built once rather than per test for two reasons. It opens a TCP connection,
+    and against a containerised Redis on Windows that goes through Docker's port
+    proxy - roughly a second per connection, paid by every test in the suite.
+    And it carries an explicit `socket_timeout`: redis-py's default is to block
+    forever, so a Redis that accepts a connection and then stops responding
+    hangs the run with no output instead of failing with a message. That is
+    exactly what happened while this suite was being written, and it cost hours
+    of looking in the wrong place.
+    """
+    import redis as redis_lib
+    from redis.backoff import ExponentialBackoff
+    from redis.retry import Retry
+
+    from qagent.config import get_settings
+
+    client = redis_lib.Redis.from_url(
+        get_settings().redis_url,
+        socket_timeout=10,
+        socket_connect_timeout=5,
+        # Retry is what makes a session-scoped client safe. A connection held
+        # for the length of a suite gets dropped - by an idle timeout, or by
+        # Docker's port proxy under load - and redis-py does not reconnect on
+        # its own. Without this the first test passes and every later one fails
+        # with "Connection closed by server", which reads like a dead Redis.
+        retry=Retry(ExponentialBackoff(base=0.1, cap=2), retries=3),
+        retry_on_timeout=True,
+        # Cheap liveness check before reusing a pooled connection, so a
+        # half-open socket is discovered and replaced rather than used.
+        health_check_interval=15,
+    )
+    try:
+        yield client
+    finally:
+        client.close()
+
+
 @pytest.fixture(autouse=True)
-def _clean_rate_limits():
+def _clean_rate_limits(rate_limit_redis):
     """main.py's rate limiter and Celery's broker/result backend are different
     logical Redis databases (REDIS_URL's db 0 vs. CELERY_BROKER_URL's db 1 and
     CELERY_RESULT_BACKEND's db 2 - see .env.example), so flushing this one never
@@ -213,10 +253,5 @@ def _clean_rate_limits():
     the fixed string "testclient", not a real, distinct IP per test), and
     register's 5/min limit (main.py) would trip well before the suite finishes.
     """
-    import redis as redis_lib
-
-    from qagent.config import get_settings
-
-    client = redis_lib.Redis.from_url(get_settings().redis_url)
-    client.flushdb()
+    rate_limit_redis.flushdb()
     yield

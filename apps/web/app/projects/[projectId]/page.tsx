@@ -3,6 +3,7 @@ import { api, apiBaseUrl, isConfigured, settle } from "@/lib/api";
 import { Card, Empty } from "@/components/figures";
 import { SetupNotice } from "@/components/setup-notice";
 import { GateBanner, SeverityBadge } from "@/components/status";
+import { VerifyBugButton } from "@/components/verify-bug-button";
 import type { Severity } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
@@ -87,22 +88,26 @@ export default async function ProjectPage({
                   borderColor: "var(--border)",
                 }}
               >
-                <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex flex-wrap items-start justify-between gap-2">
                   <div className="flex items-center gap-3">
-                    <span
-                      className="tabular text-xs font-medium"
+                    <Link
+                      href={`/bugs/${bug.id}`}
+                      className="tabular text-xs font-medium hover:underline"
                       style={{ color: "var(--text-muted)" }}
                     >
                       {bug.reference}
-                    </span>
+                    </Link>
                     <SeverityBadge severity={bug.severity} />
+                    <span className="text-xs" style={{ color: "var(--text-muted)" }}>
+                      {bug.status}
+                    </span>
                   </div>
-                  <span className="text-xs" style={{ color: "var(--text-muted)" }}>
-                    {bug.status}
-                  </span>
+                  {bug.status === "open" ? <VerifyBugButton bugId={bug.id} /> : null}
                 </div>
 
-                <h3 className="mt-2 text-sm font-semibold">{bug.title}</h3>
+                <Link href={`/bugs/${bug.id}`} className="hover:underline">
+                  <h3 className="mt-2 text-sm font-semibold">{bug.title}</h3>
+                </Link>
 
                 <dl className="mt-3 grid gap-x-6 gap-y-2 text-xs sm:grid-cols-2">
                   <div>

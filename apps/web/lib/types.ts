@@ -85,6 +85,7 @@ export interface Result {
 }
 
 export interface Bug {
+  id: string;
   reference: string;
   title: string;
   severity: Severity;

@@ -37,6 +37,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
 
       - name: Install
         run: |
@@ -58,6 +61,12 @@ jobs:
             curl -sf http://127.0.0.1:8081/health && break
             sleep 1
           done
+          cd ../notes-api
+          node server.js &
+          for i in $(seq 1 20); do
+            curl -sf http://127.0.0.1:8082/health && break
+            sleep 1
+          done
 
       - name: Evaluate (buggy-shop, FastAPI)
         env:
@@ -75,6 +84,15 @@ jobs:
         env:
           QAGENT_LLM_PROVIDER: "null"
         run: qagent evaluate --url http://127.0.0.1:8081 --name task-tracker --fixtures packages/fixtures
+
+      - name: Evaluate (notes-api, Node.js)
+        # Third fixture, third language, and the one carrying BUG-405: a check
+        # that runs and checks something, but not the signature - the shape
+        # case_invalid_token exists to catch and that neither Python fixture
+        # exercises (modules/generator/rules.py).
+        env:
+          QAGENT_LLM_PROVIDER: "null"
+        run: qagent evaluate --url http://127.0.0.1:8082 --name notes-api --fixtures packages/fixtures
 
       - name: Emitted suite must agree with the pipeline
         # Agent 3 emits standalone pytest files. The claim is that they are the

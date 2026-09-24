@@ -1,0 +1,108 @@
+# Ground truth for the notes-api fixture (ADR-0003).
+#
+# Third fixture, deliberately a third language (Node.js, no framework, hand-written
+# OpenAPI document like task-tracker's) from buggy-shop's FastAPI and task-tracker's
+# Flask, so detection isn't only ever proven against two Python code shapes.
+#
+# BUG-405 is a defect shape neither of the other two fixtures has: a check that runs
+# and checks *something*, but the wrong thing. `admin_audit_log` (server.js) decodes
+# a JWT-shaped token's claims and checks `role === "admin"` -- but never verifies the
+# signature that claim is supposed to be backed by, so a structurally valid but
+# entirely unsigned token (`alg: "none"`) is accepted exactly as readily as a real
+# one. This is what `case_invalid_token` (modules/generator/rules.py) exists to
+# catch; it had no fixture actually exercising it until this one.
+#
+# One identity only (alice, who is also the admin) -- there is no IDOR concept here,
+# task-tracker already covers that with its two-identity fixture.
+
+identities:
+  primary:
+    Authorization: "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhbGljZSIsInJvbGUiOiJhZG1pbiJ9.v0E7H-JbxyY5t4Jiw9wvXpTcoqj3AVCRI2n6nYhNnqw"
+
+fixture: notes-api
+description: Node.js (no framework) notes API with five seeded defects and two
+  correct endpoints.
+
+defects:
+  - id: BUG-401
+    endpoint: "POST /notes"
+    title: Required field dereferenced without validation
+    expected_class: real_bug
+    expected_severity: high
+    detect_with: missing required field, or wrong field type
+    notes: >
+      body.title.trim() throws when 'title' is absent (undefined has no .trim) or
+      the wrong type (a number has no .trim either). Both surface as 500 where 400
+      is documented -- same shape as buggy-shop's BUG-004 and task-tracker's
+      BUG-202, in a third language.
+
+  - id: BUG-402
+    endpoint: "GET /notes/{id}"
+    title: Identifier used without validating it names a real, well-formed row
+    expected_class: real_bug
+    expected_severity: high
+    detect_with: malformed path parameter, or a well-formed but absent one
+    notes: >
+      Number(id) is never guarded with Number.isInteger, so a non-numeric id
+      becomes NaN; NOTES.get() returns undefined either for that NaN or for a
+      well-formed but absent numeric id, and the handler dereferences .title on it
+      regardless. Both a malformed and an absent identifier hit this same line, so
+      this is one ground-truth endpoint matched by either check, the same
+      convention task-tracker's BUG-206 documents for two rules hitting one line.
+
+  - id: BUG-403
+    endpoint: "PUT /notes/{id}/complete"
+    title: Resource existence assumed before it is updated
+    expected_class: real_bug
+    expected_severity: medium
+    detect_with: absent-but-well-formed resource reference
+    notes: >
+      A malformed id is rejected correctly (Number.isInteger guards it, 400). A
+      well-formed but absent id is not: note.done = true throws on undefined,
+      producing 500 where 404 is documented. Isolated to the existence check, not
+      the cast -- same isolation buggy-shop's BUG-002 and task-tracker's BUG-204
+      document for their own assumed-existence bugs.
+
+  - id: BUG-404
+    endpoint: "GET /admin/notes"
+    title: Authentication advertised but not enforced
+    expected_class: real_bug
+    expected_severity: critical
+    detect_with: unauthenticated request
+    notes: >
+      The OpenAPI document declares this operation bearer-protected; the handler
+      never calls verifiedClaims(). An anonymous caller reads every user's notes.
+      Same defect shape as buggy-shop's BUG-003 and task-tracker's BUG-205, seeded
+      a third time to show the rule generalises across a third language and a
+      third auth scheme (JWT-shaped bearer tokens, not opaque ones), not only a
+      third framework. A GET, like both of those -- see the comment on
+      adminListNotes in server.js for why the destructive DELETE this was
+      originally seeded on doesn't work for this.
+
+  - id: BUG-405
+    endpoint: "GET /admin/audit-log"
+    title: Token signature never verified before its claims are trusted
+    expected_class: real_bug
+    expected_severity: critical
+    detect_with: "a structurally valid, unsigned (alg=none) bearer token"
+    notes: >
+      unsafeAdminClaims() decodes the JWT-shaped token's payload and checks
+      claims.role === "admin", but never recomputes or compares the signature
+      segment, and never rejects alg: "none" in the header. Every other protected
+      endpoint here calls verifiedClaims() instead, which does both -- so this bug
+      is isolated to the one handler that reimplements token handling instead of
+      reusing the correct one. Distinct from BUG-003/BUG-205/BUG-404 (auth check
+      entirely absent): here a check runs on every request, and looks identical
+      to a real one in the response it produces for every case except this
+      specific forged token.
+
+# Correct endpoints. Reported defects against these count as false positives.
+#
+# DELETE /notes/{id} is destructive and, unlike the others here, generation runs
+# more than one check against it in a single evaluation (happy path, malformed id,
+# absent id, unauthenticated) — restart the fixture between evaluation runs, same
+# caveat buggy-shop's own README section documents for its own destructive cases.
+clean:
+  - "GET /health"
+  - "GET /notes"
+  - "DELETE /notes/{id}"

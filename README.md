@@ -45,11 +45,14 @@ Current measured performance against the reference fixture:
 
 Reproduce these numbers yourself with the [two commands below](#try-it). A second
 fixture, a different framework (Flask) with a deliberately *harder* defect — see
-[Evaluating against a second fixture](#evaluating-against-a-second-fixture) —
-now scores **6 of 6 at 0% false positives**. It read 5 of 6 for a long time: the
-sixth is an IDOR, and no generator rule could reach it because every rule tests
-one identity at a time. It is now found by a [probe](#broken-access-control-idor)
-that compares two.
+[Evaluating against more fixtures](#evaluating-against-more-fixtures) — scores
+**6 of 6 at 0% false positives**. It read 5 of 6 for a long time: the sixth is an
+IDOR, and no generator rule could reach it because every rule tests one identity
+at a time. It is now found by a [probe](#broken-access-control-idor) that
+compares two. A third fixture, a third language (Node.js, no framework) with a
+defect shape neither of the first two carries — a check that runs but verifies
+the wrong thing, not one that is simply missing — also scores **5 of 5 at 0%
+false positives**.
 
 **Verified:** the pipeline (discovery, planning, generation, execution, triage,
 reporting), the CLI, the eval harness, **543 unit tests** and lint — all run
@@ -125,7 +128,7 @@ Score itself against the ground truth:
 qagent evaluate --url http://127.0.0.1:8080 --fixtures packages/fixtures
 ```
 
-### Evaluating against a second fixture
+### Evaluating against more fixtures
 
 `buggy-shop` alone can't tell you whether detection generalises or was fit to one
 FastAPI app. `packages/fixtures/task-tracker` is a second fixture — Flask, a
@@ -158,6 +161,30 @@ that was true, rather than quietly dropping the one case that exposed the gap.
 It is now detected by the [IDOR probe](#broken-access-control-idor), and the
 fixture declares the two identities that make it detectable at all. Reported:
 **6/6 detected, 0% false positives.**
+
+`packages/fixtures/notes-api` is a third fixture — Node.js, no framework, a
+hand-written OpenAPI document like task-tracker's — with five seeded defects:
+
+```bash
+cd packages/fixtures/notes-api && node server.js &
+
+qagent evaluate --url http://127.0.0.1:8082 --name notes-api --fixtures packages/fixtures
+```
+
+Four of the five are the same categories the other two fixtures already prove
+generalise (missing/wrong-type field, a malformed-or-absent identifier, unenforced
+auth) — a third time, in a third language, so the pattern is now three-for-three
+rather than a Python coincidence. The fifth, BUG-405, is a category neither other
+fixture has: `GET /admin/audit-log` checks a bearer token's claims but never
+verifies the signature backing them, so a structurally valid, entirely unsigned
+token (`alg: "none"`) is accepted as readily as a real one. That is exactly what
+`case_invalid_token` (`modules/generator/rules.py`) sends — a check that already
+existed with no fixture actually exercising it end to end until this one. Reported:
+**5/5 detected, 0% false positives.**
+
+> **Restart each fixture between runs.** Same caveat as task-tracker's, for the
+> same reason: generation includes destructive and mutating cases, and each
+> fixture holds its data in memory. CI starts a fresh process per job.
 
 Other commands:
 
@@ -1545,6 +1572,9 @@ that would come next, none of which are CLAUDE.md requirements:
   numbers marked `# TUNE:` are starting points, not measurements.
 - **More fixtures**, which is the highest-leverage work at any point — every
   metric in this README is only as trustworthy as the ground truth behind it.
+  A third landed ([notes-api](#evaluating-against-more-fixtures), Node.js,
+  the alg=none token-forgery category), which does not make this item done;
+  it makes the next fixture worth exactly as much as this one was.
 
 Phase 6 (CLAUDE.md §23) is scoped, not skipped — see
 [ADR-0008](docs/decisions/ADR-0008-phase-6-scope.md). Built: RBAC (`require_owner`

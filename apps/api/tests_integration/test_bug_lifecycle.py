@@ -228,3 +228,121 @@ def test_test_cases_are_linked_to_the_endpoint_they_exercise(Session, store) -> 
 
         case = session.query(models.TestCase).one()
         assert case.endpoint_id is not None
+
+
+def _passing(name: str = "GET /products/{id} rejects a malformed id") -> CaseOutcome:
+    return CaseOutcome(
+        name=name,
+        kind="api_functional",
+        endpoint_key="GET /products/{id}",
+        status="passed",
+        duration_ms=5,
+        request={"method": "GET", "path": "/products/{id}"},
+        response={"status": 400},
+        assertions=[],
+    )
+
+
+def test_a_defect_whose_check_passes_is_closed(Session, store) -> None:
+    """Before this, nothing ever closed a defect - so the regression branch
+    above could only be reached by editing the row by hand."""
+    with Session() as session:
+        org, project = _seed(session)
+        _scan(session, org, project, store, _outcome())
+        run = _scan(session, org, project, store, _passing())
+
+        assert session.query(models.Bug).one().status == "fixed"
+        closed = session.execute(
+            select(models.BugEvent).where(models.BugEvent.event == "closed")
+        ).scalar_one()
+        assert (closed.from_value, closed.to_value, closed.run_id) == ("open", "fixed", run.id)
+
+
+def test_a_closed_defect_that_fails_again_is_a_regression(Session, store) -> None:
+    with Session() as session:
+        org, project = _seed(session)
+        _scan(session, org, project, store, _outcome())
+        _scan(session, org, project, store, _passing())
+        _scan(session, org, project, store, _outcome())
+
+        assert session.query(models.Bug).one().status == "open"
+        assert _events(session) == ["opened", "closed", "reopened"]
+
+
+def _verification(verdict: str, statuses: list[str]):
+    from qagent.modules.runner.executor import ExecutionOutcome
+    from qagent.verification import Verification
+
+    return Verification(
+        verdict=verdict,
+        executions=[
+            ExecutionOutcome(
+                passed=s == "passed",
+                status=s,
+                duration_ms=1,
+                request={"method": "GET", "path": "/products/abc"},
+                response={"status": 400 if s == "passed" else 500},
+                assertions=[],
+            )
+            for s in statuses
+        ],
+    )
+
+
+def _verify(session, org, project, verification) -> models.TestRun:
+    from qagent.persistence import persist_verification
+
+    bug = session.query(models.Bug).one()
+    case = session.get(models.TestCase, session.get(models.TestResult, bug.result_id).test_case_id)
+    run = models.TestRun(
+        org_id=org.id, project_id=project.id, trigger="verify", status=models.RunStatus.RUNNING
+    )
+    session.add(run)
+    session.flush()
+    persist_verification(
+        session, org_id=org.id, bug=bug, case=case, run=run, verification=verification
+    )
+    session.commit()
+    set_tenant(session, org.id)
+    return run
+
+
+def test_a_verified_fix_closes_the_defect_and_records_every_attempt(Session, store) -> None:
+    with Session() as session:
+        org, project = _seed(session)
+        _scan(session, org, project, store, _outcome())
+
+        run = _verify(session, org, project, _verification("fixed", ["passed"] * 3))
+
+        assert session.query(models.Bug).one().status == "fixed"
+        event = session.execute(
+            select(models.BugEvent).where(models.BugEvent.event == "verified_fixed")
+        ).scalar_one()
+        assert event.detail["attempts"] == 3
+        assert session.query(models.TestResult).filter_by(run_id=run.id).count() == 3
+        assert session.get(models.TestRun, run.id).status is models.RunStatus.PASSED
+
+
+def test_a_failed_verification_reopens_a_closed_defect(Session, store) -> None:
+    with Session() as session:
+        org, project = _seed(session)
+        _scan(session, org, project, store, _outcome())
+        _scan(session, org, project, store, _passing())  # closed as fixed
+
+        _verify(session, org, project, _verification("still_failing", ["failed"] * 3))
+
+        assert session.query(models.Bug).one().status == "open"
+        assert _events(session)[-1] == "verification_failed"
+
+
+def test_an_inconclusive_verification_changes_nothing(Session, store) -> None:
+    with Session() as session:
+        org, project = _seed(session)
+        _scan(session, org, project, store, _outcome())
+
+        _verify(
+            session, org, project, _verification("inconclusive", ["passed", "failed", "passed"])
+        )
+
+        assert session.query(models.Bug).one().status == "open"
+        assert _events(session)[-1] == "verification_inconclusive"

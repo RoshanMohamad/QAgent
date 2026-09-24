@@ -28,6 +28,7 @@ from qagent.config import get_settings
 from qagent.db import session_scope
 from qagent.modules.llm.client import LlmClient
 from qagent.modules.notify.events import notify_run_finished, retry_failed
+from qagent.modules.secrets import resolve_auth_headers, store_from_settings
 from qagent.persistence import (
     persist_agent_run,
     persist_performance_runs,
@@ -53,6 +54,7 @@ celery_app.conf.update(
     task_default_queue="qagent.scan",
     task_routes={
         "qagent.run_scan": {"queue": "qagent.scan"},
+        "qagent.verify_bug": {"queue": "qagent.scan"},
         "qagent.run_performance_test": {"queue": "qagent.performance"},
     },
 )
@@ -83,7 +85,23 @@ def run_scan(self, org_id: str, project_id: str, run_id: str) -> dict:
         headers = dict(environment.default_headers or {})
         run_e2e = environment.e2e_enabled
         run_interactive = environment.interactive_exploration_enabled
+        secret_ref = environment.secret_ref
         history = recent_history(session, org, project)
+
+    # Resolved here, after the session closed and immediately before use: the
+    # credential lives in this frame only, never on a row (ADR-0004). A missing
+    # or malformed secret is a configuration error - retrying cannot fix it.
+    try:
+        auth_headers = resolve_auth_headers(
+            secret_ref, store_from_settings(settings), org_id=org
+        )
+    except (LookupError, ValueError) as exc:
+        logger.error("could not resolve credentials for run %s: %s", run_id, exc)
+        with session_scope(org) as session:
+            run = session.get(models.TestRun, UUID(run_id))
+            if run:
+                run.status = models.RunStatus.ERROR
+        return {"error": f"credentials unavailable: {exc}"}
 
     llm = LlmClient.from_settings(settings)
 
@@ -92,7 +110,7 @@ def run_scan(self, org_id: str, project_id: str, run_id: str) -> dict:
             base_url=base_url,
             openapi_url=openapi_url,
             default_headers=headers,
-            auth_headers=_resolve_secret(environment_secret_ref=None),
+            auth_headers=auth_headers,
             timeout_seconds=settings.qagent_runner_timeout_seconds,
             allow_private=not settings.is_production,
             allowlist=settings.egress_allowlist,
@@ -136,6 +154,94 @@ def run_scan(self, org_id: str, project_id: str, run_id: str) -> dict:
         )
 
     return result.summary()
+
+
+@celery_app.task(name="qagent.verify_bug")
+def verify_bug(
+    org_id: str,
+    bug_id: str,
+    run_id: str,
+    attempts: int = 3,
+    actor_user_id: str | None = None,
+) -> dict:
+    """Replay one defect's check on its own and record whether it is fixed.
+
+    Queued on the scan queue: it is a handful of requests against the same kind
+    of target, and does not warrant a pool of its own. Not retried - a replay
+    that could not reach the target is recorded as inconclusive, which is the
+    honest outcome, rather than silently tried again until it passes.
+    """
+    from qagent.modules.runner.executor import ApiTestRunner, RunnerConfig, TargetRejected
+    from qagent.persistence import persist_verification
+    from qagent.verification import NotVerifiable, check_verifiable, verify
+
+    org = UUID(org_id)
+
+    def _fail(message: str) -> dict:
+        with session_scope(org) as session:
+            run = session.get(models.TestRun, UUID(run_id))
+            if run:
+                run.status = models.RunStatus.ERROR
+                run.finished_at = datetime.now(UTC)
+        return {"error": message}
+
+    with session_scope(org) as session:
+        bug = session.get(models.Bug, UUID(bug_id))
+        run = session.get(models.TestRun, UUID(run_id))
+        if bug is None or run is None or bug.result_id is None:
+            return {"error": "bug or run not found"}
+        case = session.get(
+            models.TestCase, session.get(models.TestResult, bug.result_id).test_case_id
+        )
+        environment = (
+            session.get(models.Environment, run.environment_id) if run.environment_id else None
+        )
+        if environment is None or not environment.base_url:
+            run.status = models.RunStatus.ERROR
+            return {"error": "environment has no base_url"}
+        try:
+            spec = check_verifiable(kind=case.kind.value, spec=case.spec)
+        except NotVerifiable as exc:
+            run.status = models.RunStatus.ERROR
+            return {"error": str(exc)}
+
+        run.status = models.RunStatus.RUNNING
+        run.started_at = datetime.now(UTC)
+        config = RunnerConfig(
+            base_url=environment.base_url,
+            default_headers=dict(environment.default_headers or {}),
+            timeout_seconds=settings.qagent_runner_timeout_seconds,
+            allow_private=not settings.is_production,
+            allowlist=settings.egress_allowlist,
+        )
+        secret_ref = environment.secret_ref
+        case_id = case.id
+
+    try:
+        config.auth_headers = resolve_auth_headers(
+            secret_ref, store_from_settings(settings), org_id=org
+        )
+    except (LookupError, ValueError) as exc:
+        return _fail(f"credentials unavailable: {exc}")
+
+    try:
+        with ApiTestRunner(config) as runner:
+            verification = verify(runner, spec, attempts=attempts)
+    except TargetRejected as exc:
+        return _fail(f"target rejected: {exc}")
+
+    with session_scope(org) as session:
+        persist_verification(
+            session,
+            org_id=org,
+            bug=session.get(models.Bug, UUID(bug_id)),
+            case=session.get(models.TestCase, case_id),
+            run=session.get(models.TestRun, UUID(run_id)),
+            verification=verification,
+            actor_user_id=UUID(actor_user_id) if actor_user_id else None,
+        )
+
+    return verification.summary()
 
 
 @celery_app.task(name="qagent.retry_notifications")
@@ -209,14 +315,3 @@ def run_performance_test(
         "all_passed": all(r.passed for r in rows),
     }
 
-
-def _resolve_secret(*, environment_secret_ref: str | None) -> dict[str, str]:
-    """Fetch per-environment credentials at execution time.
-
-    Deliberately a seam rather than an implementation: credentials must come from a
-    secret manager and be injected for the duration of one run, never stored on the
-    environment row or written into artifacts (ADR-0004).
-    """
-    if not environment_secret_ref:
-        return {}
-    raise NotImplementedError("secret manager integration is not wired up yet")

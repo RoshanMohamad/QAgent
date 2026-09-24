@@ -20,6 +20,7 @@ from qagent.modules.observability import metrics
 from qagent.modules.storage.local import LocalArtifactStore, store_from_settings
 from qagent.modules.triage import flakiness
 from qagent.pipeline import ArtifactBytes, PipelineResult
+from qagent.verification import Verification
 
 logger = logging.getLogger(__name__)
 
@@ -332,6 +333,107 @@ def _upsert_bug(
     return existing
 
 
+def _close_if_fixed(
+    session: Session, *, project_id: UUID, run: models.TestRun, case: models.TestCase
+) -> None:
+    """Close the open defect this case produced, now that the case passed.
+
+    Without this a defect stayed "open" forever once filed, which also made
+    `_upsert_bug`'s regression branch unreachable - nothing was ever not open
+    to be reopened. A quarantined case is left alone: it passes and fails
+    intermittently, and one green run of it is not evidence of a fix.
+    """
+    if case.quarantined:
+        return
+    bug = _existing_bug(session, project_id, case.id)
+    if bug is None or bug.status != "open":
+        return
+    bug.status = "fixed"
+    _record_event(
+        session,
+        bug=bug,
+        event="closed",
+        run_id=run.id,
+        from_value="open",
+        to_value="fixed",
+        detail={"reason": "check passed in a full scan"},
+    )
+
+
+def persist_verification(
+    session: Session,
+    *,
+    org_id: UUID,
+    bug: models.Bug,
+    case: models.TestCase,
+    run: models.TestRun,
+    verification: Verification,
+    actor_user_id: UUID | None = None,
+) -> models.TestRun:
+    """Record a fix verification: one result row per attempt, and the verdict
+    on the defect's history.
+
+    The attempts are ordinary `test_results` rows, so they feed the case's flake
+    rate like any other execution - an inconclusive verification is evidence of
+    flakiness and should count as such.
+    """
+    for execution in verification.executions:
+        session.add(
+            models.TestResult(
+                org_id=org_id,
+                run_id=run.id,
+                test_case_id=case.id,
+                status=models.ResultStatus(execution.status),
+                duration_ms=execution.duration_ms,
+                request=execution.request,
+                response={k: v for k, v in execution.response.items() if k != "body_text"},
+                assertions=execution.assertions,
+                failure_message=execution.failure_message,
+            )
+        )
+    session.flush()
+
+    history = _case_result_history(session, case.id)
+    case.flake_rate = flakiness.compute_flake_rate(history)
+    case.quarantined = flakiness.should_quarantine(history, case.flake_rate)
+
+    was_status = bug.status
+    if verification.verdict == "fixed":
+        bug.status = "fixed"
+        event = "verified_fixed"
+    elif verification.verdict == "still_failing":
+        # A defect someone had closed by hand but that still fails is back open:
+        # the same regression the scan path records.
+        bug.status = "open"
+        event = "verification_failed"
+    else:
+        event = "verification_inconclusive"
+
+    session.add(
+        models.BugEvent(
+            org_id=org_id,
+            bug_id=bug.id,
+            event=event,
+            from_value=was_status,
+            to_value=bug.status,
+            actor_user_id=actor_user_id,
+            run_id=run.id,
+            detail=verification.summary(),
+        )
+    )
+
+    run.total = len(verification.executions)
+    run.passed = verification.passed
+    run.failed = verification.failed
+    run.errored = verification.errored
+    run.status = (
+        models.RunStatus.PASSED if verification.verdict == "fixed" else models.RunStatus.FAILED
+    )
+    run.finished_at = datetime.now(UTC)
+    metrics.RUNS_TOTAL.labels(status=run.status.value).inc()
+    return run
+
+
 def _persist_artifacts(
     session: Session,
     *,
@@ -449,7 +551,10 @@ def persist_result(
             suite,
             outcome.name,
             kind,
-            {"request": outcome.request},
+            # The full executable spec when there is one, so the check can be
+            # replayed alone to verify a fix (verification.py). Browser and IDOR
+            # outcomes have no spec and keep the executed request, as before.
+            outcome.spec or {"request": outcome.request},
             endpoint=endpoint_rows.get(outcome.endpoint_key or ""),
         )
 
@@ -485,6 +590,9 @@ def persist_result(
         case_history = _case_result_history(session, case.id)
         case.flake_rate = flakiness.compute_flake_rate(case_history)
         case.quarantined = flakiness.should_quarantine(case_history, case.flake_rate)
+
+        if outcome.status == models.ResultStatus.PASSED.value:
+            _close_if_fixed(session, project_id=project_id, run=run, case=case)
 
         if outcome.bug:
             _upsert_bug(

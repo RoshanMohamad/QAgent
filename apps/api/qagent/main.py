@@ -19,7 +19,7 @@ from uuid import UUID
 import redis as redis_lib
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, status
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -37,6 +37,7 @@ from qagent.modules.auth.security import (
 from qagent.modules.observability import metrics
 from qagent.modules.observability.tracing import setup_tracing
 from qagent.modules.ratelimit.limiter import RateLimiter
+from qagent.modules.secrets.store import validate_ref
 from qagent.persistence import persist_security_findings
 
 logger = logging.getLogger(__name__)
@@ -222,6 +223,20 @@ class EnvironmentIn(BaseModel):
     default_headers: dict[str, str] = Field(default_factory=dict)
     e2e_enabled: bool = False
     interactive_exploration_enabled: bool = False
+    #: The *name* of a secret holding this environment's credentials, resolved
+    #: by the worker at run time (modules/secrets/). Never the credential.
+    secret_ref: str | None = None
+
+    @field_validator("secret_ref")
+    @classmethod
+    def _plain_secret_name(cls, value: str | None) -> str | None:
+        return validate_ref(value) if value else None
+
+
+class BugVerifyIn(BaseModel):
+    #: Defaults to the environment the defect was last seen in.
+    environment_id: UUID | None = None
+    attempts: int = Field(default=3, ge=1, le=5)
 
 
 class RunIn(BaseModel):
@@ -661,7 +676,7 @@ def create_environment(
     _owner: Principal = Depends(require_owner),
 ) -> dict:
     """Owner-only (RBAC): an environment carries where a scan sends real
-    traffic and, eventually, `secret_ref` - provisioning that is not a
+    traffic and its `secret_ref` - provisioning that is not a
     member-level action."""
     if session.get(models.Project, project_id) is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "project not found")
@@ -676,6 +691,7 @@ def create_environment(
         default_headers=payload.default_headers,
         e2e_enabled=payload.e2e_enabled,
         interactive_exploration_enabled=payload.interactive_exploration_enabled,
+        secret_ref=payload.secret_ref,
     )
     session.add(environment)
     session.commit()
@@ -825,6 +841,7 @@ def list_bugs(
 
     return [
         {
+            "id": str(b.id),
             "reference": b.reference,
             "title": b.title,
             "severity": b.severity.value,
@@ -886,6 +903,7 @@ def bug_history(
                 "from": e.from_value,
                 "to": e.to_value,
                 "run_id": str(e.run_id) if e.run_id else None,
+                "detail": e.detail,
                 "at": e.created_at,
             }
             for e in events
@@ -926,6 +944,70 @@ def add_bug_comment(
     session.add(comment)
     session.commit()
     return {"id": str(comment.id), "at": comment.created_at}
+
+
+@app.post(
+    "/api/v1/bugs/{bug_id}/verify",
+    status_code=202,
+    tags=["bugs"],
+    dependencies=[Depends(rate_limit_by_org("runs", limit=30, window_seconds=60))],
+)
+def verify_bug_fix(
+    bug_id: UUID,
+    payload: BugVerifyIn,
+    principal: Principal = Depends(current_principal),
+    session: Session = Depends(get_db),
+) -> dict:
+    """Queue a replay of just this defect's check to confirm a fix
+    (qagent/verification.py). Shares the run rate limit: it sends real traffic.
+
+    The verdict lands on the defect's history (`verified_fixed`,
+    `verification_failed` or `verification_inconclusive`); poll the returned
+    run for completion.
+    """
+    from qagent.verification import NotVerifiable, check_verifiable
+
+    bug = session.get(models.Bug, bug_id)
+    if bug is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "bug not found")
+    result = session.get(models.TestResult, bug.result_id) if bug.result_id else None
+    if result is None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "this defect has no recorded check")
+    case = session.get(models.TestCase, result.test_case_id)
+    try:
+        check_verifiable(kind=case.kind.value, spec=case.spec)
+    except NotVerifiable as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from None
+
+    # Default to where the defect was last seen; an explicit environment lets a
+    # fix be checked on staging for a defect first found somewhere else.
+    environment_id = payload.environment_id or session.get(
+        models.TestRun, result.run_id
+    ).environment_id
+    environment = session.get(models.Environment, environment_id) if environment_id else None
+    if environment is None or environment.project_id != bug.project_id:
+        raise HTTPException(status.HTTP_409_CONFLICT, "no environment to verify against")
+
+    run = models.TestRun(
+        org_id=principal.org_id,
+        project_id=bug.project_id,
+        environment_id=environment.id,
+        trigger="verify",
+        status=models.RunStatus.PENDING,
+    )
+    session.add(run)
+    session.commit()
+
+    from qagent.worker.tasks import verify_bug
+
+    verify_bug.delay(
+        str(principal.org_id),
+        str(bug.id),
+        str(run.id),
+        payload.attempts,
+        str(principal.user_id),
+    )
+    return {"run_id": str(run.id), "status": run.status.value, "attempts": payload.attempts}
 
 
 @app.post("/api/v1/projects/{project_id}/gates", status_code=201, tags=["quality"])

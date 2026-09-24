@@ -63,6 +63,10 @@ class CaseOutcome:
     verdict: dict | None = None
     bug: dict | None = None
     artifacts: list[ArtifactBytes] = field(default_factory=list)
+    #: The executable spec (request *and* assertions) this outcome came from,
+    #: when there is one. Persisted on the test case so a defect's check can be
+    #: re-run on its own later to verify a fix (qagent/verification.py).
+    spec: dict | None = None
 
 
 @dataclass
@@ -672,6 +676,7 @@ def _execute_and_triage(
         response=execution.response,
         assertions=execution.assertions,
         failure_message=execution.failure_message,
+        spec=case.spec,
     )
 
     if execution.passed:

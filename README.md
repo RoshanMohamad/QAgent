@@ -794,6 +794,38 @@ made from*, because recomputing it later against today's open defects gives a
 different and useless answer. Reporting can never fail the gate: a QAgent API
 having a bad minute must not turn a passing build red.
 
+### Verifying a fix
+
+A full scan closes a defect on its own once the check that filed it passes
+again (`_close_if_fixed`, `persistence.py`) — that half of the loop needed
+nothing new. What was missing was the fast path from the [user
+journey](#example-user-journey): re-checking *one* defect right after a fix,
+without waiting for the whole suite.
+
+```bash
+POST /api/v1/bugs/{id}/verify   {"attempts": 3}
+→ {"run_id": "...", "status": "pending", "attempts": 3}
+
+GET /api/v1/bugs/{id}/history
+verification_failed   open → open      ← replayed 3/3, still 500s
+```
+
+The stored check (request *and* assertions — `qagent/verification.py`) is
+replayed against the environment it was last seen in, **several times, not
+once**: a single green replay is exactly what a flaky check produces half the
+time, so the verdict only lands when every attempt agrees.
+
+| Every attempt | Verdict | Bug status |
+|---|---|---|
+| passed | `fixed` | closed |
+| failed | `still_failing` | reopened, if a human had already closed it |
+| mixed, or any transport error | `inconclusive` | unchanged — not enough evidence either way |
+
+Not every defect is replayable this way: an [IDOR](#broken-access-control-idor)
+finding needs two identities and a browser defect needs a page session, so both
+return `409` pointing back at a full scan (`qagent scan` / `qagent scan-ui`)
+instead of a wrong verdict from a check that cannot actually reproduce them.
+
 ### Broken access control (IDOR)
 
 The one class of defect a generator rule cannot reach. Every rule builds one
@@ -1113,6 +1145,30 @@ cp .env.admin.example .env.admin   # bootstrap-only superuser DSN - api only, ne
 docker compose up --build
 ```
 
+### Authenticated targets
+
+The CLI takes credentials as `-H` flags. A queued scan cannot take them that way,
+so an environment instead names a secret, and the worker resolves that name
+right before the run starts. The database stores only the name, never the value
+(ADR-0004):
+
+```bash
+curl -X POST .../api/v1/projects/$PROJECT/environments   -d '{"base_url": "https://staging.example.com", "secret_ref": "shop-staging"}'
+```
+
+| `QAGENT_SECRETS_BACKEND` | Where the worker looks |
+|---|---|
+| `env` (default) | `QAGENT_ENV_SECRET_<ORG ID, 32 hex, upper-case>_SHOP_STAGING` |
+| `file` | `$QAGENT_SECRETS_DIR/<org id, 32 hex>/shop-staging`, for example a mounted Kubernetes secret volume |
+
+A secret value is either a bare token, which is sent as `Authorization: Bearer <token>`,
+or a JSON object of headers (`{"X-Api-Key": "..."}`). Every lookup is scoped to
+the run's organization, so one tenant cannot name another tenant's secret. A
+missing secret puts the run in `error`. It does not fall back to scanning
+anonymously, because that would look like a pass while skipping everything
+behind the login. Credential headers are redacted from HAR evidence before it
+is stored.
+
 ### Access control, rate limits, usage and metrics
 
 `register` always mints exactly one user, "owner" — an owner adds anyone else:
@@ -1276,7 +1332,7 @@ The CLI, the worker and the eval harness all run the identical loop — which me
 | [0005](docs/decisions/ADR-0005-interactive-exploration.md) | Interactive explorer state identity is `(path, structural fingerprint)`; actions are a closed schema-constrained set, ranked rules-first. |
 | [0006](docs/decisions/ADR-0006-repository-analyzer.md) | The repository analyzer reads and parses text only — never executes a checkout's own tooling — and every detection carries its evidence. |
 | [0007](docs/decisions/ADR-0007-rls-requires-an-unprivileged-role.md) | The API/worker connect as a separate, unprivileged role — never the superuser that bootstraps the schema — or row-level security is silently bypassed. |
-| [0008](docs/decisions/ADR-0008-phase-6-scope.md) | Phase 6 built RBAC, rate limiting, metrics, usage tracking and queue separation now; payment integration, cluster autoscaling and distributed tracing stay deferred until there's a real deployment to size them against. |
+| [0008](docs/decisions/ADR-0008-phase-6-scope.md) | Phase 6 built RBAC, rate limiting, metrics, usage tracking and queue separation now; Kubernetes manifests, autoscaling and tracing exist but stay untuned, and payment integration stays deferred, until there's a real deployment to size them against. |
 | [0010](docs/decisions/ADR-0010-infrastructure-is-validated-not-proven.md) | Infrastructure is schema-validated in CI, never described as proven; billing prices but never settles; the twelve-microservice split stays unbuilt and the queue split is the fan-out that carries its benefit. |
 | [0009](docs/decisions/ADR-0009-github-checkouts-are-ephemeral-and-host-pinned.md) | A connected repository is cloned from `github.com` only, with command-executing and local-file git transports disabled, and the checkout is deleted once analysed — tokens never reach argv or the database. |
 
@@ -1477,10 +1533,14 @@ triggers, fails open on a Redis outage), observability (`GET /metrics`,
 Prometheus format), usage tracking (`GET /api/v1/usage`, windowed — not
 `/dashboard`'s all-time spend), and job-queue separation (`qagent.scan` /
 `qagent.performance`, so load-test capacity scales independently of ordinary
-scans). Deliberately not built: payment/invoicing integration, Kubernetes
-manifests or autoscaling policies, and distributed tracing — all three need a
-real deployment or real load to size against, and ADR-0001 is exactly the
-argument against building them on guesses.
+scans). Kubernetes manifests (`deploy/kubernetes/`) and HPA autoscaling policies
+exist and are schema-valid, and OpenTelemetry spans exist behind
+`QAGENT_TRACING_ENABLED` — but none of the three is *tuned*: the manifests'
+`# TUNE:` values are starting points, not measurements, and tracing's sampling
+rate, retention and backend stay the operator's choice. Deliberately not built:
+payment/invoicing integration. All of this needs a real deployment or real
+load to size against, and ADR-0001 is exactly the argument against building it
+on guesses.
 
 Everything still open across phases 1-5 is listed once, above — this paragraph
 used to repeat that list and the two copies had already started to disagree.

@@ -87,6 +87,15 @@ class Settings(BaseSettings):
     qagent_max_llm_tokens: int = 200_000
     qagent_max_usd: float = 2.00
 
+    # --- Environment credentials (modules/secrets/) ---
+    # An environment stores a secret *name* (`secret_ref`); the worker resolves
+    # it here at run time, always inside the run's organization. "env" reads
+    # QAGENT_ENV_SECRET_<ORG ID HEX>_<REF>; "file" reads
+    # <qagent_secrets_dir>/<org id hex>/<ref>, which is what a Kubernetes secret
+    # volume or Docker's /run/secrets provides.
+    qagent_secrets_backend: Literal["env", "file"] = "env"
+    qagent_secrets_dir: str = "/run/secrets/qagent"
+
     # --- Runner sandbox ---
     qagent_runner_timeout_seconds: int = 120
     qagent_runner_max_concurrency: int = 4

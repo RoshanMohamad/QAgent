@@ -39,7 +39,7 @@ export default async function RunPage({
       {/* Only polls while the run is still moving; a finished run is static. */}
       {inFlight ? <AutoRefresh intervalMs={4000} /> : null}
 
-      <div className="flex items-center justify-between gap-4">
+      <div className="flex flex-wrap items-center justify-between gap-4">
         <Link
           href="/"
           className="text-xs hover:underline"
@@ -47,16 +47,24 @@ export default async function RunPage({
         >
           &larr; Dashboard
         </Link>
-        <StatusDot
-          tone={
-            inFlight
-              ? "warning"
-              : data.status === "passed"
-                ? "good"
-                : "critical"
-          }
-          label={inFlight ? `${data.status}, refreshing` : data.status}
-        />
+        <div className="flex items-center gap-3">
+          <span className="text-xs" style={{ color: "var(--text-muted)" }}>
+            {data.trigger}
+            {data.commit_sha ? (
+              <code className="tabular ml-2">{data.commit_sha.slice(0, 8)}</code>
+            ) : null}
+          </span>
+          <StatusDot
+            tone={
+              inFlight
+                ? "warning"
+                : data.status === "passed"
+                  ? "good"
+                  : "critical"
+            }
+            label={inFlight ? `${data.status}, refreshing` : data.status}
+          />
+        </div>
       </div>
 
       <div className="grid grid-cols-2 gap-3 md:grid-cols-4">

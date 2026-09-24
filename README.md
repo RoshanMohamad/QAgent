@@ -24,7 +24,7 @@ as one sentence, because the list stopped being readable:
 | Repository intelligence | Stack detection, module tree, [repository RAG](#repository-rag) — symbol-level chunking, BM25 + optional embeddings, pgvector when configured — feeding root-cause evidence into bug reports |
 | Browser | E2E page checks, interactive exploration, self-healing selector proposals, [recorder extension](#browser-recorder) → Playwright spec |
 | Security | Semgrep, Trivy and OWASP ZAP behind one severity vocabulary, plus a two-identity [IDOR probe](#broken-access-control-idor) |
-| CI/CD | [Quality gate](#quality-gate-and-ci) + GitHub Action, recorded gate/deployment history, [automatic alerts](#defect-history-and-alerts) with delivery tracking and retry |
+| CI/CD | [Quality gate](#quality-gate-and-ci) + GitHub Action, [push-triggered scans](#repository-analysis) via a signed webhook, recorded gate/deployment history, [automatic alerts](#defect-history-and-alerts) with delivery tracking and retry |
 | Performance | k6 and Apache JMeter behind one metric shape |
 | Deployment | [Validated Kubernetes manifests](#deployment), per-PR [ephemeral environments](#ephemeral-environments-per-pull-request), usage [priced into a statement](#billing) |
 | Platform | Multi-tenancy with Postgres RLS, RBAC, rate limiting, `/metrics`, usage tracking, queue separation, [Alembic migrations](#schema-migrations), S3-compatible storage, OpenTelemetry spans |
@@ -1086,8 +1086,31 @@ nothing else — it is passed through a 0600 credential file rather than argv (s
 it is not in `ps`), stripped from git's own error output, and never written to
 the database (ADR-0009).
 
-Analysis is a snapshot, not a subscription: a later push does not update it.
-Webhook-driven re-analysis needs a public callback and is deferred with Phase 5.
+Analysis is a snapshot, not a subscription by default: connecting a repository
+alone does not update it on a later push. **A push webhook makes it one:**
+
+```bash
+curl -X PUT $API/api/v1/projects/$PID/repositories/$RID/webhook \
+  -H "Authorization: Bearer $TOKEN" -d '{"secret_ref": "gh-webhook"}'
+# -> {"callback_url": "/api/v1/webhooks/github/<org id>/<repo id>", "events": ["push"]}
+```
+
+Paste that URL into the repository's GitHub webhook settings (content type
+`application/json`, secret whatever `QAGENT_ENV_SECRET_<ORG ID HEX>_GH_WEBHOOK`
+holds — the [same per-org secret store](#authenticated-targets) an
+environment's credentials come from). A push to the default branch then queues
+`qagent.run_scan` for every environment on the project — CLAUDE.md §19's
+`git push -> ... -> Run QA`, not just the analysis.
+
+The only authentication a webhook delivery can carry is the HMAC signature
+GitHub computes over the raw body (`modules/webhooks/github.py`); the org and
+repository ids in the URL are not secrets, the same way a Stripe Connect
+account id in a webhook URL isn't — they only select whose signing secret to
+check the delivery against, and nothing runs before that check passes. What
+was actually deferred with Phase 5 is exposing this deployment on a public
+address at all — the endpoint exists and is tested against a real delivery;
+giving GitHub a URL it can reach is the operator's step, same as wiring the
+[GitHub Action](#quality-gate-and-ci) already is.
 
 Detection reads manifests and config files only (`package.json`,
 `pyproject.toml`/`requirements.txt`, `docker-compose.yml`, framework config

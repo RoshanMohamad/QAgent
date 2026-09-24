@@ -620,6 +620,13 @@ class Repository(Base, TimestampMixin):
     #: Name of a secret in whatever store holds it - never the credential.
     secret_ref: Mapped[str | None] = mapped_column(String(200))
 
+    #: Name of the secret holding this repository's GitHub webhook secret -
+    #: same rule, same store (modules/secrets/). Set once an operator has
+    #: exposed this deployment publicly and configured a push webhook in
+    #: GitHub pointing at /api/v1/webhooks/github/{org_id}/{id}; null means no
+    #: webhook is configured and the endpoint refuses every request for it.
+    webhook_secret_ref: Mapped[str | None] = mapped_column(String(200))
+
     last_analyzed_sha: Mapped[str | None] = mapped_column(String(64))
     last_analyzed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 

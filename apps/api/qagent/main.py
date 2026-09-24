@@ -269,6 +269,17 @@ class ConnectRepoIn(BaseModel):
     token: str | None = Field(default=None, repr=False, exclude=True)
 
 
+class RepositoryWebhookIn(BaseModel):
+    #: Name of the secret GitHub's webhook settings were also given -
+    #: resolved at delivery time (modules/secrets/), never stored here.
+    secret_ref: str = Field(min_length=1, max_length=200)
+
+    @field_validator("secret_ref")
+    @classmethod
+    def _plain_secret_name(cls, value: str) -> str:
+        return validate_ref(value)
+
+
 class BugCommentIn(BaseModel):
     body: str = Field(min_length=1, max_length=10_000)
 
@@ -662,9 +673,139 @@ def list_repositories(
             "subdirectory": r.subdirectory,
             "last_analyzed_sha": r.last_analyzed_sha,
             "last_analyzed_at": r.last_analyzed_at,
+            "webhook_configured": r.webhook_secret_ref is not None,
         }
         for r in rows
     ]
+
+
+@app.put(
+    "/api/v1/projects/{project_id}/repositories/{repository_id}/webhook",
+    tags=["projects"],
+)
+def configure_repository_webhook(
+    project_id: UUID,
+    repository_id: UUID,
+    payload: RepositoryWebhookIn,
+    org_id: UUID = Depends(current_org),
+    session: Session = Depends(get_db),
+    _owner: Principal = Depends(require_owner),
+) -> dict:
+    """Name the secret GitHub's webhook settings sign deliveries with.
+
+    Owner-only, for the same reason connecting a repository is: it changes
+    which pushes make this server run real traffic against a real
+    environment. Returns the URL to paste into GitHub - not a secret; the org
+    and repository ids in it are not what authenticates a delivery, the HMAC
+    signature is (modules/webhooks/github.py). Configuring the webhook itself,
+    in GitHub's settings, is the operator's step, same as GitHub Actions.
+    """
+    repository = session.get(models.Repository, repository_id)
+    if repository is None or repository.project_id != project_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "repository not found")
+
+    repository.webhook_secret_ref = payload.secret_ref
+    session.commit()
+
+    return {
+        "callback_url": f"/api/v1/webhooks/github/{org_id}/{repository_id}",
+        "events": ["push"],
+        "content_type": "application/json",
+    }
+
+
+@app.post(
+    "/api/v1/webhooks/github/{org_id}/{repository_id}",
+    tags=["webhooks"],
+    dependencies=[Depends(rate_limit_by_ip("webhook", limit=120, window_seconds=60))],
+)
+async def receive_github_webhook(
+    org_id: UUID,
+    repository_id: UUID,
+    request: Request,
+    session: Session = Depends(get_db),
+    x_github_event: str | None = Header(default=None),
+    x_hub_signature_256: str | None = Header(default=None),
+) -> dict:
+    """A connected repository's push, re-validated and re-scanned.
+
+    Unauthenticated by bearer token - GitHub cannot send one - so identity is
+    the HMAC signature alone (modules/webhooks/github.py). The org and
+    repository ids in the URL are not secrets; they only say *which* repository's
+    webhook secret to check the signature against, the way a Stripe Connect
+    account id in a webhook URL says whose signing secret applies. Nothing here
+    trusts them before the signature check passes.
+
+    CLAUDE.md section 19's ``git push -> ... -> Run QA``: a push to the
+    repository's default branch queues `qagent.run_scan` for every environment
+    on its project, the same task and the same credential resolution
+    (modules/secrets/) a manual run uses.
+    """
+    import json
+
+    from qagent.modules.secrets.store import SecretNotFound, store_from_settings
+    from qagent.modules.webhooks.github import parse_push_event, verify_signature
+
+    body = await request.body()
+
+    set_tenant(session, org_id)
+    repository = session.get(models.Repository, repository_id)
+    if repository is None or repository.webhook_secret_ref is None:
+        # Same response whether the repository doesn't exist or has no webhook
+        # configured: neither is information a caller who fails the signature
+        # check (checked next, for a real repository) should be able to probe for.
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no webhook configured")
+
+    try:
+        secret = store_from_settings(settings).get(repository.webhook_secret_ref, org_id=org_id)
+    except SecretNotFound:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no webhook configured") from None
+
+    if not verify_signature(body, x_hub_signature_256, secret):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "signature mismatch")
+
+    if x_github_event == "ping":
+        return {"status": "pong"}
+    if x_github_event != "push":
+        return {"status": "ignored", "event": x_github_event}
+
+    event = parse_push_event(json.loads(body))
+    if event is None or event.deleted:
+        return {"status": "ignored"}
+    if event.ref != f"refs/heads/{repository.default_branch}":
+        return {"status": "ignored", "reason": "not the default branch"}
+
+    environments = session.execute(
+        select(models.Environment).where(models.Environment.project_id == repository.project_id)
+    ).scalars().all()
+    if not environments:
+        return {"status": "no environments configured", "commit_sha": event.commit_sha}
+
+    from qagent.worker.tasks import run_scan
+
+    queued_run_ids = []
+    for environment in environments:
+        run = models.TestRun(
+            org_id=org_id,
+            project_id=repository.project_id,
+            environment_id=environment.id,
+            trigger="webhook",
+            commit_sha=event.commit_sha,
+            status=models.RunStatus.PENDING,
+        )
+        session.add(run)
+        session.flush()
+        queued_run_ids.append(run.id)
+
+    session.commit()
+    for run_id in queued_run_ids:
+        run_scan.delay(str(org_id), str(repository.project_id), str(run_id))
+
+    return {
+        "status": "queued",
+        "commit_sha": event.commit_sha,
+        "run_ids": [str(r) for r in queued_run_ids],
+    }
 
 
 @app.post("/api/v1/projects/{project_id}/environments", status_code=201, tags=["projects"])
@@ -753,6 +894,8 @@ def get_run(
     return {
         "id": str(run.id),
         "status": run.status.value,
+        "trigger": run.trigger,
+        "commit_sha": run.commit_sha,
         "total": run.total,
         "passed": run.passed,
         "failed": run.failed,

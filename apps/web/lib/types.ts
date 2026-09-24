@@ -56,6 +56,8 @@ export interface Project {
 export interface Run {
   id: string;
   status: RunStatus;
+  trigger: string;
+  commit_sha: string | null;
   total: number;
   passed: number;
   failed: number;

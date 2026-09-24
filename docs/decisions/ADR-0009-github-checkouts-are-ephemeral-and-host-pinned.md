@@ -73,10 +73,15 @@ against files. A retained third-party checkout is standing risk — untrusted co
   stored analysis always names the commit it came from.
 - Every `CloneError` is a 422, never a 500: a bad URL, a bad branch, a missing
   credential and a private repository are all facts about the caller's request.
-- Analysis is a snapshot, not a subscription. Nothing re-clones when the repository
-  changes; a push does not update `Project.stack`. That needs webhooks, which need a
-  publicly reachable callback, and is deferred with the rest of Phase 5 rather than
-  half-built here.
+- Analysis is a snapshot, not a subscription, *unless* a repository's webhook is
+  configured (`PUT /repositories/{id}/webhook`, `modules/webhooks/github.py`): a
+  push to the default branch then queues a scan, verified by the HMAC GitHub
+  signs the delivery with — no bearer token, since GitHub cannot send one.
+  Re-cloning `Project.stack` itself on every push is not part of that: the
+  webhook re-runs QA, not the Project Analyst, matching CLAUDE.md §19's
+  `git push -> ... -> Run QA`. What is still the operator's own step is giving
+  GitHub a URL it can reach at all — exposing this deployment publicly, the
+  same prerequisite the GitHub Action already carries.
 - Only github.com works. GitLab and Bitbucket — listed in CLAUDE.md section 5 — are one
   entry in the allowlist plus their URL shape each, but they are not free: each is a
   different host to trust, so each is a deliberate decision rather than a regex widening.

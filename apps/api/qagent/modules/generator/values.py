@@ -136,3 +136,40 @@ def absent_resource_id(param: dict) -> str:
     if schema.get("format") == "uuid":
         return "00000000-0000-4000-8000-00000000dead"
     return "qagent-absent-99999"
+
+
+#: Checked in this order: a field can decorate several bounds at once (a string
+#: with both minLength and maxLength, say), and the smallest, most specific
+#: violation - one unit past whichever edge is nearest - is the fairest test of
+#: whether that exact edge is enforced.
+def _bound_violation(schema: dict) -> tuple[Any, str] | None:
+    """A value one unit past whichever bound `schema` declares, and which bound
+    that was - or ``None`` when it declares none of them."""
+    if "minimum" in schema and isinstance(schema["minimum"], (int, float)):
+        return schema["minimum"] - 1, "minimum"
+    if "maximum" in schema and isinstance(schema["maximum"], (int, float)):
+        return schema["maximum"] + 1, "maximum"
+    if "minLength" in schema and isinstance(schema["minLength"], int) and schema["minLength"] > 0:
+        return "x" * (schema["minLength"] - 1), "minLength"
+    if "maxLength" in schema and isinstance(schema["maxLength"], int):
+        return "x" * (schema["maxLength"] + 1), "maxLength"
+    return None
+
+
+def first_bounded_field(properties: dict) -> tuple[str, Any, str] | None:
+    """The first property (in declaration order) with a declared minimum,
+    maximum, minLength or maxLength, a value one unit past it, and which bound
+    it was - or ``None`` when nothing here declares one.
+
+    Declaration order, not alphabetical: a schema author's first property is
+    usually its most central one, the same reasoning `required_body_fields[0]`
+    already applies elsewhere in this generator.
+    """
+    for name, field_schema in properties.items():
+        if not isinstance(field_schema, dict):
+            continue
+        violation = _bound_violation(field_schema)
+        if violation is not None:
+            value, described = violation
+            return name, value, described
+    return None

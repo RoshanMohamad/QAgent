@@ -149,7 +149,7 @@ qagent evaluate --url http://127.0.0.1:8081 --name task-tracker --fixtures packa
 > reset. CI starts a fresh one per job and is unaffected; this bites only when
 > re-running locally.
 
-Five of the six are the same categories the seven generator rules already catch
+Five of the six are the same categories the generator's rules already catch
 (missing/wrong-type fields, a malformed or absent identifier, unenforced auth),
 seeded independently to show the rules generalise rather than being tuned to one
 app. The sixth, BUG-201, is an IDOR — any authenticated user can read any other
@@ -163,7 +163,7 @@ fixture declares the two identities that make it detectable at all. Reported:
 **6/6 detected, 0% false positives.**
 
 `packages/fixtures/notes-api` is a third fixture — Node.js, no framework, a
-hand-written OpenAPI document like task-tracker's — with five seeded defects:
+hand-written OpenAPI document like task-tracker's — with six seeded defects:
 
 ```bash
 cd packages/fixtures/notes-api && node server.js &
@@ -171,16 +171,22 @@ cd packages/fixtures/notes-api && node server.js &
 qagent evaluate --url http://127.0.0.1:8082 --name notes-api --fixtures packages/fixtures
 ```
 
-Four of the five are the same categories the other two fixtures already prove
+Four of the six are the same categories the other two fixtures already prove
 generalise (missing/wrong-type field, a malformed-or-absent identifier, unenforced
 auth) — a third time, in a third language, so the pattern is now three-for-three
-rather than a Python coincidence. The fifth, BUG-405, is a category neither other
-fixture has: `GET /admin/audit-log` checks a bearer token's claims but never
-verifies the signature backing them, so a structurally valid, entirely unsigned
-token (`alg: "none"`) is accepted as readily as a real one. That is exactly what
-`case_invalid_token` (`modules/generator/rules.py`) sends — a check that already
-existed with no fixture actually exercising it end to end until this one. Reported:
-**5/5 detected, 0% false positives.**
+rather than a Python coincidence.
+
+The other two are categories neither other fixture has. BUG-405: `GET
+/admin/audit-log` checks a bearer token's claims but never verifies the signature
+backing them, so a structurally valid, entirely unsigned token (`alg: "none"`) is
+accepted as readily as a real one — exactly what `case_invalid_token`
+(`modules/generator/rules.py`) sends, a check that already existed with no
+fixture actually exercising it end to end until this one. BUG-406: `priority`
+declares `minimum: 1, maximum: 5`; a value one past that minimum reaches an
+array lookup with no entry for it and crashes where 400 is documented —
+CLAUDE.md §12's "Boundary values," the one functional category the generator's
+rules had no check for until `case_boundary_value` was added specifically
+because no fixture exercised it. Reported: **6/6 detected, 0% false positives.**
 
 > **Restart each fixture between runs.** Same caveat as task-tracker's, for the
 > same reason: generation includes destructive and mutating cases, and each

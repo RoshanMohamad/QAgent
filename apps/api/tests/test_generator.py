@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from qagent.modules.discovery.openapi import EndpointSpec, parse_openapi, score_risk
-from qagent.modules.generator.rules import generate
+from qagent.modules.generator import values
+from qagent.modules.generator.rules import case_boundary_value, generate
 
 DOCUMENT = {
     "openapi": "3.0.0",
@@ -120,3 +121,136 @@ class TestGeneration:
         endpoint = EndpointSpec(method="GET", path="/health", responses={"200": {}})
         names = {c.name for c in generate([endpoint]).cases}
         assert not any("malformed" in n for n in names)
+
+    def test_no_boundary_case_when_the_schema_declares_no_bound(self):
+        # NewOrder's fields carry no minimum/maximum/length constraint.
+        cases = generate(parse_openapi(DOCUMENT)).cases
+        assert not any("past its" in c.name for c in cases)
+
+
+class TestBoundaryValueRule:
+    """CLAUDE.md section 12's "Boundary values" - `case_boundary_value`."""
+
+    document = {
+        "openapi": "3.0.0",
+        "info": {"title": "shop", "version": "1"},
+        "paths": {
+            "/orders": {
+                "post": {
+                    "operationId": "createOrder",
+                    "requestBody": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "required": ["quantity"],
+                                    "properties": {
+                                        "quantity": {
+                                            "type": "integer",
+                                            "minimum": 1,
+                                            "maximum": 100,
+                                        },
+                                    },
+                                }
+                            }
+                        }
+                    },
+                    "responses": {"201": {}, "400": {}},
+                }
+            }
+        },
+    }
+
+    def _endpoint(self):
+        return next(iter(parse_openapi(self.document)))
+
+    def test_fires_when_a_bound_is_declared(self):
+        case = case_boundary_value(self._endpoint())
+        assert case is not None
+        assert case.kind == "api_functional"
+
+    def test_sends_the_value_one_unit_past_the_nearer_bound(self):
+        # minimum (1) is checked before maximum (100) in first_bounded_field -
+        # the violation is one below it, not one above the maximum.
+        case = case_boundary_value(self._endpoint())
+        assert case.spec["request"]["json"]["quantity"] == 0
+
+    def test_asserts_a_4xx_and_no_server_error(self):
+        case = case_boundary_value(self._endpoint())
+        types = {a["type"] for a in case.spec["assertions"]}
+        assert types == {"status_in", "status_not_in", "body_not_matches"}
+        status_in = next(a for a in case.spec["assertions"] if a["type"] == "status_in")
+        assert status_in["value"] == [400, 409, 422]
+
+    def test_none_when_the_endpoint_has_no_request_body(self):
+        endpoint = EndpointSpec(method="GET", path="/health", responses={"200": {}})
+        assert case_boundary_value(endpoint) is None
+
+    def test_none_when_no_property_declares_a_bound(self):
+        document = {
+            "openapi": "3.0.0",
+            "info": {"title": "x", "version": "1"},
+            "paths": {
+                "/things": {
+                    "post": {
+                        "operationId": "create",
+                        "requestBody": {
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {"name": {"type": "string"}},
+                                    }
+                                }
+                            }
+                        },
+                        "responses": {"201": {}},
+                    }
+                }
+            },
+        }
+        endpoint = next(iter(parse_openapi(document)))
+        assert case_boundary_value(endpoint) is None
+
+    def test_generated_deterministically_like_every_other_rule(self):
+        endpoints = parse_openapi(self.document)
+        first = case_boundary_value(endpoints[0]).to_dict()
+        second = case_boundary_value(endpoints[0]).to_dict()
+        assert first == second
+
+
+class TestBoundaryValueHelper:
+    """qagent.modules.generator.values.first_bounded_field"""
+
+    def test_prefers_minimum_over_maximum_on_the_same_field(self):
+        found = values.first_bounded_field({"n": {"type": "integer", "minimum": 5, "maximum": 10}})
+        assert found == ("n", 4, "minimum")
+
+    def test_falls_back_to_maximum_when_no_minimum_is_declared(self):
+        found = values.first_bounded_field({"n": {"type": "integer", "maximum": 10}})
+        assert found == ("n", 11, "maximum")
+
+    def test_min_length_one_produces_an_empty_string(self):
+        found = values.first_bounded_field({"s": {"type": "string", "minLength": 1}})
+        assert found == ("s", "", "minLength")
+
+    def test_max_length_produces_one_character_too_many(self):
+        found = values.first_bounded_field({"s": {"type": "string", "maxLength": 3}})
+        assert found == ("s", "xxxx", "maxLength")
+
+    def test_returns_the_first_bounded_property_in_declaration_order(self):
+        found = values.first_bounded_field(
+            {
+                "unbounded": {"type": "string"},
+                "bounded": {"type": "integer", "minimum": 0},
+                "also_bounded": {"type": "integer", "minimum": 0},
+            }
+        )
+        assert found[0] == "bounded"
+
+    def test_none_when_nothing_declares_a_bound(self):
+        assert values.first_bounded_field({"n": {"type": "integer"}, "s": {"type": "string"}}) is None
+
+    def test_non_numeric_bound_values_are_ignored_rather_than_crashing(self):
+        # A malformed spec (a string where a number belongs) must not raise.
+        assert values.first_bounded_field({"n": {"type": "integer", "minimum": "not-a-number"}}) is None

@@ -198,6 +198,56 @@ def case_wrong_field_type(endpoint: EndpointSpec) -> GeneratedCase | None:
     )
 
 
+def case_boundary_value(endpoint: EndpointSpec) -> GeneratedCase | None:
+    """Send a value one unit past a schema-declared minimum, maximum,
+    minLength or maxLength.
+
+    CLAUDE.md section 12 lists "Boundary values" alongside missing fields and
+    wrong types as its own functional category; this rule is what makes it
+    real rather than aspirational. It only fires when the specification
+    itself declares a bound - nothing here guesses at a business rule the
+    schema never stated, the same restraint `case_wrong_field_type` applies
+    to types.
+    """
+    schema = endpoint.request_schema
+    if not schema or not schema.get("properties"):
+        return None
+
+    found = values.first_bounded_field(schema["properties"])
+    if found is None:
+        return None
+    target, value, bound = found
+
+    body = values.example_body(schema)
+    body[target] = value
+
+    return GeneratedCase(
+        name=f"{endpoint.key()} rejects '{target}' one past its {bound}",
+        kind="api_functional",
+        endpoint_key=endpoint.key(),
+        rationale=(
+            f"'{target}' declares a {bound}; a value one unit past it is a client "
+            "error, not something the handler should accept or crash on."
+        ),
+        spec={
+            "request": _request(
+                endpoint,
+                path_params=_valid_path_params(endpoint),
+                query=_required_query(endpoint),
+                body=body,
+            ),
+            "assertions": [
+                {"type": "status_in", "value": [400, 409, 422]},
+                NO_SERVER_ERROR,
+                NO_STACK_TRACE,
+            ],
+            "expectation": (
+                f"A '{target}' one past its declared {bound} returns a 4xx validation error."
+            ),
+        },
+    )
+
+
 def case_malformed_path_param(endpoint: EndpointSpec) -> GeneratedCase | None:
     params = endpoint.path_params
     if not params:
@@ -341,6 +391,7 @@ RULES = [
     case_happy_path,
     case_missing_required_field,
     case_wrong_field_type,
+    case_boundary_value,
     case_malformed_path_param,
     case_absent_resource,
     case_unauthenticated,
@@ -354,6 +405,7 @@ RULE_INTENTS: dict[str, str] = {
     "case_happy_path": "Valid request succeeds",
     "case_missing_required_field": "Missing required field is rejected",
     "case_wrong_field_type": "Wrongly typed field is rejected",
+    "case_boundary_value": "Value past a declared bound is rejected",
     "case_malformed_path_param": "Malformed identifier is rejected",
     "case_absent_resource": "Absent resource returns 404",
     "case_unauthenticated": "Unauthenticated request is refused",

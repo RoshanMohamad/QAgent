@@ -153,6 +153,10 @@ function listNotes(req, res) {
 
 // ---------------------------------------------------------------- seeded bugs
 
+// 10/20/30/40/50, indexed 1-5 to match the schema's declared bound -- there is
+// deliberately no entry for 0 (BUG-406 below).
+const PRIORITY_WEIGHT = { 1: 10, 2: 20, 3: 30, 4: 40, 5: 50 };
+
 /** BUG-401: a required field is dereferenced without validation.
  *
  * Omitting 'title', or sending a non-string 'title', both crash: the string
@@ -160,13 +164,22 @@ function listNotes(req, res) {
  * same ground-truth endpoint (seeded_defects.yaml matches by endpoint, not by
  * which generated check raised it) -- same convention task-tracker's
  * BUG-206 documents.
+ *
+ * BUG-406 lives in the same handler, on a different field: 'priority' declares
+ * `minimum: 1, maximum: 5` and is optional (omitting it defaults to 3, so the
+ * happy-path check -- which never sends it -- is unaffected). A value one
+ * past that minimum is never rejected before PRIORITY_WEIGHT[priority] is
+ * read, and there is no entry for 0, so the lookup is undefined and
+ * .toFixed() throws where 400 is documented.
  */
 async function createNote(req, res) {
   const claims = verifiedClaims(req);
   if (!claims) return send(res, 401, { detail: "Missing or invalid bearer token" });
   const body = await readJsonBody(req);
   const title = body.title.trim(); // BUG-401: no validation before .trim()
-  const note = { id: nextId++, title, done: false, owner: claims.sub };
+  const priority = body.priority ?? 3;
+  const weight = PRIORITY_WEIGHT[priority].toFixed(1); // BUG-406: no bound check first
+  const note = { id: nextId++, title, priority, weight, done: false, owner: claims.sub };
   NOTES.set(note.id, note);
   send(res, 201, note);
 }
@@ -290,7 +303,10 @@ const OPENAPI_DOCUMENT = {
               schema: {
                 type: "object",
                 required: ["title"],
-                properties: { title: { type: "string" } },
+                properties: {
+                  title: { type: "string" },
+                  priority: { type: "integer", minimum: 1, maximum: 5 },
+                },
               },
             },
           },

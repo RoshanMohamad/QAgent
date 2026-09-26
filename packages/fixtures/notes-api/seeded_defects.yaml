@@ -4,6 +4,11 @@
 # OpenAPI document like task-tracker's) from buggy-shop's FastAPI and task-tracker's
 # Flask, so detection isn't only ever proven against two Python code shapes.
 #
+# BUG-406 is the first fixture defect for CLAUDE.md section 12's "Boundary values" -
+# a category the generator had no rule for until case_boundary_value
+# (modules/generator/rules.py) was added specifically because no fixture exercised
+# it end to end.
+#
 # BUG-405 is a defect shape neither of the other two fixtures has: a check that runs
 # and checks *something*, but the wrong thing. `admin_audit_log` (server.js) decodes
 # a JWT-shaped token's claims and checks `role === "admin"` -- but never verifies the
@@ -20,7 +25,7 @@ identities:
     Authorization: "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhbGljZSIsInJvbGUiOiJhZG1pbiJ9.v0E7H-JbxyY5t4Jiw9wvXpTcoqj3AVCRI2n6nYhNnqw"
 
 fixture: notes-api
-description: Node.js (no framework) notes API with five seeded defects and two
+description: Node.js (no framework) notes API with six seeded defects and two
   correct endpoints.
 
 defects:
@@ -35,6 +40,21 @@ defects:
       the wrong type (a number has no .trim either). Both surface as 500 where 400
       is documented -- same shape as buggy-shop's BUG-004 and task-tracker's
       BUG-202, in a third language.
+
+  - id: BUG-406
+    endpoint: "POST /notes"
+    title: Value past a declared bound is dereferenced without validation
+    expected_class: real_bug
+    expected_severity: medium
+    detect_with: "a value one unit past a schema-declared minimum or maximum"
+    notes: >
+      'priority' declares minimum: 1, maximum: 5 and is optional (omitting it
+      defaults to 3, so the happy-path check, which never sends it, is unaffected).
+      PRIORITY_WEIGHT[priority] has no entry for 0, so .toFixed() throws on
+      undefined where 400 is documented. Same endpoint as BUG-401, a different
+      field and a different line - case_boundary_value (modules/generator/
+      rules.py) is what reaches this one, not case_missing_required_field or
+      case_wrong_field_type.
 
   - id: BUG-402
     endpoint: "GET /notes/{id}"

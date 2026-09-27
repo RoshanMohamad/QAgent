@@ -203,6 +203,9 @@ class Environment(Base, TimestampMixin):
     # Non-secret request defaults. Credentials live behind secret_ref, never here.
     default_headers: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     secret_ref: Mapped[str | None] = mapped_column(String(200))
+    #: GraphQL fields that require credentials (``["*"]`` for all). Introspection
+    #: cannot say, so null means no GraphQL auth checks (graphql/introspection.py).
+    graphql_protected: Mapped[list | None] = mapped_column(JSON)
 
     project: Mapped[Project] = relationship(back_populates="environments")
 

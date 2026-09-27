@@ -36,6 +36,15 @@ NO_STACK_TRACE = {
 }
 
 
+#: A structurally valid JWT with ``alg: none``, an empty signature and an admin
+#: claim. Accepting it means the signature is never checked. Shared by the REST
+#: and GraphQL forged-token rules so both probe with the identical credential.
+FORGED_BEARER = (
+    "Bearer eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0."
+    "eyJzdWIiOiJxYWdlbnQtcHJvYmUiLCJyb2xlIjoiYWRtaW4ifQ."
+)
+
+
 @dataclass
 class GeneratedCase:
     name: str
@@ -371,12 +380,7 @@ def case_invalid_token(endpoint: EndpointSpec) -> GeneratedCase | None:
                     else None,
                     auth="none",
                 ),
-                "headers": {
-                    "Authorization": (
-                        "Bearer eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0."
-                        "eyJzdWIiOiJxYWdlbnQtcHJvYmUiLCJyb2xlIjoiYWRtaW4ifQ."
-                    )
-                },
+                "headers": {"Authorization": FORGED_BEARER},
             },
             "assertions": [
                 {"type": "status_in", "value": [401, 403]},
@@ -414,6 +418,8 @@ RULE_INTENTS: dict[str, str] = {
     "graphql_malformed_id": "Malformed ID is handled, not crashed on",
     "graphql_absent_id": "Absent ID is handled, not crashed on",
     "graphql_explicit_null": "Explicit null for an optional argument is handled",
+    "graphql_unauthenticated": "Unauthenticated operation is refused",
+    "graphql_invalid_token": "Forged token is refused",
 }
 
 

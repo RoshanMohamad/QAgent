@@ -366,3 +366,159 @@ def test_emitted_graphql_suite_is_standalone_python():
     compile(graphql_file.content, graphql_file.path, "exec")  # must not raise
     assert "def graphql_error_kind(" in graphql_file.content
     assert "from qagent" not in graphql_file.content
+
+
+# ------------------------------------------------------------------ authentication
+
+
+class TestGraphqlAuth:
+    """Declared-protected fields only (introspection.is_protected)."""
+
+    def _protected(self, fields):
+        return {e.key(): e for e in parse_introspection(INTROSPECTION, protected=set(fields))}
+
+    def test_nothing_is_protected_unless_declared(self):
+        from qagent.modules.graphql.introspection import is_protected
+
+        assert is_protected("book", None) is False
+        assert is_protected("book", set()) is False
+        assert is_protected("book", {"health"}) is False
+        assert is_protected("book", {"book"}) is True
+        assert is_protected("anything", {"*"}) is True
+
+    def test_declaration_sets_requires_auth_and_raises_risk(self):
+        plain = _endpoints()["QUERY /graphql/book"]
+        protected = self._protected({"book"})["QUERY /graphql/book"]
+        assert protected.requires_auth is True
+        assert protected.risk_score > plain.risk_score
+        assert self._protected({"book"})["QUERY /graphql/health"].requires_auth is False
+
+    def test_no_auth_checks_without_a_declaration(self):
+        from qagent.modules.generator.graphql_rules import (
+            graphql_invalid_token,
+            graphql_unauthenticated,
+        )
+
+        for endpoint in _endpoints().values():
+            assert graphql_unauthenticated(endpoint) is None
+            assert graphql_invalid_token(endpoint) is None
+
+    def test_unauthenticated_check_strips_credentials_and_asks_whether_data_came_back(self):
+        from qagent.modules.generator.graphql_rules import graphql_unauthenticated
+
+        case = graphql_unauthenticated(self._protected({"book"})["QUERY /graphql/book"])
+        assert case.kind == "api_security"
+        assert case.spec["request"]["auth"] == "none"
+        assert case.spec["request"]["headers"] == {}
+        assert {"type": "graphql_field_denied", "value": "book"} in case.spec["assertions"]
+        assert case.spec["auth_probe"] is True
+
+    def test_forged_token_check_sends_the_same_token_as_the_rest_rule(self):
+        from qagent.modules.generator.graphql_rules import graphql_invalid_token
+        from qagent.modules.generator.rules import FORGED_BEARER
+
+        case = graphql_invalid_token(self._protected({"*"})["QUERY /graphql/health"])
+        assert case.spec["request"]["auth"] == "none"
+        assert case.spec["request"]["headers"] == {"Authorization": FORGED_BEARER}
+
+    @pytest.mark.parametrize(
+        ("status", "body", "denied"),
+        [
+            (401, None, True),
+            (403, {"data": {"book": {"id": "1"}}}, True),
+            (200, {"data": {"book": None}, "errors": [{"message": "no"}]}, True),
+            (200, {"data": None, "errors": [{"message": "no"}]}, True),
+            (200, {"data": {"book": None}}, True),  # null with no error: also a denial
+            (200, "not json", True),
+            (200, {"data": {"book": {"id": "1"}}}, False),
+            (200, {"data": {"book": []}}, False),  # an empty list is still served
+        ],
+    )
+    def test_denied_means_no_data_for_the_field(self, status, body, denied):
+        from qagent.modules.graphql.errors import graphql_field_denied
+
+        assert graphql_field_denied(status, body, "book") is denied
+
+    def test_assertion_names_what_was_served(self):
+        outcome = evaluate(
+            {"type": "graphql_field_denied", "value": "patrons"},
+            {"status": 200, "body_json": {"data": {"patrons": [{"email": "a@example.com"}]}}},
+        )
+        assert outcome.passed is False
+        assert "a@example.com" in outcome.message
+
+    def test_a_served_field_is_classified_as_an_access_control_bug(self):
+        from qagent.modules.generator.graphql_rules import graphql_unauthenticated
+
+        case = graphql_unauthenticated(self._protected({"book"})["QUERY /graphql/book"])
+        signals = _signals(case, {"data": {"book": {"id": "1"}}})
+        assert signals.is_auth_probe is True
+        verdict = classify(signals)
+        assert verdict.failure_class is FailureClass.REAL_BUG
+        assert verdict.confidence == 0.93
+
+    def test_offline_report_is_critical_and_describes_a_bypass(self):
+        from qagent.config import get_settings
+        from qagent.modules.generator.graphql_rules import graphql_invalid_token
+        from qagent.modules.llm.budget import Budget
+        from qagent.modules.llm.client import LlmClient
+        from qagent.modules.llm.providers import NullProvider
+        from qagent.modules.triage.agent import build_bug_report
+
+        case = graphql_invalid_token(self._protected({"book"})["QUERY /graphql/book"])
+        response = {"status": 200, "body_json": {"data": {"book": {"id": "1"}}}}
+        report = build_bug_report(
+            case_name=case.name,
+            verdict=classify(_signals(case, response["body_json"])),
+            spec={**case.spec, "kind": case.kind},
+            request=case.spec["request"],
+            response=response,
+            failure_message=None,
+            llm=LlmClient(settings=get_settings(), provider=NullProvider(), budget=Budget(10, 1000, 1.0)),
+        )
+        assert report["severity"] == "critical"
+        assert "without valid credentials" in report["actual"]
+        assert any("forged" in step for step in report["steps"])
+
+    def test_emitted_auth_checks_are_standalone_python(self):
+        from qagent.modules.emitter.pytest_emitter import emit
+
+        cases = generate(list(self._protected({"*"}).values())).cases
+        report = emit(cases, base_url="http://app.test", out_dir=None, dry_run=True)
+        (graphql_file,) = [f for f in report.files if f.path == "test_graphql.py"]
+        compile(graphql_file.content, graphql_file.path, "exec")
+        assert "def graphql_field_denied(" in graphql_file.content
+        assert "graphql_field_denied(response.status_code" in graphql_file.content
+
+
+def test_the_harness_passes_a_fixtures_declaration_to_the_pipeline(tmp_path, monkeypatch):
+    from qagent.eval import harness
+
+    fixture = tmp_path / "gql"
+    fixture.mkdir()
+    (fixture / "seeded_defects.yaml").write_text(
+        "fixture: gql\ngraphql_protected: [patrons, '*']\ndefects: []\n", encoding="utf-8"
+    )
+    seen = {}
+
+    def fake_run_pipeline(**kwargs):
+        seen.update(kwargs)
+        from datetime import UTC, datetime
+
+        from qagent.pipeline import PipelineResult
+
+        return PipelineResult(base_url=kwargs["base_url"], started_at=datetime.now(UTC))
+
+    monkeypatch.setattr(harness, "run_pipeline", fake_run_pipeline)
+    harness.run_evaluation(fixtures_dir=tmp_path, fixture_name="gql", base_url="http://x")
+    assert seen["graphql_protected"] == ["patrons", "*"]
+
+
+@pytest.mark.parametrize(
+    ("values", "expected"),
+    [([], None), (["a,b", " c "], ["a", "b", "c"]), (["*"], ["*"]), ([","], None)],
+)
+def test_cli_accepts_repeated_and_comma_separated_fields(values, expected):
+    from qagent.cli import _protected_fields
+
+    assert _protected_fields(values) == expected

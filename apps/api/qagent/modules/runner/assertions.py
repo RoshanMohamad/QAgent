@@ -137,6 +137,23 @@ def evaluate(assertion: dict, response: dict) -> AssertionOutcome:
             + (f": {message}" if message else ""),
         )
 
+    if kind == "graphql_field_denied":
+        from qagent.modules.graphql.errors import graphql_field_denied
+
+        field = str(expected or "")
+        denied = graphql_field_denied(status, body_json, field)
+        served = None
+        if not denied and isinstance(body_json, dict):
+            served = (body_json.get("data") or {}).get(field)
+        return AssertionOutcome(
+            kind,
+            denied,
+            f"no data for '{field}' without valid credentials",
+            _excerpt(str(served)) if served is not None else status,
+            f"'{field}' must not be served without valid credentials"
+            + ("" if denied else f", but returned {_excerpt(str(served), 80)}"),
+        )
+
     if kind == "header_present":
         headers = {k.lower(): v for k, v in (response.get("headers") or {}).items()}
         name = str(expected or "").lower()

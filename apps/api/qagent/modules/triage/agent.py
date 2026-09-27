@@ -193,6 +193,37 @@ def _template_report(
         first = errors[0] if errors and isinstance(errors[0], dict) else {}
         message = first.get("message")
         payload = request.get("json") or {}
+        if spec.get("auth_probe"):
+            field = next(
+                (
+                    a.get("value")
+                    for a in spec.get("assertions", [])
+                    if a.get("type") == "graphql_field_denied"
+                ),
+                "the field",
+            )
+            data = body.get("data") if isinstance(body.get("data"), dict) else {}
+            served = data.get(field)
+            return {
+                "title": case_name,
+                "severity": severity,
+                "expected": spec.get("expectation", "See assertions."),
+                "actual": f"HTTP {status}, '{field}' returned without valid credentials: "
+                + json.dumps(served)[:200],
+                "root_cause": verdict.reason,
+                "suggested_fix": (
+                    f"Check the caller's identity inside the '{field}' resolver (or in a "
+                    "shared guard every protected resolver runs) and raise an "
+                    "UNAUTHENTICATED error before any data is read."
+                ),
+                "steps": [
+                    f"POST {request.get('path')} with no credentials"
+                    + (" but a forged alg=none token" if request.get("headers") else ""),
+                    f"Operation: {str(payload.get('query'))[:300]}",
+                    f"Variables: {json.dumps(payload.get('variables'))[:300]}",
+                    f"Observe data for '{field}' in the response",
+                ],
+            }
         return {
             "title": case_name,
             "severity": severity,

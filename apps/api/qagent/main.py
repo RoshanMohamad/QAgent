@@ -226,6 +226,8 @@ class EnvironmentIn(BaseModel):
     #: The *name* of a secret holding this environment's credentials, resolved
     #: by the worker at run time (modules/secrets/). Never the credential.
     secret_ref: str | None = None
+    #: GraphQL fields requiring credentials; ["*"] for every field.
+    graphql_protected: list[str] | None = Field(default=None, max_length=500)
 
     @field_validator("secret_ref")
     @classmethod
@@ -833,6 +835,7 @@ def create_environment(
         e2e_enabled=payload.e2e_enabled,
         interactive_exploration_enabled=payload.interactive_exploration_enabled,
         secret_ref=payload.secret_ref,
+        graphql_protected=payload.graphql_protected,
     )
     session.add(environment)
     session.commit()

@@ -174,6 +174,9 @@ def run_evaluation(
         base_url=base_url,
         auth_headers=primary or None,
         secondary_auth_headers=secondary or None,
+        # Same reasoning as identities: a fixture seeding a GraphQL auth bug has
+        # to declare which fields are protected, because introspection can't.
+        graphql_protected=list(ground_truth.get("graphql_protected") or []) or None,
         llm=llm or LlmClient.from_settings(),
         allow_private=True,
     )

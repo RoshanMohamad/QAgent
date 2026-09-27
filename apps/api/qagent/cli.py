@@ -198,6 +198,24 @@ def _code_index_for(repo: Path | None, settings: Any) -> Any:
     return built
 
 
+#: One definition for every command that discovers, so scan, emit and plan
+#: cannot disagree about which GraphQL fields get authentication checks.
+_GRAPHQL_PROTECTED = typer.Option(
+    [],
+    "--graphql-protected",
+    help=(
+        "GraphQL field that requires credentials (repeatable or comma-separated; "
+        "'*' for every field). Introspection cannot say, so without this no "
+        "GraphQL auth check runs."
+    ),
+)
+
+
+def _protected_fields(values: list[str]) -> list[str] | None:
+    fields = [f.strip() for item in values for f in item.split(",") if f.strip()]
+    return fields or None
+
+
 @app.command()
 def scan(
     url: str = typer.Option(..., "--url", "-u", help="Base URL of the running application."),
@@ -217,6 +235,7 @@ def scan(
     fail_on_bug: bool = typer.Option(
         True, "--fail-on-bug/--no-fail-on-bug", help="Exit non-zero when a defect is found."
     ),
+    graphql_protected: list[str] = _GRAPHQL_PROTECTED,
 ) -> None:
     """Discover, generate, execute and triage API checks against a running app."""
     auth_headers = _parse_headers(header)
@@ -233,6 +252,7 @@ def scan(
         allowlist=settings.egress_allowlist,
         llm=LlmClient.from_settings(settings),
         code_index=_code_index_for(repo, settings),
+        graphql_protected=_protected_fields(graphql_protected),
     )
 
     _render(result, verbose=verbose)
@@ -942,6 +962,7 @@ def emit(
     ),
     max_cases: int | None = typer.Option(None, "--max-cases", help="Cap generated checks."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Report what would be written."),
+    graphql_protected: list[str] = _GRAPHQL_PROTECTED,
 ) -> None:
     """Write the generated checks out as runnable pytest files (agent 3).
 
@@ -954,7 +975,9 @@ def emit(
     from qagent.modules.planner.strategy import build_plan
     from qagent.pipeline import discover
 
-    endpoints, source = discover(url, spec, repo)
+    endpoints, source = discover(
+        url, spec, repo, graphql_protected=_protected_fields(graphql_protected)
+    )
     if not endpoints:
         console.print("[red]no endpoints discovered; nothing to emit[/red]")
         raise typer.Exit(code=2)
@@ -1253,6 +1276,7 @@ def plan(
     ),
     show_checks: bool = typer.Option(False, "--checks", help="List every required check."),
     output: Path | None = typer.Option(None, "--json", help="Write the plan as JSON."),
+    graphql_protected: list[str] = _GRAPHQL_PROTECTED,
 ) -> None:
     """Show the test strategy (agent 2) without executing anything.
 
@@ -1264,7 +1288,9 @@ def plan(
     from qagent.modules.planner.strategy import build_plan, coverage, enrich_plan
     from qagent.pipeline import discover
 
-    found, source = discover(url, spec, repo)
+    found, source = discover(
+        url, spec, repo, graphql_protected=_protected_fields(graphql_protected)
+    )
     if not found:
         console.print("[red]no endpoints discovered; nothing to plan[/red]")
         raise typer.Exit(code=2)

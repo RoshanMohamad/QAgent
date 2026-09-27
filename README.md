@@ -53,7 +53,7 @@ compares two. A third fixture, a third language (Node.js, no framework) with a
 defect shape neither of the first two carries — a check that runs but verifies
 the wrong thing, not one that is simply missing — also scores **5 of 5 at 0%
 false positives**. A fourth, the first that is not REST — a [GraphQL](#graphql)
-API where every response is `200 OK` — scores **4 of 4 at 0% false positives**.
+API where every response is `200 OK` — scores **6 of 6 at 0% false positives**.
 
 **Verified:** the pipeline (discovery, planning, generation, execution, triage,
 reporting), the CLI, the eval harness, **543 unit tests** and lint — all run
@@ -190,7 +190,7 @@ rules had no check for until `case_boundary_value` was added specifically
 because no fixture exercised it. Reported: **6/6 detected, 0% false positives.**
 
 `packages/fixtures/library-graphql` is the fourth, and the first that is not
-REST — see [GraphQL](#graphql) below. **4/4 detected, 0% false positives.**
+REST — see [GraphQL](#graphql) below. **6/6 detected, 0% false positives.**
 
 > **Restart each fixture between runs.** Same caveat as task-tracker's, for the
 > same reason: generation includes destructive and mutating cases, and each
@@ -286,7 +286,7 @@ flaky history, which never excuses an unhandled exception. `unclear` falls
 through to `unknown`, the conservative answer when false positives are the
 primary metric.
 
-**Four rules**, not the REST seven (`modules/generator/graphql_rules.py`). Missing
+**Six rules**, not the REST eight (`modules/generator/graphql_rules.py`). Missing
 required arguments and wrong types are rejected by GraphQL's own validation
 layer before any resolver runs, so checking them would test the GraphQL library,
 not the application. What transfers is the category of defect:
@@ -300,16 +300,45 @@ not the application. What transfers is the category of defect:
 - **Explicit null**: GraphQL treats an omitted argument and an explicit `null`
   as different inputs, and both are valid for a nullable argument. A resolver
   that defaults the first routinely crashes on the second.
+- **No credentials** and **a forged token** (the same unsigned `alg=none` token
+  the REST rule sends), for fields declared protected. See below.
 
 The fixture uses graphql-core's default error formatting, where a crashed
 resolver carries **no** error code. That is the harder case: detection comes from
 the exception text alone, not from a code that announces it.
 
-**Known gap, stated rather than guessed around: no authentication checks.**
-OpenAPI declares which operations are protected. GraphQL introspection does not
-expose applied directives, so there is no specification to hold a field to, and
-flagging every field that answers without credentials would put false positives
-on every legitimately public one.
+**Authentication checks run only for fields you declare protected.** OpenAPI
+declares which operations need credentials. GraphQL introspection does not
+expose applied directives, so QAgent can't find out on its own, and flagging
+every field that answers without credentials would put false positives on every
+legitimately public one. So it is told:
+
+```bash
+qagent scan --url http://127.0.0.1:8083 -H "Authorization: Bearer $TOKEN" \
+  --graphql-protected patrons,addBook,borrowBook     # or '*' for every field
+```
+
+The same list is `graphql_protected` on an environment (`POST .../environments`)
+for dashboard-triggered scans, and a key in a fixture's `seeded_defects.yaml`.
+`emit` and `plan` take the flag too, so an emitted suite contains the same auth
+checks the scan ran.
+
+It is a *protected* list on purpose, not a list of public fields. If a field is
+left off a protected list, it just gets no auth check. If a field were left off
+a public list, it would be reported as a vulnerability. False positives are the
+metric that matters most, so the omission that fails quietly is the safer one.
+With no declaration at all, no GraphQL auth check is generated. The fixture
+proves both directions: undeclared, it produces zero auth checks; declared, it
+flags exactly the two seeded auth bugs and passes the four correctly enforced
+mutations.
+
+The check asks one question: did the caller without valid credentials get data
+for the field? A `401`/`403`, or a null field (with or without an error), is a
+denial. Any value, even an empty list, means the field was served. The two
+seeded auth bugs need different rules. `patrons` never checks, so both rules
+catch it. `overdueReport` checks that a token is *present*, never that it is
+*valid*, so only the forged-token rule does. That is the GraphQL twin of
+notes-api's BUG-405.
 
 ### Repository RAG
 
@@ -1638,9 +1667,6 @@ that would come next, none of which are CLAUDE.md requirements:
   of tens of megabytes per failure — worth doing once there is a retention
   policy to size it against.
 - **GitLab and Bitbucket** (§5 says GitHub first, and only GitHub is built).
-- **Authentication checks for [GraphQL](#graphql).** Introspection does not say
-  which fields are protected. Closing this needs a declared source, such as an
-  allowlist of public fields or a schema annotation QAgent can read, not a guess.
 - **Settlement.** The statement is priced; wiring a payment provider needs a
   pricing decision that does not exist yet ([ADR-0010](docs/decisions/ADR-0010-infrastructure-is-validated-not-proven.md)).
 - **Tuning the manifests against a real cluster.** They are schema-valid; the

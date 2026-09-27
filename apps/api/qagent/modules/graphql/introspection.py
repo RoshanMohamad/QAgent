@@ -102,11 +102,30 @@ def _selection(return_ref: dict | None, types: dict[str, dict]) -> str:
     return "{ " + " ".join(fields or ["__typename"]) + " }"
 
 
-def parse_introspection(result: dict, *, graphql_path: str = "/graphql") -> list[EndpointSpec]:
+def is_protected(field: str, protected: set[str] | frozenset[str] | None) -> bool:
+    """Whether the operator declared ``field`` as requiring authentication.
+
+    Introspection cannot say (it does not expose applied directives), so this
+    is the only source, and it is a *protected* list on purpose: a field left
+    off it just gets no auth check (a missed check), where an allowlist of
+    public fields would turn every omission into a false positive - the metric
+    that matters most (ADR-0003). ``*`` declares the whole API protected.
+    """
+    return bool(protected) and ("*" in protected or field in protected)
+
+
+def parse_introspection(
+    result: dict,
+    *,
+    graphql_path: str = "/graphql",
+    protected: set[str] | frozenset[str] | None = None,
+) -> list[EndpointSpec]:
     """Flatten an introspection result into one endpoint per root field.
 
     Never raises on a malformed result: an API that half-answers introspection
     yields the fields that did parse, same contract as ``parse_openapi``.
+    ``protected`` is the operator's declaration of which fields need
+    credentials (see ``is_protected``).
     """
     schema = ((result or {}).get("data") or {}).get("__schema") or {}
     types = {
@@ -143,6 +162,7 @@ def parse_introspection(result: dict, *, graphql_path: str = "/graphql") -> list
                         }
                     )
                 path = f"{prefix}/{name}"
+                requires_auth = is_protected(name, protected)
                 # Risk as its REST twin would score: a mutation is a write, an
                 # ID argument is an identifier - the same two signals score_risk
                 # reads from a method and a `{param}` segment.
@@ -150,7 +170,7 @@ def parse_introspection(result: dict, *, graphql_path: str = "/graphql") -> list
                 risk = score_risk(
                     "post" if operation == "mutation" else "get",
                     path + ("/{id}" if has_id else ""),
-                    False,
+                    requires_auth,
                 )
                 endpoints.append(
                     EndpointSpec(
@@ -160,6 +180,7 @@ def parse_introspection(result: dict, *, graphql_path: str = "/graphql") -> list
                         summary=field.get("description"),
                         source="graphql",
                         risk_score=risk,
+                        requires_auth=requires_auth,
                         graphql={
                             "endpoint": prefix,
                             "operation": operation,
@@ -206,6 +227,7 @@ def fetch_graphql(
     explicit_path: str | None = None,
     headers: dict[str, str] | None = None,
     timeout: float = 15.0,
+    protected: set[str] | frozenset[str] | None = None,
 ) -> tuple[list[EndpointSpec], str | None]:
     """Probe for a GraphQL endpoint and introspect it.
 
@@ -233,7 +255,7 @@ def fetch_graphql(
                 continue
             if not isinstance(payload, dict) or not (payload.get("data") or {}).get("__schema"):
                 continue
-            endpoints = parse_introspection(payload, graphql_path=path)
+            endpoints = parse_introspection(payload, graphql_path=path, protected=protected)
             if endpoints:
                 logger.info("discovered graphql schema at %s (%d fields)", url, len(endpoints))
                 return endpoints, url

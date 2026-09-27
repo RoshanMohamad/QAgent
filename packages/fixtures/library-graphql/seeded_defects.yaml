@@ -12,13 +12,27 @@
 # `extensions.code` - graphql-core's default - so detection has to come from the
 # raw exception message, the harder case.
 #
-# Known, deliberate gap, not seeded: GraphQL introspection does not expose which
-# fields require authentication, so QAgent generates no auth checks for GraphQL
-# (modules/generator/graphql_rules.py). There is no specification to hold a field
-# to, and guessing would flag every legitimately public field.
+# Authentication: GraphQL introspection does not expose which fields require
+# credentials, so this file declares them (`graphql_protected`), exactly as an
+# operator passes `qagent scan --graphql-protected`. Without that declaration QAgent
+# generates no GraphQL auth check at all - guessing would flag every public field.
+# A fixture seeding GraphQL auth bugs has to declare it for the same reason
+# task-tracker declares two identities for its IDOR.
+
+identities:
+  primary:
+    Authorization: "Bearer library-alice-token"
+
+graphql_protected:
+  - patrons
+  - overdueReport
+  - addBook
+  - borrowBook
+  - renameBook
+  - returnBook
 
 fixture: library-graphql
-description: GraphQL library API with four seeded defects and three correct fields.
+description: GraphQL library API with six seeded defects and three correct fields.
 
 defects:
   - id: BUG-501
@@ -64,7 +78,31 @@ defects:
       the schema and puts the key in kwargs as None; .strip() then raises
       AttributeError. GraphQL-specific: omitted and null are different inputs.
 
+  - id: BUG-505
+    endpoint: "QUERY /graphql/patrons"
+    title: Field declared protected but never checked
+    expected_class: real_bug
+    expected_severity: critical
+    detect_with: request without credentials (graphql_unauthenticated)
+    notes: >
+      Every other protected resolver calls _require_user first. This one returns
+      every patron's email address to an anonymous caller. Same shape as
+      buggy-shop's BUG-003, as a GraphQL field.
+
+  - id: BUG-506
+    endpoint: "QUERY /graphql/overdueReport"
+    title: Token presence checked, token validity never checked
+    expected_class: real_bug
+    expected_severity: critical
+    detect_with: forged alg=none bearer token (graphql_invalid_token)
+    notes: >
+      A missing token is rejected correctly, so the unauthenticated check passes.
+      Any token at all is accepted, including an unsigned one, so only the
+      forged-token check reaches this. The GraphQL twin of notes-api's BUG-405.
+
 # Correct fields. Reported defects against these count as false positives.
+# returnBook is protected and correctly enforced, so it also proves the auth
+# checks do not flag a field that does its job.
 clean:
   - "QUERY /graphql/health"
   - "QUERY /graphql/books"

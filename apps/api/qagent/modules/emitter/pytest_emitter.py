@@ -199,6 +199,17 @@ def _assertion_lines(assertion: dict) -> list[str]:
             "        f\"{response.text[:200]}\"",
             "    )",
         ]
+    if kind == "graphql_field_denied":
+        return [
+            "    try:",
+            "        payload = response.json()",
+            "    except ValueError:",
+            "        payload = None",
+            f"    assert graphql_field_denied(response.status_code, payload, {str(value)!r}), (",
+            f'        "{value} must not be served without valid credentials: "',
+            "        f\"{response.text[:200]}\"",
+            "    )",
+        ]
     if kind == "json_path_equals":
         path = assertion.get("path", "")
         return [
@@ -319,7 +330,7 @@ def emit(
         )
 
         uses_graphql = any(
-            a.get("type") == "graphql_error_kind_in"
+            a.get("type") in {"graphql_error_kind_in", "graphql_field_denied"}
             for c in module_cases
             for a in (c.spec or {}).get("assertions") or []
         )

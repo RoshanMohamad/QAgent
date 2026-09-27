@@ -150,6 +150,7 @@ def discover(
     openapi_url: str | None = None,
     repo_path: Path | None = None,
     headers: dict[str, str] | None = None,
+    graphql_protected: list[str] | None = None,
 ) -> tuple[list[EndpointSpec], str | None]:
     """Discover endpoints from an OpenAPI document and/or a GraphQL schema,
     falling back to static route parsing of ``repo_path`` when neither exists.
@@ -168,7 +169,9 @@ def discover(
         sources.append(source_url or "openapi")
 
     if base_url:
-        graphql_endpoints, graphql_url = fetch_graphql(base_url, headers=headers)
+        graphql_endpoints, graphql_url = fetch_graphql(
+            base_url, headers=headers, protected=set(graphql_protected or [])
+        )
         if graphql_endpoints:
             endpoints.extend(graphql_endpoints)
             sources.append(graphql_url or "graphql")
@@ -209,6 +212,7 @@ def run_pipeline(
     plan_enrichment: bool = False,
     code_index: RepositoryIndex | None = None,
     secondary_auth_headers: dict[str, str] | None = None,
+    graphql_protected: list[str] | None = None,
 ) -> PipelineResult:
     """Run the full loop against one environment.
 
@@ -245,6 +249,10 @@ def run_pipeline(
     every rule tests one at a time. Without a second identity the stage is
     skipped and recorded as such.
 
+    ``graphql_protected`` names the GraphQL fields that require credentials
+    (``*`` for all). Introspection cannot say, so without it no GraphQL auth
+    check is generated (modules/graphql/introspection.is_protected).
+
     ``run_interactive`` additionally fills forms and clicks through same-origin pages
     (modules/explorer/interact.py) instead of only following links, folding any defect
     it finds into ``outcomes`` as ``kind="e2e_interactive"``. It is a separate stage
@@ -261,6 +269,7 @@ def run_pipeline(
             openapi_url,
             repo_path,
             headers={**(default_headers or {}), **(auth_headers or {})},
+            graphql_protected=graphql_protected,
         )
         set_attributes(active, endpoints=len(endpoints), spec_url=spec_url or "none")
     result.endpoints = endpoints

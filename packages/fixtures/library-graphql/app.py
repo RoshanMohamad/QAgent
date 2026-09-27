@@ -14,6 +14,11 @@ GraphQL API marks a client error.
 Everything answers HTTP 200, as GraphQL servers do. No status code in this
 file distinguishes a bug from a correct rejection.
 
+Authentication: every mutation, ``patrons`` and ``overdueReport`` require a
+bearer token; ``health``, ``books`` and ``book`` are public. GraphQL
+introspection cannot say which is which, so seeded_defects.yaml declares it
+(``graphql_protected``), the way an operator passes ``--graphql-protected``.
+
 Every bug is recorded in seeded_defects.yaml. Do not "fix" them. Run with:
 
     flask --app app run --port 8083
@@ -35,10 +40,18 @@ type Book {
   tags: [String!]!
 }
 
+type Patron {
+  id: ID!
+  name: String!
+  email: String!
+}
+
 type Query {
   health: String!
   books(author: String): [Book!]!
   book(id: ID!): Book
+  patrons: [Patron!]!
+  overdueReport: [Book!]!
 }
 
 type Mutation {
@@ -50,6 +63,13 @@ type Mutation {
 """
 
 schema = build_schema(SDL)
+
+TOKENS = {"library-alice-token": "alice"}
+
+PATRONS = [
+    {"id": 1, "name": "Alice", "email": "alice@example.com"},
+    {"id": 2, "name": "Bob", "email": "bob@example.com"},
+]
 
 BOOKS: dict[int, dict] = {
     1: {"id": 1, "title": "Dune", "author": "Frank Herbert", "available": True, "tags": ["sf"]},
@@ -69,6 +89,14 @@ def _bad_input(message: str) -> GraphQLError:
 
 def _not_found(message: str) -> GraphQLError:
     return GraphQLError(message, extensions={"code": "NOT_FOUND"})
+
+
+def _require_user(info) -> str:
+    """The correct guard: a known token, not merely a present one."""
+    user = TOKENS.get(info.context.get("token") or "")
+    if user is None:
+        raise GraphQLError("Authentication required", extensions={"code": "UNAUTHENTICATED"})
+    return user
 
 
 def _numeric_id(raw: str) -> int:
@@ -92,8 +120,10 @@ def resolve_books(_info, author: str | None = None) -> list[dict]:
     return [b for b in BOOKS.values() if b["author"] == author]
 
 
-def resolve_return_book(_info, id: str) -> dict:  # noqa: A002 - GraphQL argument name
-    """Correct: guards the cast and the existence, and says which went wrong."""
+def resolve_return_book(info, id: str) -> dict:  # noqa: A002 - GraphQL argument name
+    """Correct: authenticates, guards the cast and the existence, and says which
+    went wrong."""
+    _require_user(info)
     book = BOOKS.get(_numeric_id(id))
     if book is None:
         raise _not_found("Book not found")
@@ -115,7 +145,7 @@ def resolve_book(_info, id: str) -> dict | None:  # noqa: A002
     return BOOKS.get(int(id))  # BUG-501: ValueError on a non-numeric id
 
 
-def resolve_add_book(_info, title: str, author: str, tags: list[str] | None = None) -> dict:
+def resolve_add_book(info, title: str, author: str, tags: list[str] | None = None) -> dict:
     """BUG-502: an optional argument is dereferenced as if it were required.
 
     'tags' is nullable in the schema. Omitting it and sending an explicit null
@@ -123,6 +153,7 @@ def resolve_add_book(_info, title: str, author: str, tags: list[str] | None = No
     check sends (it only supplies required arguments), so even the baseline
     check finds this - one ground-truth endpoint, reached by two checks.
     """
+    _require_user(info)
     tag_line = ", ".join(tags)  # BUG-502: TypeError when tags is None
     book_id = max(BOOKS) + 1
     BOOKS[book_id] = {
@@ -135,19 +166,20 @@ def resolve_add_book(_info, title: str, author: str, tags: list[str] | None = No
     return BOOKS[book_id]
 
 
-def resolve_borrow_book(_info, id: str) -> dict:  # noqa: A002
+def resolve_borrow_book(info, id: str) -> dict:  # noqa: A002
     """BUG-503: resource existence is assumed before it is updated.
 
     The cast is guarded (a malformed id is a BAD_USER_INPUT error), but a
     well-formed absent id reaches ``book["available"] = False`` on None - the
     same isolation buggy-shop's BUG-002 and task-tracker's BUG-204 document.
     """
+    _require_user(info)
     book = BOOKS.get(_numeric_id(id))
     book["available"] = False  # BUG-503: TypeError when the book is absent
     return book
 
 
-def resolve_rename_book(_info, id: str, **kwargs) -> dict:  # noqa: A002
+def resolve_rename_book(info, id: str, **kwargs) -> dict:  # noqa: A002
     """BUG-504: an explicit null is treated as if it were a value.
 
     Omitting 'title' is handled - nothing changes. Sending ``title: null``,
@@ -156,12 +188,37 @@ def resolve_rename_book(_info, id: str, **kwargs) -> dict:  # noqa: A002
     shape: "omitted" and "null" are different inputs, and a resolver written
     against only the first is the most common way to get the second wrong.
     """
+    _require_user(info)
     book = BOOKS.get(_numeric_id(id))
     if book is None:
         raise _not_found("Book not found")
     if "title" in kwargs:
         book["title"] = kwargs["title"].strip()  # BUG-504: AttributeError on null
     return book
+
+
+def resolve_patrons(_info) -> list[dict]:
+    """BUG-505: declared protected, never checked.
+
+    Every other protected resolver calls _require_user first; this one returns
+    every patron's email address to an anonymous caller. The GraphQL twin of
+    buggy-shop's BUG-003 - and invisible to QAgent unless the operator declares
+    the field protected, because introspection cannot.
+    """
+    return PATRONS  # BUG-505: no _require_user(info)
+
+
+def resolve_overdue_report(info) -> list[dict]:
+    """BUG-506: checks that a token is present, never that it is valid.
+
+    No token is rejected correctly, so the unauthenticated check passes. Any
+    token at all - including an unsigned alg=none one - is accepted, so only
+    the forged-token check finds it. The GraphQL twin of notes-api's BUG-405:
+    a check that runs, but checks the wrong thing.
+    """
+    if not info.context.get("token"):
+        raise GraphQLError("Authentication required", extensions={"code": "UNAUTHENTICATED"})
+    return [b for b in BOOKS.values() if not b["available"]]  # BUG-506: never verified
 
 
 ROOT = {
@@ -172,16 +229,21 @@ ROOT = {
     "borrowBook": resolve_borrow_book,
     "renameBook": resolve_rename_book,
     "returnBook": resolve_return_book,
+    "patrons": resolve_patrons,
+    "overdueReport": resolve_overdue_report,
 }
 
 
 @app.post("/graphql")
 def graphql_endpoint():
     payload = request.get_json(force=True, silent=True) or {}
+    header = request.headers.get("Authorization", "")
+    token = header.removeprefix("Bearer ").strip() if header.startswith("Bearer ") else None
     result = graphql_sync(
         schema,
         payload.get("query") or "",
         root_value=ROOT,
+        context_value={"token": token},
         variable_values=payload.get("variables"),
         operation_name=payload.get("operationName"),
     )

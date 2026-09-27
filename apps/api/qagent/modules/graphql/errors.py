@@ -76,6 +76,26 @@ def _error_kind(error: object) -> str:
     return "unclear"
 
 
+def graphql_field_denied(status: object, body_json: object, field: str) -> bool:
+    """Did a request without valid credentials get *no* data for ``field``?
+
+    Denied means the transport refused it (401/403, some servers reject the
+    whole request) or the field came back null - with or without an error, since
+    returning null to hide a resource's existence is also a correct denial.
+    Served means the anonymous caller received a value. That is the only
+    question an authentication check asks, the same way a REST one asks
+    whether a 2xx came back.
+    """
+    if status in (401, 403):
+        return True
+    if not isinstance(body_json, dict):
+        return True  # not a GraphQL answer at all: nothing was served
+    data = body_json.get("data")
+    if not isinstance(data, dict):
+        return True
+    return data.get(field) is None
+
+
 def graphql_error_kind(body_json: object) -> str:
     """``none`` | ``handled`` | ``internal`` | ``unclear`` for one response body."""
     if not isinstance(body_json, dict):

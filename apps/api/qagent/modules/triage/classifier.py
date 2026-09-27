@@ -143,8 +143,10 @@ def extract_signals(
     # An auth probe deliberately strips or forges credentials and expects rejection.
     # It must be distinguished from an ordinary failure, because a *successful*
     # response to one is an authentication bypass rather than a fussy assertion.
-    is_auth_probe = (
-        request.get("auth") == "none" and bool(expected) and set(expected).issubset({401, 403})
+    # A GraphQL auth probe is answered 200 either way, so its spec says so
+    # directly - the same reason GraphQL checks declare `negative` themselves.
+    is_auth_probe = request.get("auth") == "none" and (
+        (bool(expected) and set(expected).issubset({401, 403})) or bool(spec.get("auth_probe"))
     )
 
     error_kind = response.get("error")

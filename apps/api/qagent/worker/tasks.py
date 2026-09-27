@@ -86,6 +86,7 @@ def run_scan(self, org_id: str, project_id: str, run_id: str) -> dict:
         run_e2e = environment.e2e_enabled
         run_interactive = environment.interactive_exploration_enabled
         secret_ref = environment.secret_ref
+        graphql_protected = environment.graphql_protected
         history = recent_history(session, org, project)
 
     # Resolved here, after the session closed and immediately before use: the
@@ -118,6 +119,7 @@ def run_scan(self, org_id: str, project_id: str, run_id: str) -> dict:
             history=history,
             run_e2e=run_e2e,
             run_interactive=run_interactive,
+            graphql_protected=graphql_protected,
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception("scan failed")

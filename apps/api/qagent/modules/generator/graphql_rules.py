@@ -17,11 +17,12 @@ optional argument sent as an explicit ``null``. GraphQL distinguishes "omitted"
 from "null" (the spec makes both valid for a nullable argument), and resolvers
 that handle the first with a default routinely crash on the second.
 
-Nothing here generates an authentication check, and that is a deliberate gap
-rather than an oversight: OpenAPI declares which operations are protected;
-GraphQL introspection does not expose applied directives, so there is no
-specification to hold a field to. Guessing would put false positives on every
-legitimately public field.
+Authentication checks run only for fields the operator *declared* protected
+(``--graphql-protected``, modules/graphql/introspection.is_protected).
+OpenAPI declares which operations are protected; GraphQL introspection does
+not expose applied directives, so without that declaration there is no
+specification to hold a field to, and guessing would put false positives on
+every legitimately public field.
 """
 
 from __future__ import annotations
@@ -29,7 +30,12 @@ from __future__ import annotations
 from typing import Any
 
 from qagent.modules.discovery.openapi import EndpointSpec
-from qagent.modules.generator.rules import NO_SERVER_ERROR, NO_STACK_TRACE, GeneratedCase
+from qagent.modules.generator.rules import (
+    FORGED_BEARER,
+    NO_SERVER_ERROR,
+    NO_STACK_TRACE,
+    GeneratedCase,
+)
 from qagent.modules.graphql.introspection import unwrap
 
 #: A resolver may answer these with data, null, or a handled error - all fine.
@@ -197,9 +203,64 @@ def graphql_explicit_null(endpoint: EndpointSpec) -> GeneratedCase | None:
     )
 
 
+def _auth_case(endpoint: EndpointSpec, *, name: str, headers: dict, expectation: str):
+    gql = endpoint.graphql or {}
+    variables = _required_values(endpoint)
+    return GeneratedCase(
+        name=name,
+        kind="api_security",
+        endpoint_key=endpoint.key(),
+        rationale="The operator declared this field protected.",
+        spec={
+            "request": {
+                "method": "POST",
+                "path": gql["endpoint"],
+                "path_params": {},
+                "query": {},
+                "json": {"query": _document(gql, variables), "variables": variables},
+                "auth": "none",
+                "headers": headers,
+            },
+            "assertions": [
+                NO_SERVER_ERROR,
+                {"type": "graphql_field_denied", "value": gql["field"]},
+            ],
+            "expectation": expectation,
+            "graphql": True,
+            # Read by triage: a failure here means the field was served without
+            # valid credentials - an access-control failure, not a fussy test.
+            "auth_probe": True,
+        },
+    )
+
+
+def graphql_unauthenticated(endpoint: EndpointSpec) -> GeneratedCase | None:
+    if not endpoint.requires_auth:
+        return None
+    return _auth_case(
+        endpoint,
+        name=f"{endpoint.key()} requires authentication",
+        headers={},
+        expectation="Without credentials the field returns no data.",
+    )
+
+
+def graphql_invalid_token(endpoint: EndpointSpec) -> GeneratedCase | None:
+    if not endpoint.requires_auth:
+        return None
+    return _auth_case(
+        endpoint,
+        name=f"{endpoint.key()} rejects a forged bearer token",
+        headers={"Authorization": FORGED_BEARER},
+        expectation="With an unsigned alg=none token the field returns no data.",
+    )
+
+
 GRAPHQL_RULES = [
     graphql_happy_path,
     graphql_malformed_id,
     graphql_absent_id,
     graphql_explicit_null,
+    graphql_unauthenticated,
+    graphql_invalid_token,
 ]

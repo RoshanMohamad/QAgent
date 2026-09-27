@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 from qagent.modules.discovery.openapi import EndpointSpec, fetch_spec, parse_openapi
 from qagent.modules.explorer.actions import InteractionPolicy
 from qagent.modules.generator.rules import GeneratedCase, generate
+from qagent.modules.graphql.introspection import fetch_graphql
 from qagent.modules.llm.client import LlmClient
 from qagent.modules.observability.tracing import set_attributes, span
 from qagent.modules.planner.strategy import CoverageReport, TestPlan, build_plan, coverage
@@ -145,14 +146,36 @@ class PipelineResult:
 
 
 def discover(
-    base_url: str, openapi_url: str | None = None, repo_path: Path | None = None
+    base_url: str,
+    openapi_url: str | None = None,
+    repo_path: Path | None = None,
+    headers: dict[str, str] | None = None,
 ) -> tuple[list[EndpointSpec], str | None]:
-    """Discover endpoints from an OpenAPI document, falling back to static route
-    parsing of ``repo_path`` when the project doesn't expose one.
+    """Discover endpoints from an OpenAPI document and/or a GraphQL schema,
+    falling back to static route parsing of ``repo_path`` when neither exists.
+
+    OpenAPI and GraphQL are combined, not alternatives: a REST health check
+    beside a GraphQL API is the common shape, and taking only the first one
+    found would silently drop half the surface. ``headers`` go to the
+    introspection request only - some APIs gate introspection behind auth.
     """
+    endpoints: list[EndpointSpec] = []
+    sources: list[str] = []
+
     document, source_url = fetch_spec(base_url, openapi_url)
     if document:
-        return parse_openapi(document), source_url
+        endpoints.extend(parse_openapi(document))
+        sources.append(source_url or "openapi")
+
+    if base_url:
+        graphql_endpoints, graphql_url = fetch_graphql(base_url, headers=headers)
+        if graphql_endpoints:
+            endpoints.extend(graphql_endpoints)
+            sources.append(graphql_url or "graphql")
+
+    if endpoints:
+        endpoints.sort(key=lambda e: (-e.risk_score, e.path, e.method))
+        return endpoints, " + ".join(sources)
 
     if repo_path is not None:
         from qagent.modules.discovery.routes import parse_routes
@@ -233,15 +256,21 @@ def run_pipeline(
 
     # --- discover -----------------------------------------------------------
     with span("qagent.discover", base_url=base_url) as active:
-        endpoints, spec_url = discover(base_url, openapi_url, repo_path)
+        endpoints, spec_url = discover(
+            base_url,
+            openapi_url,
+            repo_path,
+            headers={**(default_headers or {}), **(auth_headers or {})},
+        )
         set_attributes(active, endpoints=len(endpoints), spec_url=spec_url or "none")
     result.endpoints = endpoints
     result.spec_url = spec_url
 
     if not endpoints:
         result.errors.append(
-            "No OpenAPI document could be retrieved and route parsing found nothing "
-            "usable." + ("" if repo_path else " Supply --repo to try static route parsing.")
+            "No OpenAPI document or introspectable GraphQL schema could be retrieved, "
+            "and route parsing found nothing usable."
+            + ("" if repo_path else " Supply --repo to try static route parsing.")
         )
         result.finished_at = datetime.now(UTC)
         result.llm_totals = llm.totals()

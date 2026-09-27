@@ -185,6 +185,29 @@ def _template_report(
         # whether it manifests as a crash or as a quietly successful response.
         severity = "critical" if signals_is_security(spec) else "high"
 
+    if spec.get("graphql"):
+        # "HTTP 200" is true and useless for GraphQL: the defect is in the errors
+        # array, and the reproduction is the operation document, not a body blob.
+        body = response.get("body_json") if isinstance(response.get("body_json"), dict) else {}
+        errors = body.get("errors") if isinstance(body.get("errors"), list) else []
+        first = errors[0] if errors and isinstance(errors[0], dict) else {}
+        message = first.get("message")
+        payload = request.get("json") or {}
+        return {
+            "title": case_name,
+            "severity": severity,
+            "expected": spec.get("expectation", "See assertions."),
+            "actual": f"HTTP {status}, GraphQL error: {message or 'see response'}",
+            "root_cause": verdict.reason,
+            "suggested_fix": _fix_hint(verdict, spec, status),
+            "steps": [
+                f"POST {request.get('path')}",
+                f"Operation: {str(payload.get('query'))[:300]}",
+                f"Variables: {json.dumps(payload.get('variables'))[:300]}",
+                "Observe an unhandled resolver error in the response's errors array",
+            ],
+        }
+
     return {
         "title": case_name,
         "severity": severity,
@@ -221,6 +244,12 @@ def _fix_hint(verdict: Verdict, spec: dict, status: int | None = None) -> str:
                 "Enforce the security scheme this operation advertises. The credential "
                 "is currently parsed but never verified, so reject the request before "
                 "the handler runs when it is absent, malformed or unsigned."
+            )
+        if spec.get("graphql"):
+            return (
+                "Validate the argument inside the resolver and either return null or "
+                "raise a GraphQL error carrying a client code (BAD_USER_INPUT, "
+                "NOT_FOUND) instead of letting the exception escape the resolver."
             )
         return (
             "Validate and reject the input before it reaches business logic, and map "

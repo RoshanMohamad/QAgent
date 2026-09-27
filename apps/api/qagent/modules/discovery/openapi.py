@@ -71,6 +71,9 @@ class EndpointSpec:
     requires_auth: bool = False
     source: str = "openapi"
     risk_score: float = 0.0
+    #: Set only when ``source == "graphql"``: the operation type, field, its
+    #: arguments and a selection set (modules/graphql/introspection.py).
+    graphql: dict | None = None
 
     @property
     def declared_status_codes(self) -> list[int]:

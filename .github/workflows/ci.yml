@@ -45,7 +45,7 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install -e ./apps/api
-          pip install "uvicorn[standard]" flask
+          pip install "uvicorn[standard]" flask "graphql-core>=3.2"
 
       - name: Start fixture applications
         run: |
@@ -65,6 +65,12 @@ jobs:
           node server.js &
           for i in $(seq 1 20); do
             curl -sf http://127.0.0.1:8082/health && break
+            sleep 1
+          done
+          cd ../library-graphql
+          FLASK_APP=app.py flask run --port 8083 &
+          for i in $(seq 1 20); do
+            curl -sf http://127.0.0.1:8083/health && break
             sleep 1
           done
 
@@ -93,6 +99,15 @@ jobs:
         env:
           QAGENT_LLM_PROVIDER: "null"
         run: qagent evaluate --url http://127.0.0.1:8082 --name notes-api --fixtures packages/fixtures
+
+      - name: Evaluate (library-graphql, GraphQL)
+        # The first non-REST fixture. Every response is HTTP 200; the only
+        # difference between a crashed resolver and a correct rejection is the
+        # errors array (modules/graphql/errors.py). Crashes carry no error code
+        # (graphql-core's default), so detection reads the exception text.
+        env:
+          QAGENT_LLM_PROVIDER: "null"
+        run: qagent evaluate --url http://127.0.0.1:8083 --name library-graphql --fixtures packages/fixtures
 
       - name: Emitted suite must agree with the pipeline
         # Agent 3 emits standalone pytest files. The claim is that they are the

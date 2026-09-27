@@ -190,6 +190,15 @@ def _assertion_lines(assertion: dict) -> list[str]:
             f"        \"response should contain path {str(value)!r}\"",
             "    )",
         ]
+    if kind == "graphql_error_kind_in":
+        allowed = list(value or [])
+        return [
+            "    kind = graphql_error_kind(response.json())",
+            f"    assert kind in {allowed!r}, (",
+            f'        f"graphql errors should be {allowed!r}, got {{kind}}: "',
+            "        f\"{response.text[:200]}\"",
+            "    )",
+        ]
     if kind == "json_path_equals":
         path = assertion.get("path", "")
         return [
@@ -218,6 +227,18 @@ def _json_path(payload, path):
             return False, None
     return True, current
 '''
+
+
+def _graphql_errors_helper() -> str:
+    """modules/graphql/errors.py, verbatim - minus the ``__future__`` import,
+    which is only legal at the top of a file. Embedded rather than copied so
+    the emitted suite and the in-process runner cannot disagree about what
+    counts as a crashed resolver."""
+    from qagent.modules.graphql import errors
+
+    source = Path(errors.__file__).read_text(encoding="utf-8")
+    kept = [line for line in source.splitlines() if line != "from __future__ import annotations"]
+    return "\n\n" + "\n".join(kept) + "\n"
 
 
 def render_case(case: GeneratedCase, *, used_names: set[str]) -> str:
@@ -297,9 +318,17 @@ def emit(
             for a in (c.spec or {}).get("assertions") or []
         )
 
+        uses_graphql = any(
+            a.get("type") == "graphql_error_kind_in"
+            for c in module_cases
+            for a in (c.spec or {}).get("assertions") or []
+        )
+
         content = _MODULE_HEADER.format(base_url=base_url)
         if uses_json_path:
             content += _JSON_PATH_HELPER
+        if uses_graphql:
+            content += _graphql_errors_helper()
         content += body
 
         file_path = f"test_{module}.py"

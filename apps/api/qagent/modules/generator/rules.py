@@ -410,7 +410,25 @@ RULE_INTENTS: dict[str, str] = {
     "case_absent_resource": "Absent resource returns 404",
     "case_unauthenticated": "Unauthenticated request is refused",
     "case_invalid_token": "Forged token is refused",
+    "graphql_happy_path": "Valid operation resolves without errors",
+    "graphql_malformed_id": "Malformed ID is handled, not crashed on",
+    "graphql_absent_id": "Absent ID is handled, not crashed on",
+    "graphql_explicit_null": "Explicit null for an optional argument is handled",
 }
+
+
+def rules_for(endpoint: EndpointSpec) -> list:
+    """The rule set that applies to an endpoint's kind of API.
+
+    REST rules on a GraphQL field would test the GraphQL library's own
+    validation, not the application (modules/generator/graphql_rules.py).
+    Imported lazily because graphql_rules builds on this module.
+    """
+    if endpoint.source == "graphql":
+        from qagent.modules.generator.graphql_rules import GRAPHQL_RULES
+
+        return GRAPHQL_RULES
+    return RULES
 
 
 def rule_intent(rule_name: str) -> str:
@@ -427,7 +445,7 @@ def applicable_rules(endpoint: EndpointSpec) -> list[str]:
     a duplicated applicability predicate quietly disagrees with its rule.
     """
     names = []
-    for rule in RULES:
+    for rule in rules_for(endpoint):
         try:
             if rule(endpoint) is not None:
                 names.append(rule.__name__)
@@ -461,7 +479,7 @@ def generate(
     ordered = plan.order_endpoints(endpoints) if plan is not None else endpoints
 
     for endpoint in ordered:
-        for rule in RULES:
+        for rule in rules_for(endpoint):
             if max_cases is not None and len(report.cases) >= max_cases:
                 report.skipped.append(f"{endpoint.key()} (case limit reached)")
                 return report

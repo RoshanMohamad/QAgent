@@ -118,6 +118,25 @@ def evaluate(assertion: dict, response: dict) -> AssertionOutcome:
             f"'{path}' should equal {expected!r}",
         )
 
+    if kind == "graphql_error_kind_in":
+        # GraphQL answers a crashed resolver with 200 OK; the verdict lives in
+        # the errors array (modules/graphql/errors.py).
+        from qagent.modules.graphql.errors import graphql_error_kind
+
+        actual = graphql_error_kind(body_json)
+        first_error = None
+        if isinstance(body_json, dict) and isinstance(body_json.get("errors"), list):
+            first_error = (body_json["errors"] or [{}])[0]
+        message = first_error.get("message") if isinstance(first_error, dict) else None
+        return AssertionOutcome(
+            kind,
+            actual in (expected or []),
+            expected,
+            actual,
+            f"graphql errors should be {expected}, got {actual}"
+            + (f": {message}" if message else ""),
+        )
+
     if kind == "header_present":
         headers = {k.lower(): v for k, v in (response.get("headers") or {}).items()}
         name = str(expected or "").lower()

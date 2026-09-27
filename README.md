@@ -19,7 +19,7 @@ as one sentence, because the list stopped being readable:
 
 | Area | What exists |
 |---|---|
-| Core loop | Discovery (OpenAPI + static route parsing), Test Planner (agent 2), rule-based generation, SSRF-guarded execution, rules-first triage, defect reports with [HAR evidence](#evidence-on-every-defect) |
+| Core loop | Discovery (OpenAPI, [GraphQL introspection](#graphql), static route parsing), Test Planner (agent 2), rule-based generation, SSRF-guarded execution, rules-first triage, defect reports with [HAR evidence](#evidence-on-every-defect) |
 | Agents | Project Analyst (1), Test Planner (2), Generator + pytest emitter (3), Explorer — link-crawl and interactive (4), Bug Hunter / Failure Analyzer |
 | Repository intelligence | Stack detection, module tree, [repository RAG](#repository-rag) — symbol-level chunking, BM25 + optional embeddings, pgvector when configured — feeding root-cause evidence into bug reports |
 | Browser | E2E page checks, interactive exploration, self-healing selector proposals, [recorder extension](#browser-recorder) → Playwright spec |
@@ -52,7 +52,8 @@ at a time. It is now found by a [probe](#broken-access-control-idor) that
 compares two. A third fixture, a third language (Node.js, no framework) with a
 defect shape neither of the first two carries — a check that runs but verifies
 the wrong thing, not one that is simply missing — also scores **5 of 5 at 0%
-false positives**.
+false positives**. A fourth, the first that is not REST — a [GraphQL](#graphql)
+API where every response is `200 OK` — scores **4 of 4 at 0% false positives**.
 
 **Verified:** the pipeline (discovery, planning, generation, execution, triage,
 reporting), the CLI, the eval harness, **543 unit tests** and lint — all run
@@ -188,6 +189,9 @@ CLAUDE.md §12's "Boundary values," the one functional category the generator's
 rules had no check for until `case_boundary_value` was added specifically
 because no fixture exercised it. Reported: **6/6 detected, 0% false positives.**
 
+`packages/fixtures/library-graphql` is the fourth, and the first that is not
+REST — see [GraphQL](#graphql) below. **4/4 detected, 0% false positives.**
+
 > **Restart each fixture between runs.** Same caveat as task-tracker's, for the
 > same reason: generation includes destructive and mutating cases, and each
 > fixture holds its data in memory. CI starts a fresh process per job.
@@ -247,6 +251,65 @@ and `--enrich` spends one model call letting a review raise a module's priority
 (never lower one, never remove a check). `qagent scan` builds the same plan
 automatically and prints a coverage line whenever a run covered less than it
 planned; `GET /api/v1/runs/{id}/plan` returns the stored plan for a persisted run.
+
+### GraphQL
+
+GraphQL answers almost everything with `200 OK`. A resolver that crashed and a
+resolver that correctly said "not found" look identical at the HTTP layer; the
+difference lives in the `errors` array. So supporting GraphQL was not a second
+parser. It needed a way to read that array the way triage reads a status code:
+
+```bash
+cd packages/fixtures/library-graphql && flask --app app run --port 8083 &
+qagent scan --url http://127.0.0.1:8083
+```
+
+**Discovery** probes `/graphql` and a few other common paths with the standard
+introspection query. Each root `Query` and `Mutation` field becomes one endpoint,
+keyed `QUERY /graphql/book` the way an OpenAPI operation is keyed `GET /books/{id}`,
+so planning, persistence, the dashboard and the evaluation harness handle it with
+no second code path. It runs beside OpenAPI, not instead of it, so a REST health
+check next to a GraphQL API is not dropped. An API with introspection disabled is
+not discovered: there is no way to enumerate its fields that isn't guessing.
+
+**Reading `errors`** (`modules/graphql/errors.py`) sorts a response into one of four kinds:
+
+| Kind | Means | Evidence |
+|---|---|---|
+| `none` | no errors | |
+| `handled` | the API rejected the request on purpose | a client code (`BAD_USER_INPUT`, `NOT_FOUND`, GitHub's `type`), or a message that reads as a client error |
+| `internal` | a resolver raised an unhandled exception | Apollo's `INTERNAL_SERVER_ERROR`, a leaked exception in `extensions`, or a raw runtime message (`invalid literal for int()`, `Cannot read properties of undefined`) |
+| `unclear` | errors exist, none of the above | never reported: a codeless error from a server that doesn't use codes is not evidence of a crash |
+
+Triage treats `internal` as a 5xx in every sense but the status code. That includes
+flaky history, which never excuses an unhandled exception. `unclear` falls
+through to `unknown`, the conservative answer when false positives are the
+primary metric.
+
+**Four rules**, not the REST seven (`modules/generator/graphql_rules.py`). Missing
+required arguments and wrong types are rejected by GraphQL's own validation
+layer before any resolver runs, so checking them would test the GraphQL library,
+not the application. What transfers is the category of defect:
+
+- **Happy path**: required arguments only, optional ones omitted. This is also
+  the check that catches a resolver dereferencing an optional argument it
+  assumes was sent.
+- **Malformed ID**: GraphQL's `ID` scalar accepts any string, so
+  `"not-a-number"` passes validation and reaches the resolver's cast.
+- **Absent ID**: a well-formed id for a row that does not exist.
+- **Explicit null**: GraphQL treats an omitted argument and an explicit `null`
+  as different inputs, and both are valid for a nullable argument. A resolver
+  that defaults the first routinely crashes on the second.
+
+The fixture uses graphql-core's default error formatting, where a crashed
+resolver carries **no** error code. That is the harder case: detection comes from
+the exception text alone, not from a code that announces it.
+
+**Known gap, stated rather than guessed around: no authentication checks.**
+OpenAPI declares which operations are protected. GraphQL introspection does not
+expose applied directives, so there is no specification to hold a field to, and
+flagging every field that answers without credentials would put false positives
+on every legitimately public one.
 
 ### Repository RAG
 
@@ -1289,6 +1352,9 @@ locations, then flattened into endpoints with local `$ref`s resolved. Every endp
 gets a **risk score** from its method, path and security declaration, and generation
 works down that ranking — so a truncated budget still covers what matters.
 
+A GraphQL schema is discovered alongside it by introspection, one endpoint per
+root field; see [GraphQL](#graphql) for why that also needed its own error reading.
+
 When no document can be found and `--repo` (or `scan-repo`'s compose checkout) is
 given, discovery falls back to **static route parsing**: an AST walk over Python
 source for FastAPI/Flask-style decorators (`@app.get("/x")`,
@@ -1572,15 +1638,20 @@ that would come next, none of which are CLAUDE.md requirements:
   of tens of megabytes per failure — worth doing once there is a retention
   policy to size it against.
 - **GitLab and Bitbucket** (§5 says GitHub first, and only GitHub is built).
+- **Authentication checks for [GraphQL](#graphql).** Introspection does not say
+  which fields are protected. Closing this needs a declared source, such as an
+  allowlist of public fields or a schema annotation QAgent can read, not a guess.
 - **Settlement.** The statement is priced; wiring a payment provider needs a
   pricing decision that does not exist yet ([ADR-0010](docs/decisions/ADR-0010-infrastructure-is-validated-not-proven.md)).
 - **Tuning the manifests against a real cluster.** They are schema-valid; the
   numbers marked `# TUNE:` are starting points, not measurements.
 - **More fixtures**, which is the highest-leverage work at any point — every
   metric in this README is only as trustworthy as the ground truth behind it.
-  A third landed ([notes-api](#evaluating-against-more-fixtures), Node.js,
-  the alg=none token-forgery category), which does not make this item done;
-  it makes the next fixture worth exactly as much as this one was.
+  A third ([notes-api](#evaluating-against-more-fixtures), Node.js, the
+  alg=none token-forgery category) and a fourth
+  ([library-graphql](#graphql), the first non-REST one) have landed, which
+  does not make this item done; each makes the next fixture worth exactly as
+  much as it was.
 
 Phase 6 (CLAUDE.md §23) is scoped, not skipped — see
 [ADR-0008](docs/decisions/ADR-0008-phase-6-scope.md). Built: RBAC (`require_owner`

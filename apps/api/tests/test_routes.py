@@ -113,6 +113,7 @@ def test_discover_falls_back_to_route_parser_when_no_spec(tmp_path: Path, monkey
     monkeypatch.setattr(
         "qagent.pipeline.fetch_spec", lambda base_url, openapi_url, timeout=15.0: ({}, None)
     )
+    monkeypatch.setattr("qagent.pipeline.fetch_graphql", lambda *a, **k: ([], None))
 
     endpoints, source = discover("http://example.test", None, tmp_path)
     assert source == f"route-parser:{tmp_path}"
@@ -127,6 +128,7 @@ def test_discover_prefers_openapi_over_route_parser(tmp_path: Path, monkeypatch)
         "qagent.pipeline.fetch_spec",
         lambda base_url, openapi_url, timeout=15.0: (document, "http://example.test/openapi.json"),
     )
+    monkeypatch.setattr("qagent.pipeline.fetch_graphql", lambda *a, **k: ([], None))
 
     endpoints, source = discover("http://example.test", None, tmp_path)
     assert source == "http://example.test/openapi.json"

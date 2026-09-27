@@ -1,0 +1,71 @@
+# Ground truth for the library-graphql fixture (ADR-0003).
+#
+# Fourth fixture, and the first that is not REST: a GraphQL API (Flask +
+# graphql-core, vanilla error formatting). Endpoint keys are how QAgent names a
+# GraphQL root field - operation type plus /graphql/<field> - so the harness
+# matches reported defects here exactly as it matches `GET /books/{id}` elsewhere
+# (modules/graphql/introspection.py).
+#
+# Every response is HTTP 200. The only thing separating a crashed resolver from a
+# correctly rejected request is the errors array, which is the capability this
+# fixture exists to prove (modules/graphql/errors.py). Crashes here carry no
+# `extensions.code` - graphql-core's default - so detection has to come from the
+# raw exception message, the harder case.
+#
+# Known, deliberate gap, not seeded: GraphQL introspection does not expose which
+# fields require authentication, so QAgent generates no auth checks for GraphQL
+# (modules/generator/graphql_rules.py). There is no specification to hold a field
+# to, and guessing would flag every legitimately public field.
+
+fixture: library-graphql
+description: GraphQL library API with four seeded defects and three correct fields.
+
+defects:
+  - id: BUG-501
+    endpoint: "QUERY /graphql/book"
+    title: Identifier cast without validation in a resolver
+    expected_class: real_bug
+    expected_severity: high
+    detect_with: malformed ID argument
+    notes: >
+      int(id) raises ValueError for "not-a-number". GraphQL's ID scalar accepts
+      any string, so schema validation does not stop it. An absent numeric id
+      returns null correctly, isolating this to the cast.
+
+  - id: BUG-502
+    endpoint: "MUTATION /graphql/addBook"
+    title: Optional argument dereferenced as if required
+    expected_class: real_bug
+    expected_severity: high
+    detect_with: happy path (optional args omitted), or explicit null
+    notes: >
+      ", ".join(tags) raises TypeError when the nullable 'tags' argument is
+      omitted or null. The happy-path check omits optional arguments, so it
+      reaches this on its own; the explicit-null check reaches the same line.
+
+  - id: BUG-503
+    endpoint: "MUTATION /graphql/borrowBook"
+    title: Resource existence assumed before it is updated
+    expected_class: real_bug
+    expected_severity: medium
+    detect_with: absent-but-well-formed ID argument
+    notes: >
+      The cast is guarded (malformed -> BAD_USER_INPUT). A well-formed absent id
+      reaches book["available"] = False on None and raises TypeError.
+
+  - id: BUG-504
+    endpoint: "MUTATION /graphql/renameBook"
+    title: Explicit null for an optional argument treated as a value
+    expected_class: real_bug
+    expected_severity: medium
+    detect_with: explicit null for a nullable argument
+    notes: >
+      Omitting 'title' changes nothing, correctly. 'title: null' is valid per
+      the schema and puts the key in kwargs as None; .strip() then raises
+      AttributeError. GraphQL-specific: omitted and null are different inputs.
+
+# Correct fields. Reported defects against these count as false positives.
+clean:
+  - "QUERY /graphql/health"
+  - "QUERY /graphql/books"
+  - "MUTATION /graphql/returnBook"

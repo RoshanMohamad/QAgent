@@ -69,6 +69,9 @@ class Signals:
     auth_configured: bool
     is_auth_probe: bool = False
     recent_history: list[str] = field(default_factory=list)
+    #: For a GraphQL check only: none | handled | internal | unclear
+    #: (modules/graphql/errors.py). ``None`` for REST.
+    graphql_error_kind: str | None = None
 
     @property
     def is_server_error(self) -> bool:
@@ -126,7 +129,16 @@ def extract_signals(
             break
 
     # A negative case is one that deliberately sends bad input and expects a 4xx.
-    was_negative = bool(expected) and all(400 <= code < 500 for code in expected)
+    # A GraphQL check has no 4xx to expect, so its spec says so directly.
+    was_negative = (bool(expected) and all(400 <= code < 500 for code in expected)) or bool(
+        spec.get("negative")
+    )
+
+    graphql_kind = None
+    if spec.get("graphql"):
+        from qagent.modules.graphql.errors import graphql_error_kind
+
+        graphql_kind = graphql_error_kind(response.get("body_json"))
 
     # An auth probe deliberately strips or forges credentials and expects rejection.
     # It must be distinguished from an ordinary failure, because a *successful*
@@ -149,6 +161,7 @@ def extract_signals(
         auth_configured=auth_configured,
         is_auth_probe=is_auth_probe,
         recent_history=recent_history or [],
+        graphql_error_kind=graphql_kind,
     )
 
 
@@ -208,7 +221,13 @@ def classify(signals: Signals) -> Verdict:
         )
 
     # --- flakiness: history contradicts this result ---
-    if signals.flipped_recently and not signals.is_server_error:
+    # A GraphQL "internal" error is a 5xx in every sense but the status code, and
+    # gets the same treatment: history never excuses an unhandled exception.
+    if (
+        signals.flipped_recently
+        and not signals.is_server_error
+        and signals.graphql_error_kind != "internal"
+    ):
         return Verdict(
             FailureClass.FLAKY_TEST,
             0.72,
@@ -246,6 +265,24 @@ def classify(signals: Signals) -> Verdict:
             0.85,
             "The application returned a server error for a request it documents as supported.",
             evidence=[f"status {signals.status}"],
+        )
+
+    # GraphQL's equivalent of a 5xx: the HTTP layer said 200, the errors array
+    # says a resolver raised an unhandled exception (modules/graphql/errors.py).
+    # Only "internal" gets here - "unclear" falls through to UNKNOWN, because a
+    # codeless error from a server that doesn't use codes is not evidence.
+    if signals.graphql_error_kind == "internal":
+        return Verdict(
+            FailureClass.REAL_BUG,
+            0.90 if signals.was_negative_case else 0.85,
+            "A resolver raised an unhandled exception: the GraphQL response reports "
+            "an internal error rather than a handled one"
+            + (
+                " for deliberately edge-case input, so the resolver is missing validation."
+                if signals.was_negative_case
+                else " for a well-formed operation."
+            ),
+            evidence=[f"status {signals.status}", "graphql error kind: internal"],
         )
 
     # --- test-side explanations ---

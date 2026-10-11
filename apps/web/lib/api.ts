@@ -2,12 +2,15 @@ import type {
   Bug,
   BugHistory,
   DashboardSummary,
+  Environment,
   GateRecord,
   Project,
+  RecordingSummary,
   QualityGate,
   PerformanceRun,
   Result,
   Run,
+  RunSummary,
   SecurityFinding,
 } from "./types";
 import { getToken } from "./session";
@@ -56,6 +59,12 @@ async function get<T>(path: string): Promise<T> {
 export const api = {
   dashboard: () => get<DashboardSummary>("/api/v1/dashboard"),
   projects: () => get<Project[]>("/api/v1/projects"),
+  environments: (projectId: string) =>
+    get<Environment[]>(`/api/v1/projects/${projectId}/environments`),
+  recordings: (projectId: string) =>
+    get<RecordingSummary[]>(`/api/v1/projects/${projectId}/recordings`),
+  runs: (projectId: string, limit = 10) =>
+    get<RunSummary[]>(`/api/v1/projects/${projectId}/runs?limit=${limit}`),
   bugs: (projectId: string) => get<Bug[]>(`/api/v1/projects/${projectId}/bugs`),
   securityFindings: (projectId: string) =>
     get<SecurityFinding[]>(`/api/v1/projects/${projectId}/security`),

@@ -462,6 +462,24 @@ through `repr()` into a string literal, so a path of
 `/x"); import os; os.system(...)` renders as data; the test suite asserts that
 directly by parsing the output and checking no such call node exists.
 
+**Jest, for Node projects.** CLAUDE.md §8 asks for "Playwright/Jest/PyTest
+depending on project type", so `--framework` picks the output:
+
+```bash
+qagent emit --url http://127.0.0.1:8080 --out ./tests/qagent --repo . --framework auto
+QAGENT_BASE_URL=http://127.0.0.1:8080 npx jest --rootDir ./tests/qagent
+```
+
+`auto` emits Jest when `--repo`'s analysis detects Jest, and pytest otherwise.
+The Jest files (`orders.test.js`, …) need only Jest and Node 18+ for the built-in
+`fetch`. Values enter them only through `json.dumps(ensure_ascii=True)`, so every
+value is a JavaScript literal: `node --check` on hostile input is part of the
+test suite. Against the buggy fixture the Jest suite fails **the same 11 of 18
+checks** as the pytest suite. That was checked by hand with Jest 30, not in CI.
+GraphQL error classification has to exist in JavaScript for those files, so it's
+a port of `modules/graphql/errors.py`. A parity test runs both implementations
+over the same table of responses so they can't drift apart.
+
 ### Quality gate and CI
 
 `qagent gate` runs QA and exits non-zero when the result should stop a deploy.
@@ -567,6 +585,22 @@ Four things it refuses to do, each of which was a bug first:
 Console errors seen while recording are reported as observations: a flow that
 logs an uncaught `TypeError` has already found something before a test exists.
 
+Recordings can also be stored against a project instead of only living on disk:
+
+```bash
+qagent record-import checkout.json --url http://shop.test \
+  --report-to https://qagent.example.com --project <project-id>   # $QAGENT_TOKEN
+```
+
+The raw document is uploaded and the **server parses it again** with the same
+bounded parser. It never trusts a client's conversion. It's stored as a
+`browser_sessions` row holding the UI flow, the derived API checks and the
+console errors, plus one `recorded_actions` row per step. Steps get their own
+rows so a selector can be queried across recordings ("which flows click
+`#checkout`"), which is the question self-healing asks when that selector
+breaks. The project page lists them (`GET /api/v1/projects/{id}/recordings`,
+`GET /api/v1/recordings/{id}`).
+
 ### Compose mode
 
 For a repository that ships its own `docker-compose.yml` (ADR-0001), QAgent can
@@ -582,6 +616,30 @@ by `qagent scan`, and tears the stack down (`docker compose down -v`) whether th
 run succeeded, failed, or the pipeline itself raised. No new code path: the same
 `run_pipeline` function backs both commands, so this is provisioning bolted onto
 the existing loop, not a second loop to keep in sync.
+
+The stack never runs as written ([ADR-0011](docs/decisions/ADR-0011-compose-mode-runs-sandboxed.md)).
+Before anything is built, the *resolved* configuration is checked. `privileged`,
+host namespaces, `cap_add`, devices, a mounted Docker socket, and bind mounts
+outside the repository are all refused, and every violation is listed. Then a
+hardening override is layered on top:
+
+- CPU, memory (no swap) and process limits
+- `cap_drop: ALL`, keeping only the few capabilities entrypoints need
+- `no-new-privileges`
+- a read-only root filesystem, with tmpfs scratch space
+- every published port removed except the target's, which is bound to `127.0.0.1`
+- every service on an `internal` network with no route out
+
+```bash
+qagent scan-repo -c ./docker-compose.yml --service api --port 8080 \
+  --cpus 2 --memory 2g          # limits per service (default 1 CPU, 1g)
+  # --writable-rootfs           # for images that write outside volumes/tmpfs
+```
+
+Requires Docker Compose 2.24.4+ (older versions merge the override instead of
+replacing it, so they're refused). The one deliberate gap: the target service
+itself keeps egress, because Docker doesn't forward published ports into an
+internal network. Its database and other sidecars have no egress.
 
 ### Browser E2E
 
@@ -1263,6 +1321,31 @@ instead of falling back to route parsing, same contract as `qagent endpoints`.
 `Project.stack` — the column CLAUDE.md's own schema reserved for this and,
 until now, nothing wrote.
 
+`Project.stack` holds only the latest result. Every analysis, through `analyze`
+or `connect`, is also kept as an `ai_analysis` row, with its source and the
+analysed commit. `GET /api/v1/projects/{id}/analyses` returns them newest first,
+so "when did the analyzer start seeing Redis" has an answer.
+
+### Markdown reports
+
+`qagent report` turns a saved result into the defect report CLAUDE.md §15
+describes. It includes:
+
+- a summary table and the failure-analysis breakdown
+- for each defect, ordered by severity: the reproduction steps, expected and
+  actual behaviour, root cause, suggested fix, and the request/response
+  evidence in a collapsible block
+
+```bash
+qagent test --url http://127.0.0.1:8080 --json scan.json   # `test` is `scan` under its §19 name
+qagent report --json scan.json --title "nightly" > report.md
+```
+
+It reads only the file, so it works on a result from any CI run. Everything in
+that file came from the application under test, so prose is Markdown-escaped
+and response excerpts go in code spans and fences longer than any backtick run
+inside them. A hostile body can't inject a heading, a tag, or a closed fence.
+
 ### Issue tracker sync
 
 Turn a scan's defects into tracked GitHub issues instead of leaving them in a
@@ -1359,7 +1442,26 @@ bearer token issued by `POST /api/v1/auth/login`, stored as an httpOnly cookie -
 there is no `QAGENT_ORG_ID` to configure any more.
 
 It reads the API and shows the pass rate, open defects by severity, the quality
-gate decision, per-run failure analysis and full defect reports. Signed out or
+gate decision, per-run failure analysis and full defect reports.
+
+It also acts, so the whole §24 journey works without the API or CLI:
+
+- **create a project** on the home page, optionally connecting its GitHub
+  repository in the same step
+- on the project page, **add an environment** (the base URL of a running copy)
+- **connect or re-analyze** the repository
+- **Run QA**, which queues a scan and opens the run page. That page refreshes
+  itself until the run finishes, and so does the project's recent-runs list
+  while any run is pending.
+
+Every write goes through one of a fixed set of route handlers, which attach the
+httpOnly session token server-side. There is no catch-all proxy, so the browser
+can reach only the writes the dashboard exposes. Owner-only actions (adding an
+environment, connecting a repository) show the API's refusal to a member rather
+than failing silently. Credentials are never typed into the dashboard; an
+environment references a secret by name through the API.
+
+Signed out or
 unreachable, it says exactly what is wrong rather than rendering a shell of
 zeroes - a dashboard reporting 0 defects because it cannot connect is worse than
 no dashboard.
@@ -1486,6 +1588,7 @@ The CLI, the worker and the eval harness all run the identical loop — which me
 | [0008](docs/decisions/ADR-0008-phase-6-scope.md) | Phase 6 built RBAC, rate limiting, metrics, usage tracking and queue separation now; Kubernetes manifests, autoscaling and tracing exist but stay untuned, and payment integration stays deferred, until there's a real deployment to size them against. |
 | [0010](docs/decisions/ADR-0010-infrastructure-is-validated-not-proven.md) | Infrastructure is schema-validated in CI, never described as proven; billing prices but never settles; the twelve-microservice split stays unbuilt and the queue split is the fan-out that carries its benefit. |
 | [0009](docs/decisions/ADR-0009-github-checkouts-are-ephemeral-and-host-pinned.md) | A connected repository is cloned from `github.com` only, with command-executing and local-file git transports disabled, and the checkout is deleted once analysed — tokens never reach argv or the database. |
+| [0011](docs/decisions/ADR-0011-compose-mode-runs-sandboxed.md) | Compose mode refuses host-reaching settings in the resolved config and layers a hardening override (limits, `cap_drop: ALL`, read-only root, internal network, loopback-only target port); the target alone keeps egress. |
 
 ---
 
@@ -1520,12 +1623,18 @@ so both are treated as hostile:
   (nothing else stops one tenant saturating the shared Celery queue). Fails open,
   not closed, on a Redis outage — same rule as budgets above.
 
+- **Compose sandbox.** A repository's compose stack is checked for host access before
+  it runs, and runs resource-capped, capability-stripped, read-only, and on an
+  internal network ([ADR-0011](docs/decisions/ADR-0011-compose-mode-runs-sandboxed.md)).
+
 The worker container runs read-only, with `no-new-privileges`, no exposed ports, and
 no Docker socket.
 
-> Docker is not a security boundary against genuinely hostile code. Before `compose`
-> mode executes third-party repositories, runners need gVisor or Firecracker and a
-> default-deny egress proxy.
+> Docker is not a security boundary against genuinely hostile code. The compose
+> sandbox stops a stack from *asking* for host access and caps what it can use. It
+> does not contain a kernel exploit. Running untrusted repositories at scale still
+> needs gVisor or Firecracker and a default-deny egress proxy (the target service
+> keeps egress today).
 
 ---
 
@@ -1543,7 +1652,7 @@ apps/api/qagent/
 │   ├── generator/         deterministic rules + value synthesis
 │   ├── runner/            SSRF-guarded execution, assertions
 │   ├── triage/            failure classification, bug reports
-│   ├── provisioning/      compose mode: stack lifecycle, health wait
+│   ├── provisioning/      compose mode: sandbox policy, stack lifecycle, health wait
 │   ├── browser/           Playwright page-load checks + selector healing (`e2e` extra)
 │   ├── explorer/          BFS link-crawl + interactive exploration, application state graph
 │   ├── security/          Semgrep SAST wrapper (`security` extra)

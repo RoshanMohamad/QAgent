@@ -150,13 +150,84 @@ def test_screenshot_capture_failure_does_not_crash_the_check() -> None:
     assert result.screenshot_png is None
 
 
+def test_trace_captured_on_failure() -> None:
+    page = FakePage(response=FakeResponse(500))
+    tracing = FakeTracing(trace_bytes=b"zip-trace-data")
+    context = FakeContext(page, tracing=tracing)
+
+    result = _check_page(page, "http://example.test/", timeout_ms=5000, context=context)
+    assert result.status == "failed"
+    assert result.trace_zip == b"zip-trace-data"
+    assert tracing.stopped is True
+    assert tracing.stop_path is not None
+
+
+def test_trace_not_captured_on_pass() -> None:
+    page = FakePage(response=FakeResponse(200))
+    tracing = FakeTracing()
+    context = FakeContext(page, tracing=tracing)
+
+    result = _check_page(page, "http://example.test/", timeout_ms=5000, context=context)
+    assert result.status == "passed"
+    assert result.trace_zip is None
+    assert tracing.stopped is True
+    assert tracing.stop_path is None
+
+
+def test_trace_capture_failure_does_not_crash_the_check() -> None:
+    page = FakePage(response=FakeResponse(500))
+
+    class _FailingTracing(FakeTracing):
+        def stop(self, path=None):
+            if path:
+                raise RuntimeError("disk full")
+            super().stop(path)
+
+    context = FakeContext(page, tracing=_FailingTracing())
+    result = _check_page(page, "http://example.test/", timeout_ms=5000, context=context)
+    assert result.status == "failed"
+    assert result.trace_zip is None
+
+
+class FakeTracing:
+    def __init__(self, trace_bytes: bytes = b"fake-zip-trace-bytes") -> None:
+        self.started = False
+        self.stopped = False
+        self.stop_path: str | None = None
+        self._trace_bytes = trace_bytes
+
+    def start(self, **kwargs: Any) -> None:
+        self.started = True
+
+    def stop(self, path: str | None = None) -> None:
+        self.stopped = True
+        self.stop_path = path
+        if path:
+            from pathlib import Path
+
+            Path(path).write_bytes(self._trace_bytes)
+
+
+class FakeContext:
+    def __init__(self, page: FakePage, tracing: FakeTracing | None = None) -> None:
+        self._page = page
+        self.tracing = tracing or FakeTracing()
+        self.closed = False
+
+    def new_page(self) -> FakePage:
+        return self._page
+
+    def close(self) -> None:
+        self.closed = True
+
+
 class _FakeBrowser:
     def __init__(self, page: FakePage):
         self._page = page
         self.closed = False
 
-    def new_context(self):
-        return types.SimpleNamespace(new_page=lambda: self._page)
+    def new_context(self) -> FakeContext:
+        return FakeContext(self._page)
 
     def close(self) -> None:
         self.closed = True

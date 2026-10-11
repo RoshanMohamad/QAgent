@@ -43,6 +43,10 @@ class _FakeS3:
             raise _client_error("NoSuchKey", 404)
         return {"Body": io.BytesIO(self.objects[(Bucket, Key)])}
 
+    def delete_object(self, *, Bucket: str, Key: str) -> dict:  # noqa: N803
+        self.objects.pop((Bucket, Key), None)
+        return {}
+
     def head_object(self, *, Bucket: str, Key: str) -> dict:  # noqa: N803
         self.heads += 1
         if self._fail_head_with is not None:
@@ -199,3 +203,26 @@ def test_s3_backend_is_selected_when_configured(monkeypatch, tmp_path: Path) -> 
     assert built["bucket"] == "evidence"
     assert built["endpoint_url"] == "https://minio.local"
     assert built["region"] == "auto"
+
+
+def test_delete_removes_object_from_s3() -> None:
+    store, fake = _store()
+    data = b"evidence to delete"
+    stored = store.save(data, org_id=ORG, kind="log", extension=".log")
+
+    assert store.read(stored.storage_key) == data
+    assert store.delete(stored.storage_key) is True
+
+    with pytest.raises(ArtifactNotFound):
+        store.read(stored.storage_key)
+
+
+def test_delete_missing_object_error_handling() -> None:
+    class _ErrorS3(_FakeS3):
+        def delete_object(self, *, Bucket, Key):  # noqa: N803
+            raise _client_error("AccessDenied", 403)
+
+    store, _ = _store(_ErrorS3())
+    with pytest.raises(Exception) as caught:
+        store.delete("key")
+    assert "AccessDenied" in str(caught.value)

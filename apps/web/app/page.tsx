@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { api, apiBaseUrl, isConfigured, settle } from "@/lib/api";
 import { Card, Empty, HeroFigure, StatTile, compact } from "@/components/figures";
+import { NewProjectForm } from "@/components/new-project-form";
 import { SetupNotice } from "@/components/setup-notice";
 import { SeverityBadge } from "@/components/status";
 import type { Severity } from "@/lib/types";
@@ -194,10 +195,7 @@ export default async function DashboardPage() {
           {projects.error ? (
             <Empty>Could not load projects.</Empty>
           ) : projects.data.length === 0 ? (
-            <Empty>
-              No projects yet. Create one through the API, then point an
-              environment at a running application.
-            </Empty>
+            <Empty>No projects yet.</Empty>
           ) : (
             <ul className="divide-y" style={{ borderColor: "var(--border)" }}>
               {projects.data.map((project) => (
@@ -218,6 +216,9 @@ export default async function DashboardPage() {
               ))}
             </ul>
           )}
+          <div className="mt-4 border-t pt-4" style={{ borderColor: "var(--border)" }}>
+            <NewProjectForm />
+          </div>
         </Card>
       </div>
     </div>

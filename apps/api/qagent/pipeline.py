@@ -610,13 +610,19 @@ def _action_outcome_to_case_outcome(outcome: ActionOutcome, llm: LlmClient) -> C
             _browser_artifacts(
                 screenshot=outcome.screenshot_png,
                 log_lines=outcome.console_errors + outcome.page_errors,
+                trace_zip=getattr(outcome, "trace_zip", None),
             )
         )
     return case_outcome
 
 
-def _browser_artifacts(*, screenshot: bytes | None, log_lines: list[str]) -> list[ArtifactBytes]:
-    """Screenshot and console log, for whichever browser stage produced them.
+def _browser_artifacts(
+    *,
+    screenshot: bytes | None,
+    log_lines: list[str],
+    trace_zip: bytes | None = None,
+) -> list[ArtifactBytes]:
+    """Screenshot, console log, and Playwright trace, for whichever browser stage produced them.
 
     Shared so the two stages cannot drift into documenting their defects
     differently - which is exactly what had happened.
@@ -629,6 +635,15 @@ def _browser_artifacts(*, screenshot: bytes | None, log_lines: list[str]) -> lis
                 content_type="image/png",
                 extension=".png",
                 data=screenshot,
+            )
+        )
+    if trace_zip:
+        artifacts.append(
+            ArtifactBytes(
+                kind="trace",
+                content_type="application/zip",
+                extension=".zip",
+                data=trace_zip,
             )
         )
     log = "\n".join(line for line in log_lines if line)
@@ -687,6 +702,7 @@ def _page_check_to_outcome(check: PageCheckResult, llm: LlmClient) -> CaseOutcom
             _browser_artifacts(
                 screenshot=check.screenshot_png,
                 log_lines=check.console_errors + check.page_errors,
+                trace_zip=check.trace_zip,
             )
         )
     return outcome

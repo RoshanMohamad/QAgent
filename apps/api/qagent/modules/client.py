@@ -102,3 +102,12 @@ class QAgentClient:
                 "quality_gate_id": quality_gate_id,
             },
         )
+
+    def upload_recording(self, project_id: str, *, document: dict, name: str | None = None,
+                         base_url: str | None = None) -> ReportResult:
+        """Store a recorded session against a project. The server re-parses the
+        raw document itself rather than trusting a conversion done here."""
+        return self._post(
+            f"/api/v1/projects/{project_id}/recordings",
+            {"document": document, "name": name, "base_url": base_url},
+        )

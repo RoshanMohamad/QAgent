@@ -64,6 +64,25 @@ class LocalArtifactStore:
             raise ArtifactNotFound(storage_key)
         return path.read_bytes()
 
+    def delete(self, storage_key: str) -> bool:
+        """Delete an artifact by its storage key. Return True if file existed and was removed."""
+        try:
+            path = self._resolve(storage_key)
+        except ValueError:
+            return False
+        if not path.is_file():
+            return False
+        path.unlink()
+        parent = path.parent
+        root = self.root.resolve()
+        while parent != root and parent.is_relative_to(root):
+            try:
+                parent.rmdir()
+            except OSError:
+                break
+            parent = parent.parent
+        return True
+
     def _resolve(self, storage_key: str) -> Path:
         """Reject a key that would resolve outside ``root``.
 

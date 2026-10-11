@@ -40,6 +40,7 @@ class PageCheckResult:
     # `pipeline.py` decides whether the check became a bug, and `persistence.py`
     # is the only place that ever touches storage (CLAUDE.md section 15).
     screenshot_png: bytes | None = None
+    trace_zip: bytes | None = None
 
 
 @dataclass
@@ -90,7 +91,25 @@ def _capture_screenshot(page: Any, url: str) -> bytes | None:
         return None
 
 
-def _check_page(page: _Page, url: str, timeout_ms: int) -> PageCheckResult:
+def _capture_trace(context: Any, url: str) -> bytes | None:
+    """Best-effort Playwright trace capture for failure evidence."""
+    if context is None or not hasattr(context, "tracing"):
+        return None
+    try:
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            trace_path = Path(tmpdir) / "trace.zip"
+            context.tracing.stop(path=str(trace_path))
+            if trace_path.exists():
+                return trace_path.read_bytes()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("trace capture failed for %s: %s", url, exc)
+    return None
+
+
+def _check_page(page: _Page, url: str, timeout_ms: int, context: Any = None) -> PageCheckResult:
     console_errors: list[str] = []
     page_errors: list[str] = []
 
@@ -108,11 +127,13 @@ def _check_page(page: _Page, url: str, timeout_ms: int) -> PageCheckResult:
     try:
         response = page.goto(url, timeout=timeout_ms, wait_until="load")
     except Exception as exc:  # noqa: BLE001 - a navigation failure is the signal itself
+        trace_zip = _capture_trace(context, url)
         return PageCheckResult(
             url=url,
             status="error",
             failure_message=f"navigation failed: {exc}",
             load_time_ms=int((datetime.now(UTC) - started).total_seconds() * 1000),
+            trace_zip=trace_zip,
         )
 
     load_time_ms = int((datetime.now(UTC) - started).total_seconds() * 1000)
@@ -127,6 +148,12 @@ def _check_page(page: _Page, url: str, timeout_ms: int) -> PageCheckResult:
         failures.append(f"{len(console_errors)} console error(s)")
 
     screenshot_png = _capture_screenshot(page, url) if failures else None
+    trace_zip = _capture_trace(context, url) if failures else None
+    if not failures and context is not None and hasattr(context, "tracing"):
+        try:
+            context.tracing.stop()
+        except Exception:
+            pass
 
     return PageCheckResult(
         url=url,
@@ -135,6 +162,7 @@ def _check_page(page: _Page, url: str, timeout_ms: int) -> PageCheckResult:
         load_time_ms=load_time_ms,
         console_errors=console_errors,
         screenshot_png=screenshot_png,
+        trace_zip=trace_zip,
         page_errors=page_errors,
         failure_message="; ".join(failures) or None,
     )
@@ -161,10 +189,22 @@ def run_browser_checks(
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=headless)
         try:
-            page = browser.new_context().new_page()
             for url in urls:
-                logger.info("checking %s", url)
-                result.checks.append(_check_page(page, url, timeout_ms))
+                context = browser.new_context()
+                if hasattr(context, "tracing"):
+                    try:
+                        context.tracing.start(screenshots=True, snapshots=True, sources=True)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("tracing start failed for %s: %s", url, exc)
+                page = context.new_page()
+                try:
+                    logger.info("checking %s", url)
+                    result.checks.append(_check_page(page, url, timeout_ms, context=context))
+                finally:
+                    try:
+                        context.close()
+                    except Exception:
+                        pass
         finally:
             browser.close()
 

@@ -1,12 +1,25 @@
 import Link from "next/link";
 import { api, apiBaseUrl, isConfigured, settle } from "@/lib/api";
+import { AutoRefresh } from "@/components/auto-refresh";
 import { Card, Empty } from "@/components/figures";
+import {
+  AddEnvironmentForm,
+  ConnectRepoForm,
+  RunQaForm,
+} from "@/components/project-actions";
 import { SetupNotice } from "@/components/setup-notice";
-import { GateBanner, SeverityBadge } from "@/components/status";
+import { GateBanner, SeverityBadge, StatusDot } from "@/components/status";
 import { VerifyBugButton } from "@/components/verify-bug-button";
-import type { Severity } from "@/lib/types";
+import type { RunStatus, Severity } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
+
+const IN_FLIGHT: RunStatus[] = ["pending", "running"];
+
+function runTone(status: RunStatus) {
+  if (IN_FLIGHT.includes(status)) return "warning" as const;
+  return status === "passed" ? ("good" as const) : ("critical" as const);
+}
 
 const SEVERITY_RANK: Record<Severity, number> = {
   critical: 0,
@@ -23,13 +36,18 @@ export default async function ProjectPage({
 }) {
   const { projectId } = await params;
 
-  const [gate, bugs, findings, performance, gates] = await Promise.all([
-    settle(api.quality(projectId)),
-    settle(api.bugs(projectId)),
-    settle(api.securityFindings(projectId)),
-    settle(api.performanceRuns(projectId)),
-    settle(api.gates(projectId)),
-  ]);
+  const [gate, bugs, findings, performance, gates, projects, environments, runs, recordings] =
+    await Promise.all([
+      settle(api.quality(projectId)),
+      settle(api.bugs(projectId)),
+      settle(api.securityFindings(projectId)),
+      settle(api.performanceRuns(projectId)),
+      settle(api.gates(projectId)),
+      settle(api.projects()),
+      settle(api.environments(projectId)),
+      settle(api.runs(projectId)),
+      settle(api.recordings(projectId)),
+    ]);
 
   if (gate.error && bugs.error) {
     return (
@@ -45,6 +63,13 @@ export default async function ProjectPage({
     .slice()
     .sort((a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity]);
 
+  const project = (projects.data ?? []).find((p) => p.id === projectId) ?? null;
+  const recentRuns = runs.data ?? [];
+  const anyInFlight = recentRuns.some((r) => IN_FLIGHT.includes(r.status));
+  const environmentName = new Map(
+    (environments.data ?? []).map((env) => [env.id, env.name]),
+  );
+
   const sortedFindings = (findings.data ?? [])
     .slice()
     .sort((a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity]);
@@ -59,7 +84,105 @@ export default async function ProjectPage({
         &larr; All projects
       </Link>
 
+      {/* Polls only while something this page shows is still moving. */}
+      {anyInFlight ? <AutoRefresh intervalMs={4000} /> : null}
+
+      {project ? (
+        <div>
+          <h1 className="text-xl font-semibold">{project.name}</h1>
+          <p className="mt-1 text-xs" style={{ color: "var(--text-muted)" }}>
+            {project.repo_url ?? "No repository connected"}
+          </p>
+        </div>
+      ) : null}
+
       {gate.data ? <GateBanner gate={gate.data} /> : null}
+
+      <Card
+        title="Run QA"
+        description="Discover the API, generate checks, execute them and triage every failure against the chosen environment."
+      >
+        {environments.error ? (
+          <Empty>Could not load environments.</Empty>
+        ) : (
+          <RunQaForm projectId={projectId} environments={environments.data} />
+        )}
+      </Card>
+
+      <Card
+        title="Recent runs"
+        description="Newest first. Pending and running scans refresh on their own."
+      >
+        {runs.error ? (
+          <Empty>Could not load runs.</Empty>
+        ) : recentRuns.length === 0 ? (
+          <Empty>No runs yet.</Empty>
+        ) : (
+          <ul className="divide-y" style={{ borderColor: "var(--border)" }}>
+            {recentRuns.map((run) => (
+              <li key={run.id} className="py-2 first:pt-0 last:pb-0">
+                <Link
+                  href={`/runs/${run.id}`}
+                  className="flex flex-wrap items-center justify-between gap-3 hover:underline"
+                >
+                  <span className="flex items-center gap-3">
+                    <StatusDot tone={runTone(run.status)} label={run.status} />
+                    <span className="text-xs" style={{ color: "var(--text-secondary)" }}>
+                      {run.trigger}
+                      {run.environment_id && environmentName.get(run.environment_id)
+                        ? ` · ${environmentName.get(run.environment_id)}`
+                        : ""}
+                    </span>
+                    {run.commit_sha ? (
+                      <code className="tabular text-xs" style={{ color: "var(--text-muted)" }}>
+                        {run.commit_sha.slice(0, 8)}
+                      </code>
+                    ) : null}
+                  </span>
+                  <span className="tabular text-xs" style={{ color: "var(--text-secondary)" }}>
+                    {run.total > 0
+                      ? `${run.passed}/${run.total} passed`
+                      : IN_FLIGHT.includes(run.status)
+                        ? "in progress"
+                        : "no checks"}
+                  </span>
+                </Link>
+              </li>
+            ))}
+          </ul>
+        )}
+      </Card>
+
+      <div className="grid gap-6 lg:grid-cols-2">
+        <Card
+          title="Environments"
+          description="Running copies of the application a scan sends traffic to. Credentials are set through the API as a secret reference, never typed here."
+        >
+          {(environments.data ?? []).length > 0 ? (
+            <ul className="mb-4 space-y-1.5">
+              {(environments.data ?? []).map((env) => (
+                <li key={env.id} className="flex flex-wrap items-baseline gap-2 text-xs">
+                  <span className="font-medium">{env.name}</span>
+                  <span className="break-all" style={{ color: "var(--text-secondary)" }}>
+                    {env.base_url ?? env.mode}
+                  </span>
+                  {env.has_credentials ? (
+                    <span style={{ color: "var(--text-muted)" }}>· authenticated</span>
+                  ) : null}
+                </li>
+              ))}
+            </ul>
+          ) : null}
+          <AddEnvironmentForm projectId={projectId} />
+        </Card>
+
+        <Card
+          title="Repository"
+          description="Cloned into a temporary directory, analyzed, then deleted. Only GitHub is supported."
+        >
+          <ConnectRepoForm projectId={projectId} repoUrl={project?.repo_url ?? null} />
+        </Card>
+      </div>
 
       {gate.data?.run ? (
         <Link
@@ -161,6 +284,38 @@ export default async function ProjectPage({
                     {bug.suggested_fix}
                   </p>
                 ) : null}
+              </li>
+            ))}
+          </ul>
+        )}
+      </Card>
+
+      <Card
+        title="Recordings"
+        description="Sessions captured with the browser extension, stored as a UI flow plus the API checks the flow's traffic produced. Upload with qagent record-import --report-to."
+      >
+        {recordings.error ? (
+          <Empty>Could not load recordings.</Empty>
+        ) : (recordings.data ?? []).length === 0 ? (
+          <Empty>No recordings stored for this project.</Empty>
+        ) : (
+          <ul className="divide-y" style={{ borderColor: "var(--border)" }}>
+            {(recordings.data ?? []).map((recording) => (
+              <li
+                key={recording.id}
+                className="flex flex-wrap items-baseline justify-between gap-2 py-2 first:pt-0 last:pb-0"
+              >
+                <span className="text-sm font-medium">{recording.name}</span>
+                <span className="tabular text-xs" style={{ color: "var(--text-secondary)" }}>
+                  {recording.summary.actions} steps · {recording.api_cases} API checks
+                  {recording.diagnostics > 0 ? (
+                    <span style={{ color: "var(--critical)" }}>
+                      {" "}
+                      · {recording.diagnostics} console error
+                      {recording.diagnostics === 1 ? "" : "s"}
+                    </span>
+                  ) : null}
+                </span>
               </li>
             ))}
           </ul>

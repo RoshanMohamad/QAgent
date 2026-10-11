@@ -266,6 +266,14 @@ def scan(
         raise typer.Exit(code=1)
 
 
+# CLAUDE.md section 19 calls this `qagent test`. One implementation under two
+# names, so the two can never drift apart.
+app.command(
+    "test",
+    help="Run QA against a running app: discover, generate, execute, triage. Same as `scan`.",
+)(scan)
+
+
 def _write_json_report(result: PipelineResult, output: Path) -> None:
     payload = {
         "summary": result.summary(),
@@ -312,6 +320,13 @@ def scan_repo(
     startup_timeout: float = typer.Option(
         120.0, "--startup-timeout", help="Seconds to wait for the stack to become healthy."
     ),
+    cpus: float = typer.Option(1.0, "--cpus", help="CPU limit per sandboxed service."),
+    memory: str = typer.Option("1g", "--memory", help="Memory limit per sandboxed service."),
+    writable_rootfs: bool = typer.Option(
+        False,
+        "--writable-rootfs",
+        help="Leave container root filesystems writable, for images that write outside volumes.",
+    ),
     max_cases: int | None = typer.Option(None, "--max-cases", help="Cap generated checks."),
     output: Path | None = typer.Option(None, "--json", help="Write the full result as JSON."),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show passing checks too."),
@@ -319,8 +334,13 @@ def scan_repo(
         True, "--fail-on-bug/--no-fail-on-bug", help="Exit non-zero when a defect is found."
     ),
 ) -> None:
-    """Bring a repository's own docker-compose stack up, scan it, tear it down (ADR-0001)."""
+    """Bring a repository's own docker-compose stack up, scan it, tear it down (ADR-0001).
+
+    The stack runs sandboxed (CLAUDE.md section 22): host-reaching settings are
+    refused, every service is resource-capped, and only the target is reachable.
+    """
     from qagent.modules.provisioning.compose import ComposeError, run_pipeline_from_compose
+    from qagent.modules.provisioning.sandbox import SandboxPolicy
 
     if not compose_file.exists():
         console.print(f"[red]compose file not found:[/red] {compose_file}")
@@ -335,6 +355,7 @@ def scan_repo(
             target_port=port,
             health_path=health_path,
             startup_timeout_seconds=startup_timeout,
+            sandbox=SandboxPolicy(cpus=cpus, memory=memory, read_only=not writable_rootfs),
             openapi_url=spec,
             repo_path=repo or compose_file.resolve().parent,
             max_cases=max_cases,
@@ -840,6 +861,15 @@ def record_import(
         None, "--playwright", help="Directory to emit the UI flow as a Playwright spec into."
     ),
     output: Path | None = typer.Option(None, "--json", help="Write the converted session."),
+    report_to: str | None = typer.Option(
+        None, "--report-to", help="QAgent API to store the recording in ($QAGENT_API_URL)."
+    ),
+    project: str | None = typer.Option(
+        None, "--project", help="Project to store it against ($QAGENT_PROJECT_ID)."
+    ),
+    api_token: str | None = typer.Option(
+        None, "--api-token", help="Bearer token for the QAgent API ($QAGENT_TOKEN)."
+    ),
 ) -> None:
     """Turn a recorded browser session into tests (CLAUDE.md section 10).
 
@@ -951,6 +981,49 @@ def record_import(
     if not session.actions and not session.requests:
         raise typer.Exit(code=2)
 
+    _upload_recording(
+        document,
+        name=session_file.stem,
+        base_url=base_url,
+        report_to=report_to,
+        project=project,
+        token=api_token,
+    )
+
+
+def _upload_recording(
+    document: dict,
+    *,
+    name: str,
+    base_url: str | None,
+    report_to: str | None,
+    project: str | None,
+    token: str | None,
+) -> None:
+    """Store the session against a project, when a QAgent API is configured.
+
+    The raw document is sent, not this command's conversion: the server parses
+    it again with the same bounded parser, because a client-side conversion is
+    exactly the kind of input it should not have to trust.
+    """
+    import os
+
+    from qagent.modules.client import QAgentClient
+
+    project_id = project or os.environ.get("QAGENT_PROJECT_ID")
+    client = QAgentClient.from_env(report_to, token)
+    if client is None:
+        return
+    if not project_id:
+        console.print("[yellow]--report-to given without --project; recording not stored[/yellow]")
+        return
+
+    outcome = client.upload_recording(project_id, document=document, name=name, base_url=base_url)
+    if outcome.ok:
+        console.print(f"[dim]stored recording {outcome.record_id or ''}[/dim]")
+    else:
+        console.print(f"[yellow]could not store the recording:[/yellow] {outcome.detail}")
+
 
 @app.command()
 def emit(
@@ -962,15 +1035,22 @@ def emit(
     ),
     max_cases: int | None = typer.Option(None, "--max-cases", help="Cap generated checks."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Report what would be written."),
+    framework: str = typer.Option(
+        "auto",
+        "--framework",
+        "-f",
+        help="pytest, jest, or auto (jest when --repo is a Jest project, else pytest).",
+    ),
     graphql_protected: list[str] = _GRAPHQL_PROTECTED,
 ) -> None:
-    """Write the generated checks out as runnable pytest files (agent 3).
+    """Write the generated checks out as runnable test files (agent 3).
 
-    The emitted suite depends only on pytest and httpx - not on QAgent - so the
-    tests keep working if this tool is uninstalled. Point them at an application
-    with QAGENT_BASE_URL and supply credentials with QAGENT_AUTH_HEADER.
+    pytest (+ httpx) or Jest (+ Node's built-in fetch), chosen to match the
+    project (CLAUDE.md section 8). Either way the suite depends on nothing from
+    QAgent, so the tests keep working if this tool is uninstalled. Point them at
+    an application with QAGENT_BASE_URL and supply credentials with
+    QAGENT_AUTH_HEADER.
     """
-    from qagent.modules.emitter.pytest_emitter import emit as emit_pytest
     from qagent.modules.generator.rules import generate
     from qagent.modules.planner.strategy import build_plan
     from qagent.pipeline import discover
@@ -987,11 +1067,16 @@ def emit(
     test_plan = build_plan(endpoints)
     generation = generate(endpoints, max_cases=max_cases, plan=test_plan)
 
-    report = emit_pytest(generation.cases, base_url=url, out_dir=out, dry_run=dry_run)
+    chosen = _choose_framework(framework, repo)
+    if chosen == "jest":
+        from qagent.modules.emitter.jest_emitter import emit as emit_tests
+    else:
+        from qagent.modules.emitter.pytest_emitter import emit as emit_tests
+    report = emit_tests(generation.cases, base_url=url, out_dir=out, dry_run=dry_run)
 
     console.print(
         Panel(
-            f"[bold]{out}[/bold]\nsource: {source}\n"
+            f"[bold]{out}[/bold]\nsource: {source}\nframework: {chosen}\n"
             f"{report.case_count} test(s) across {len(report.files)} file(s)"
             + ("  [yellow](dry run, nothing written)[/yellow]" if dry_run else ""),
             title="QAgent emit",
@@ -1012,8 +1097,27 @@ def emit(
 
     if not dry_run and report.files:
         console.print(
-            f"\n[dim]run them with: QAGENT_BASE_URL={url} python -m pytest {out}[/dim]"
+            f"\n[dim]run them with: QAGENT_BASE_URL={url} "
+            + (f"npx jest --rootDir {out}" if chosen == "jest" else f"python -m pytest {out}")
+            + "[/dim]"
         )
+
+
+def _choose_framework(requested: str, repo: Path | None) -> str:
+    """Resolve ``--framework``. ``auto`` follows the repository: a project that
+    already runs Jest gets Jest files it will actually keep, anything else (or
+    no ``--repo`` to look at) gets pytest, the long-standing default."""
+    requested = requested.lower()
+    if requested in {"pytest", "jest"}:
+        return requested
+    if requested != "auto":
+        console.print(f"[red]unknown framework {requested!r}[/red]: use pytest, jest or auto")
+        raise typer.Exit(code=2)
+    if repo is None or not repo.is_dir():
+        return "pytest"
+    from qagent.modules.analyzer.stack import detect_stack
+
+    return "jest" if "Jest" in detect_stack(repo).names() else "pytest"
 
 
 @app.command()
@@ -1375,6 +1479,43 @@ def evaluate(
     if report.false_positive_rate > 0.25:
         console.print("[red]false positive rate above threshold[/red]")
         raise typer.Exit(code=1)
+
+
+@app.command()
+def report(
+    report_path: Path = typer.Option(
+        ..., "--json", "-j", help="A qagent scan --json (or test/scan-repo --json) output file."
+    ),
+    out: Path | None = typer.Option(
+        None, "--out", "-o", help="Write the Markdown here instead of printing it."
+    ),
+    title: str = typer.Option("QAgent report", "--title", help="Heading for the report."),
+) -> None:
+    """Render a saved scan result as a Markdown defect report (CLAUDE.md section 15).
+
+    Each defect gets its severity, reproduction steps, expected and actual
+    behaviour, root cause, suggested fix and the request/response evidence. It
+    reads only the file, so it works on a result from any machine or CI run.
+    """
+    from qagent.modules.reporting.markdown import render_markdown
+
+    try:
+        payload = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        console.print(f"[red]could not read scan result:[/red] {exc}")
+        raise typer.Exit(code=2) from exc
+    if not isinstance(payload, dict) or "outcomes" not in payload:
+        console.print(f"[red]{report_path} is not a qagent scan --json result[/red]")
+        raise typer.Exit(code=2)
+
+    markdown = render_markdown(payload, title=title)
+    if out:
+        out.write_text(markdown, encoding="utf-8")
+        console.print(f"[dim]wrote {out}[/dim]")
+    else:
+        # Plain stdout, not rich: the output is meant to be piped into a file
+        # or a PR comment, and rich would re-wrap and colour it.
+        typer.echo(markdown, nl=False)
 
 
 @app.command("report-issues")
@@ -2023,6 +2164,57 @@ def perf(
         raise typer.Exit(code=1)
 
 
+@app.command("prune-artifacts")
+def prune_artifacts_cmd(
+    days: int | None = typer.Option(
+        None,
+        "--days",
+        "-d",
+        help="Evict artifacts older than this many days (defaults to QAGENT_ARTIFACT_RETENTION_DAYS).",
+    ),
+    max_mb: int | None = typer.Option(
+        None, "--max-mb", help="Evict oldest artifacts when org total exceeds this size in MB."
+    ),
+    org: str | None = typer.Option(
+        None, "--org", help="Restrict eviction to a specific organization UUID."
+    ),
+) -> None:
+    """Evict expired or quota-exceeding evidence artifacts (CLAUDE.md section 15)."""
+    import uuid
+    from qagent.db import SessionLocal
+    from qagent.modules.storage.factory import store_from_settings
+    from qagent.modules.storage.retention import prune_artifacts
+
+    settings = get_settings()
+    retention_days = days if days is not None else settings.qagent_artifact_retention_days
+    max_bytes = (
+        max_mb * 1024 * 1024 if max_mb is not None else settings.qagent_artifact_max_bytes_per_org
+    )
+    target_org_id = uuid.UUID(org) if org else None
+
+    store = store_from_settings(settings)
+    session = SessionLocal()
+    try:
+        summary = prune_artifacts(
+            session,
+            store,
+            max_age_days=retention_days,
+            max_bytes_per_org=max_bytes,
+            org_id=target_org_id,
+        )
+    finally:
+        session.close()
+
+    console.print(
+        f"[green]Pruned {summary.pruned_records} artifact record(s)[/green], "
+        f"freed {summary.freed_bytes / (1024 * 1024):.2f} MB, "
+        f"deleted {summary.deleted_files} physical file(s)."
+    )
+    if summary.errors:
+        for err in summary.errors:
+            console.print(f"[yellow]warning:[/yellow] {err}")
+
+
 def main() -> None:
     try:
         app()
@@ -2032,3 +2224,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

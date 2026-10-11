@@ -108,6 +108,8 @@ class Settings(BaseSettings):
     # (modules/storage/base.py), so moving between them is a recursive copy.
     qagent_storage_backend: Literal["local", "s3"] = "local"
     qagent_artifact_root: str = "./data/artifacts"
+    qagent_artifact_retention_days: int = 30
+    qagent_artifact_max_bytes_per_org: int = 1_073_741_824  # 1 GB
     qagent_s3_bucket: str | None = None
     #: Unset for AWS; set for R2, MinIO, or any other S3-compatible endpoint.
     qagent_s3_endpoint_url: str | None = None

@@ -10,18 +10,34 @@ This module owns process/lifecycle concerns only. It knows nothing about
 discovery, generation or triage; it hands ``run_pipeline`` a base URL and gets a
 ``PipelineResult`` back, so the thing this module adds is provisioning, not a
 second code path to keep in sync with the first.
+
+The stack is third-party code, so it never runs as written: ``up`` first resolves
+the configuration, refuses anything that reaches the host, and layers a hardening
+override on top (``sandbox.py``, CLAUDE.md section 22). ``sandbox=None`` turns
+that off and exists for tests and for a trusted local stack - not as a default.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import subprocess
+import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import httpx
+
+from qagent.modules.provisioning.sandbox import (
+    SandboxPolicy,
+    SandboxViolation,
+    build_override,
+    check_policy,
+    require_compose_version,
+    write_override,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +55,7 @@ class ComposeConfig:
     health_path: str = "/"
     startup_timeout_seconds: float = 120.0
     poll_interval_seconds: float = 2.0
+    sandbox: SandboxPolicy | None = field(default_factory=SandboxPolicy)
 
 
 def _run(args: list[str], *, cwd: Path) -> subprocess.CompletedProcess[str]:
@@ -63,6 +80,8 @@ class ComposeStack:
         self.config = config
         self._base_dir = config.compose_file.parent
         self._up = False
+        self._override_dir: tempfile.TemporaryDirectory[str] | None = None
+        self._override_file: Path | None = None
 
     def __enter__(self) -> ComposeStack:
         self.up()
@@ -72,22 +91,73 @@ class ComposeStack:
         self.down()
 
     def _compose_args(self, *sub: str) -> list[str]:
-        return [
-            "docker",
-            "compose",
-            "-f",
-            str(self.config.compose_file),
-            "-p",
-            self.config.project_name,
-            *sub,
-        ]
+        files = ["-f", str(self.config.compose_file)]
+        if self._override_file is not None:
+            files += ["-f", str(self._override_file)]
+        return ["docker", "compose", *files, "-p", self.config.project_name, *sub]
+
+    def _resolved_config(self) -> dict[str, Any]:
+        result = _run(self._compose_args("config", "--format", "json"), cwd=self._base_dir)
+        if result.returncode != 0:
+            raise ComposeError(f"docker compose config failed: {result.stderr.strip()}")
+        try:
+            return json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise ComposeError(f"docker compose config returned invalid JSON: {exc}") from exc
+
+    def harden(self) -> None:
+        """Validate the stack against the sandbox policy and write the override.
+
+        Runs before ``up`` and before anything is built: a rejected file never
+        reaches the daemon. The override lives in a temp directory, never in the
+        repository, so a hostile repo can't pre-plant one.
+        """
+        policy = self.config.sandbox
+        if policy is None:
+            logger.warning("compose: sandbox disabled for %s", self.config.project_name)
+            return
+
+        version = _run(["docker", "compose", "version", "--short"], cwd=self._base_dir)
+        try:
+            require_compose_version(version.stdout if version.returncode == 0 else "")
+            resolved = self._resolved_config()
+            check_policy(
+                resolved,
+                repo_root=self._base_dir,
+                target_service=self.config.target_service,
+            )
+        except SandboxViolation as exc:
+            raise ComposeError(str(exc)) from exc
+
+        override = build_override(
+            resolved,
+            target_service=self.config.target_service,
+            target_port=self.config.target_port,
+            policy=policy,
+        )
+        self._override_dir = tempfile.TemporaryDirectory(prefix="qagent-sandbox-")
+        self._override_file = write_override(
+            override, Path(self._override_dir.name) / "qagent.sandbox.yml"
+        )
+        logger.info("compose: sandbox applied (%s)", policy.describe())
 
     def up(self) -> None:
+        self.harden()
         result = _run(self._compose_args("up", "-d", "--build", "--wait"), cwd=self._base_dir)
         # Tear down even a partial failure: some containers may already be running.
         self._up = True
         if result.returncode != 0:
-            raise ComposeError(f"docker compose up failed: {result.stderr.strip()}")
+            hint = ""
+            if (
+                self.config.sandbox is not None
+                and self.config.sandbox.read_only
+                and "read-only file system" in result.stderr.lower()
+            ):
+                hint = (
+                    " (the sandbox makes root filesystems read-only; an image that "
+                    "writes outside its volumes and tmpfs needs --writable-rootfs)"
+                )
+            raise ComposeError(f"docker compose up failed: {result.stderr.strip()}{hint}")
 
     def down(self) -> None:
         if not self._up:
@@ -98,6 +168,10 @@ class ComposeStack:
         if result.returncode != 0:
             logger.warning("docker compose down failed: %s", result.stderr.strip())
         self._up = False
+        if self._override_dir is not None:
+            self._override_dir.cleanup()
+            self._override_dir = None
+            self._override_file = None
 
     def published_port(self, service: str, container_port: int) -> int:
         result = _run(self._compose_args("port", service, str(container_port)), cwd=self._base_dir)
@@ -143,6 +217,7 @@ def run_pipeline_from_compose(
     project_name: str | None = None,
     health_path: str = "/",
     startup_timeout_seconds: float = 120.0,
+    sandbox: SandboxPolicy | None = None,
     **pipeline_kwargs: Any,
 ) -> Any:
     """Bring the stack up, run the standard pipeline against it, tear it down.
@@ -160,6 +235,7 @@ def run_pipeline_from_compose(
         target_port=target_port,
         health_path=health_path,
         startup_timeout_seconds=startup_timeout_seconds,
+        sandbox=sandbox if sandbox is not None else SandboxPolicy(),
     )
 
     with ComposeStack(config) as stack:

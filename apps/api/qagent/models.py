@@ -911,6 +911,110 @@ class AuditLog(Base, TimestampMixin):
     detail: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
 
 
+class BrowserSession(Base, TimestampMixin):
+    """A recording uploaded from the browser extension (CLAUDE.md section 10).
+
+    Stored already converted: ``ui_flow`` is what the Playwright emitter reads
+    and ``api_cases`` are the checks the runner executes, both produced by
+    ``modules/recorder/session.py`` at upload time. The raw document is not
+    kept - it came from a page the developer visited, may have been shaped by
+    that page, and everything worth keeping survives the parser's validation.
+    """
+
+    __tablename__ = "browser_sessions"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    org_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    start_url: Mapped[str | None] = mapped_column(String(2000))
+    created_by: Mapped[str | None] = mapped_column(String(320))
+    #: Counts, warnings and fragile-selector total from ``RecordedSession.summary``.
+    summary: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    ui_flow: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    api_cases: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    #: Console and page errors seen while recording: findings before any test ran.
+    diagnostics: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+
+    actions: Mapped[list[RecordedAction]] = relationship(
+        back_populates="session",
+        cascade="all, delete-orphan",
+        order_by="RecordedAction.sequence",
+    )
+
+
+class RecordedAction(Base, TimestampMixin):
+    """One user step of a ``BrowserSession``, in the order it happened.
+
+    A row per step rather than a JSON list so a selector can be queried across
+    sessions - "which recordings click ``#checkout``" is the question the
+    self-healing engine asks when that selector breaks.
+    """
+
+    __tablename__ = "recorded_actions"
+    __table_args__ = (Index("ix_recorded_actions_session_seq", "session_id", "sequence"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    org_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("browser_sessions.id", ondelete="CASCADE"), nullable=False
+    )
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    type: Mapped[str] = mapped_column(String(32), nullable=False)
+    selector: Mapped[str | None] = mapped_column(String(1000), index=True)
+    value: Mapped[str | None] = mapped_column(Text)
+    url: Mapped[str | None] = mapped_column(String(2000))
+    tag: Mapped[str | None] = mapped_column(String(64))
+    text: Mapped[str | None] = mapped_column(String(300))
+    redacted: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    fragile: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+    session: Mapped[BrowserSession] = relationship(back_populates="actions")
+
+
+class AiAnalysis(Base, TimestampMixin):
+    """A stored conclusion from one of the agents, kept as history.
+
+    ``Project.stack`` holds only the latest Project Analyst result and is
+    replaced wholesale on every analysis. This keeps each one, so "when did
+    the analyzer start seeing Redis" or "how many endpoints did it find before
+    that refactor" has an answer. ``kind`` names the analysis; ``content`` is
+    that agent's own ``to_dict()``, unmodified.
+    """
+
+    __tablename__ = "ai_analysis"
+    __table_args__ = (Index("ix_ai_analysis_project_kind", "project_id", "kind", "created_at"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    org_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
+    )
+    run_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("test_runs.id", ondelete="SET NULL")
+    )
+    kind: Mapped[str] = mapped_column(String(64), nullable=False)
+    agent: Mapped[str] = mapped_column(String(64), nullable=False)
+    #: Where the input came from: a repository URL, a local path, a run.
+    source: Mapped[str | None] = mapped_column(String(500))
+    commit_sha: Mapped[str | None] = mapped_column(String(64))
+    content: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+
+
 #: Tables that carry org_id and therefore get row-level security policies.
 TENANT_TABLES = [
     "users",
@@ -935,4 +1039,7 @@ TENANT_TABLES = [
     "agent_runs",
     "llm_calls",
     "audit_logs",
+    "browser_sessions",
+    "recorded_actions",
+    "ai_analysis",
 ]

@@ -459,7 +459,7 @@ def _persist_artifacts(
     #: `modules/evidence/har.py` already redacts on the way in; scrubbing again
     #: here is deliberate defence in depth, and it is what lets the `scrubbed`
     #: column be true rather than aspirational.
-    scrubbable = {"log", "har", "trace"}
+    scrubbable = {"log", "har"}
 
     for artifact in artifacts:
         data = artifact.data

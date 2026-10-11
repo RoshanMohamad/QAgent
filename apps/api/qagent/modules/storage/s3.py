@@ -97,6 +97,16 @@ class S3ArtifactStore:
             raise
         return response["Body"].read()
 
+    def delete(self, storage_key: str) -> bool:
+        """Delete an object by key. Return True if deleted, False if not found."""
+        try:
+            self._client.delete_object(Bucket=self.bucket, Key=storage_key)
+            return True
+        except Exception as exc:  # noqa: BLE001 - botocore's classes are synthesised
+            if _is_missing(exc):
+                return False
+            raise
+
     def _exists(self, key: str) -> bool:
         try:
             self._client.head_object(Bucket=self.bucket, Key=key)

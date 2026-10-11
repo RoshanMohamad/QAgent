@@ -40,6 +40,8 @@ class ArtifactStore(Protocol):
 
     def read(self, storage_key: str) -> bytes: ...
 
+    def delete(self, storage_key: str) -> bool: ...
+
 
 def content_key(data: bytes, *, org_id: UUID | str, kind: str, extension: str) -> str:
     """``<org>/<kind>/<sha256><ext>`` - the same layout in every backend.

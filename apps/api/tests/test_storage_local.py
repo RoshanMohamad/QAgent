@@ -66,3 +66,27 @@ def test_root_directory_is_created_if_missing(tmp_path: Path) -> None:
     assert root.is_dir()
     stored = store.save(b"x", org_id=uuid.uuid4(), kind="log", extension=".log")
     assert store.read(stored.storage_key) == b"x"
+
+
+def test_delete_existing_artifact_removes_file(tmp_path: Path) -> None:
+    store = LocalArtifactStore(tmp_path)
+    stored = store.save(b"content", org_id=uuid.uuid4(), kind="log", extension=".log")
+
+    assert store.read(stored.storage_key) == b"content"
+    assert store.delete(stored.storage_key) is True
+
+    with pytest.raises(ArtifactNotFound):
+        store.read(stored.storage_key)
+
+    # Deleting again returns False (idempotent absent handling)
+    assert store.delete(stored.storage_key) is False
+
+
+def test_delete_missing_key_returns_false(tmp_path: Path) -> None:
+    store = LocalArtifactStore(tmp_path)
+    assert store.delete("missing/file.png") is False
+
+
+def test_delete_rejects_path_traversal(tmp_path: Path) -> None:
+    store = LocalArtifactStore(tmp_path)
+    assert store.delete("../../etc/passwd") is False

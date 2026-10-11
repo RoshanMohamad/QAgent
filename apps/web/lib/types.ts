@@ -53,6 +53,43 @@ export interface Project {
   stack: Record<string, unknown>;
 }
 
+export interface Environment {
+  id: string;
+  name: string;
+  mode: "target_url" | "compose";
+  base_url: string | null;
+  openapi_url: string | null;
+  e2e_enabled: boolean;
+  /** Whether headers or a secret_ref are set. The values never leave the API. */
+  has_credentials: boolean;
+}
+
+/** One row of `GET /projects/{id}/recordings`: a stored extension session. */
+export interface RecordingSummary {
+  id: string;
+  name: string;
+  start_url: string | null;
+  summary: { actions: number; requests: number; fragile_selectors: number };
+  api_cases: number;
+  diagnostics: number;
+  created_at: string;
+}
+
+/** One row of `GET /projects/{id}/runs`: counts only, no breakdown. */
+export interface RunSummary {
+  id: string;
+  status: RunStatus;
+  trigger: string;
+  commit_sha: string | null;
+  environment_id: string | null;
+  total: number;
+  passed: number;
+  failed: number;
+  errored: number;
+  created_at: string;
+  finished_at: string | null;
+}
+
 export interface Run {
   id: string;
   status: RunStatus;

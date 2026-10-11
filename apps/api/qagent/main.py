@@ -17,7 +17,7 @@ from pathlib import Path
 from uuid import UUID
 
 import redis as redis_lib
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func, select
@@ -269,6 +269,20 @@ class ConnectRepoIn(BaseModel):
     repo_url: str = Field(min_length=1, max_length=500)
     branch: str | None = None
     token: str | None = Field(default=None, repr=False, exclude=True)
+
+
+class RecordingIn(BaseModel):
+    """A session exported by the browser extension (CLAUDE.md section 10).
+
+    ``document`` is untrusted - it came from a page the developer visited - and
+    goes straight to ``parse_session``, which bounds and validates it. Only
+    what survives that is stored.
+    """
+
+    document: dict
+    name: str | None = Field(default=None, max_length=200)
+    #: Keep only traffic to this origin, as ``qagent record-import --url``.
+    base_url: str | None = Field(default=None, max_length=500)
 
 
 class RepositoryWebhookIn(BaseModel):
@@ -557,9 +571,38 @@ def analyze_project(
 
     analysis = analyze_repository(repo_dir)
     project.stack = analysis.to_dict()
+    _record_analysis(session, org_id, project_id, content=project.stack, source=str(repo_dir))
     session.commit()
 
     return {"id": str(project.id), "stack": project.stack}
+
+
+def _record_analysis(
+    session: Session,
+    org_id: UUID,
+    project_id: UUID,
+    *,
+    content: dict,
+    source: str | None,
+    commit_sha: str | None = None,
+) -> None:
+    """Keep the Project Analyst's result as history (``ai_analysis``).
+
+    ``Project.stack`` is replaced on every analysis, which is right for "what
+    is this project now" and loses "what was it before". This row is the
+    before.
+    """
+    session.add(
+        models.AiAnalysis(
+            org_id=org_id,
+            project_id=project_id,
+            kind="project_analysis",
+            agent="project_analyst",
+            source=source,
+            commit_sha=commit_sha,
+            content=content,
+        )
+    )
 
 
 @app.post("/api/v1/projects/{project_id}/connect", tags=["projects"])
@@ -642,6 +685,14 @@ def connect_repository(
     repository.default_branch = payload.branch or repository.default_branch
     repository.last_analyzed_sha = commit_sha
     repository.last_analyzed_at = datetime.now(UTC)
+    _record_analysis(
+        session,
+        org_id,
+        project_id,
+        content=project.stack,
+        source=ref.https_url,
+        commit_sha=commit_sha,
+    )
     session.commit()
 
     return {
@@ -840,6 +891,211 @@ def create_environment(
     session.add(environment)
     session.commit()
     return {"id": str(environment.id), "base_url": environment.base_url}
+
+
+@app.get("/api/v1/projects/{project_id}/analyses", tags=["projects"])
+def list_analyses(
+    project_id: UUID,
+    kind: str | None = None,
+    limit: int = Query(default=20, ge=1, le=100),
+    org_id: UUID = Depends(current_org),
+    session: Session = Depends(get_db),
+) -> list[dict]:
+    """Stored agent conclusions for a project, newest first."""
+    if session.get(models.Project, project_id) is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "project not found")
+    query = select(models.AiAnalysis).where(models.AiAnalysis.project_id == project_id)
+    if kind:
+        query = query.where(models.AiAnalysis.kind == kind)
+    rows = session.execute(
+        query.order_by(models.AiAnalysis.created_at.desc()).limit(limit)
+    ).scalars()
+    return [
+        {
+            "id": str(a.id),
+            "kind": a.kind,
+            "agent": a.agent,
+            "source": a.source,
+            "commit_sha": a.commit_sha,
+            "run_id": str(a.run_id) if a.run_id else None,
+            "created_at": a.created_at,
+            "content": a.content,
+        }
+        for a in rows
+    ]
+
+
+@app.post("/api/v1/projects/{project_id}/recordings", status_code=201, tags=["recordings"])
+def upload_recording(
+    project_id: UUID,
+    payload: RecordingIn,
+    principal: Principal = Depends(current_principal),
+    session: Session = Depends(get_db),
+) -> dict:
+    """Store a browser-extension recording against a project, already converted
+    into a UI flow and API checks (the same conversion ``record-import`` does).
+    """
+    from qagent.modules.recorder.session import parse_session, to_api_cases, to_ui_flow
+
+    if session.get(models.Project, project_id) is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "project not found")
+
+    recorded = parse_session(payload.document)
+    if not recorded.actions and not recorded.requests:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "the session contains no usable actions or requests"
+            + (f": {'; '.join(recorded.warnings[:3])}" if recorded.warnings else ""),
+        )
+
+    cases = to_api_cases(recorded, base_url=payload.base_url)
+    browser_session = models.BrowserSession(
+        org_id=principal.org_id,
+        project_id=project_id,
+        name=(payload.name or recorded.start_url or "recording")[:200],
+        start_url=recorded.start_url,
+        created_by=str(principal.user_id),
+        summary=recorded.summary(),
+        ui_flow=to_ui_flow(recorded),
+        api_cases=[case.to_dict() for case in cases],
+        diagnostics=list(recorded.diagnostics),
+    )
+    browser_session.actions = [
+        models.RecordedAction(org_id=principal.org_id, sequence=index, **action.to_dict())
+        for index, action in enumerate(recorded.actions)
+    ]
+    session.add(browser_session)
+    session.commit()
+
+    return {
+        "id": str(browser_session.id),
+        "name": browser_session.name,
+        "summary": browser_session.summary,
+        "api_cases": len(cases),
+        "diagnostics": browser_session.diagnostics,
+    }
+
+
+@app.get("/api/v1/projects/{project_id}/recordings", tags=["recordings"])
+def list_recordings(
+    project_id: UUID, org_id: UUID = Depends(current_org), session: Session = Depends(get_db)
+) -> list[dict]:
+    if session.get(models.Project, project_id) is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "project not found")
+    rows = session.execute(
+        select(models.BrowserSession)
+        .where(models.BrowserSession.project_id == project_id)
+        .order_by(models.BrowserSession.created_at.desc())
+    ).scalars()
+    return [
+        {
+            "id": str(r.id),
+            "name": r.name,
+            "start_url": r.start_url,
+            "summary": r.summary,
+            "api_cases": len(r.api_cases),
+            "diagnostics": len(r.diagnostics),
+            "created_at": r.created_at,
+        }
+        for r in rows
+    ]
+
+
+@app.get("/api/v1/recordings/{recording_id}", tags=["recordings"])
+def get_recording(
+    recording_id: UUID, org_id: UUID = Depends(current_org), session: Session = Depends(get_db)
+) -> dict:
+    recording = session.get(models.BrowserSession, recording_id)
+    if recording is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "recording not found")
+    return {
+        "id": str(recording.id),
+        "project_id": str(recording.project_id),
+        "name": recording.name,
+        "start_url": recording.start_url,
+        "created_by": recording.created_by,
+        "created_at": recording.created_at,
+        "summary": recording.summary,
+        "diagnostics": recording.diagnostics,
+        "ui_flow": recording.ui_flow,
+        "api_cases": recording.api_cases,
+        "actions": [
+            {
+                "sequence": a.sequence,
+                "type": a.type,
+                "selector": a.selector,
+                "value": a.value,
+                "url": a.url,
+                "tag": a.tag,
+                "text": a.text,
+                "redacted": a.redacted,
+                "fragile": a.fragile,
+            }
+            for a in recording.actions
+        ],
+    }
+
+
+@app.get("/api/v1/projects/{project_id}/environments", tags=["projects"])
+def list_environments(
+    project_id: UUID, org_id: UUID = Depends(current_org), session: Session = Depends(get_db)
+) -> list[dict]:
+    """What the dashboard's "Run QA" picks a target from. Never returns
+    `default_headers` values or the secret they may resolve to - only whether
+    credentials are configured, which is all a picker needs to show."""
+    if session.get(models.Project, project_id) is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "project not found")
+    rows = session.execute(
+        select(models.Environment)
+        .where(models.Environment.project_id == project_id)
+        .order_by(models.Environment.created_at)
+    ).scalars()
+    return [
+        {
+            "id": str(e.id),
+            "name": e.name,
+            "mode": e.mode.value,
+            "base_url": e.base_url,
+            "openapi_url": e.openapi_url,
+            "e2e_enabled": e.e2e_enabled,
+            "has_credentials": bool(e.secret_ref or e.default_headers),
+        }
+        for e in rows
+    ]
+
+
+@app.get("/api/v1/projects/{project_id}/runs", tags=["runs"])
+def list_runs(
+    project_id: UUID,
+    limit: int = Query(default=20, ge=1, le=100),
+    org_id: UUID = Depends(current_org),
+    session: Session = Depends(get_db),
+) -> list[dict]:
+    """Most recent first. Counts only - `GET /runs/{id}` has the breakdown."""
+    if session.get(models.Project, project_id) is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "project not found")
+    rows = session.execute(
+        select(models.TestRun)
+        .where(models.TestRun.project_id == project_id)
+        .order_by(models.TestRun.created_at.desc())
+        .limit(limit)
+    ).scalars()
+    return [
+        {
+            "id": str(r.id),
+            "status": r.status.value,
+            "trigger": r.trigger,
+            "commit_sha": r.commit_sha,
+            "environment_id": str(r.environment_id) if r.environment_id else None,
+            "total": r.total,
+            "passed": r.passed,
+            "failed": r.failed,
+            "errored": r.errored,
+            "created_at": r.created_at,
+            "finished_at": r.finished_at,
+        }
+        for r in rows
+    ]
 
 
 @app.post(

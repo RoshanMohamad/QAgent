@@ -393,3 +393,61 @@ def test_record_import_exits_nonzero_on_an_empty_session(tmp_path) -> None:
     path.write_text(json.dumps({"actions": [], "requests": []}), encoding="utf-8")
 
     assert runner.invoke(app, ["record-import", str(path)]).exit_code == 2
+
+
+# ------------------------------------------------------------------ upload
+
+
+def test_record_import_uploads_the_raw_document_when_a_project_is_given(
+    tmp_path, monkeypatch
+) -> None:
+    from qagent.modules.client import QAgentClient, ReportResult
+
+    monkeypatch.delenv("QAGENT_API_URL", raising=False)
+    monkeypatch.delenv("QAGENT_PROJECT_ID", raising=False)
+    sent: list[tuple[str, dict]] = []
+
+    def fake_post(self, path, payload):  # noqa: ANN001
+        sent.append((path, payload))
+        return ReportResult(ok=True, record_id="rec-1")
+
+    monkeypatch.setattr(QAgentClient, "_post", fake_post)
+    session_file = tmp_path / "checkout.json"
+    session_file.write_text(json.dumps(_session()), encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        [
+            "record-import", str(session_file),
+            "--url", "http://shop.test",
+            "--report-to", "http://qagent.test",
+            "--project", "p-1",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    [(path, payload)] = sent
+    assert path == "/api/v1/projects/p-1/recordings"
+    # the server re-parses; it is sent what the extension wrote, not our conversion
+    assert payload["document"] == _session()
+    assert payload["name"] == "checkout"
+    assert payload["base_url"] == "http://shop.test"
+    assert "stored recording rec-1" in result.output
+
+
+def test_record_import_stores_nothing_without_a_project(tmp_path, monkeypatch) -> None:
+    from qagent.modules.client import QAgentClient
+
+    monkeypatch.delenv("QAGENT_PROJECT_ID", raising=False)
+    called = []
+    monkeypatch.setattr(QAgentClient, "_post", lambda *a, **k: called.append(a))
+    session_file = tmp_path / "s.json"
+    session_file.write_text(json.dumps(_session()), encoding="utf-8")
+
+    result = runner.invoke(
+        app, ["record-import", str(session_file), "--report-to", "http://qagent.test"]
+    )
+
+    assert result.exit_code == 0
+    assert called == []
+    assert "without --project" in result.output

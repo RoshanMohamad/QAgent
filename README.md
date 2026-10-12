@@ -1253,11 +1253,14 @@ app running:
 qagent analyze --repo ./path/to/checkout
 ```
 
-Or connect a GitHub repository directly and let QAgent fetch it:
+Or connect a GitHub, GitLab or Bitbucket repository directly and let QAgent
+fetch it:
 
 ```bash
 qagent connect --repo https://github.com/pallets/flask      # or just pallets/flask
 qagent connect --repo me/private-app --token $GITHUB_TOKEN  # private
+qagent connect --repo https://gitlab.com/group/subgroup/app # $GITLAB_TOKEN if private
+qagent connect --repo https://bitbucket.org/team/app        # $BITBUCKET_TOKEN if private
 ```
 
 ```text
@@ -1276,13 +1279,15 @@ curl -X POST $API/api/v1/projects/$PID/connect -H "Authorization: Bearer $TOKEN"
 # -> {"repo_url": ..., "commit_sha": "d73fa1cd...", "summary": {...}}
 ```
 
-The clone is shallow, single-branch, submodule-free, pinned to `github.com`,
-and **deleted as soon as the analysis finishes** — nothing downstream reads
-source after Agent 1, and checks run against a running application, not files.
-Only https `github.com` URLs are accepted: `git clone` otherwise honours
-transports that execute commands (`ext::`), read local files (`file://`), or
-reach internal hosts the API process can see and the caller should not, and one
-host allowlist removes all three at once. A token is used for the clone and
+The clone is shallow, single-branch, submodule-free, pinned to three public
+hosts, and **deleted as soon as the analysis finishes** — nothing downstream
+reads source after Agent 1, and checks run against a running application, not
+files. Only https URLs on `github.com`, `gitlab.com` or `bitbucket.org` are
+accepted: `git clone` otherwise honours transports that execute commands
+(`ext::`), read local files (`file://`), or reach internal hosts the API process
+can see and the caller should not, and one host allowlist removes all three at
+once. The list is code, not configuration — which is also why self-hosted
+GitLab is not supported ([ADR-0012](docs/decisions/ADR-0012-gitlab-and-bitbucket-are-fixed-public-hosts.md)). A token is used for the clone and
 nothing else — it is passed through a 0600 credential file rather than argv (so
 it is not in `ps`), stripped from git's own error output, and never written to
 the database (ADR-0009).
@@ -1296,15 +1301,19 @@ curl -X PUT $API/api/v1/projects/$PID/repositories/$RID/webhook \
 # -> {"callback_url": "/api/v1/webhooks/github/<org id>/<repo id>", "events": ["push"]}
 ```
 
-Paste that URL into the repository's GitHub webhook settings (content type
+Paste that URL into the repository's webhook settings (content type
 `application/json`, secret whatever `QAGENT_ENV_SECRET_<ORG ID HEX>_GH_WEBHOOK`
 holds — the [same per-org secret store](#authenticated-targets) an
 environment's credentials come from). A push to the default branch then queues
 `qagent.run_scan` for every environment on the project — CLAUDE.md §19's
 `git push -> ... -> Run QA`, not just the analysis.
 
-The only authentication a webhook delivery can carry is the HMAC signature
-GitHub computes over the raw body (`modules/webhooks/github.py`); the org and
+The callback URL follows the repository's host — `/webhooks/gitlab/...` with
+`events: ["Push events"]`, `/webhooks/bitbucket/...` with `["repo:push"]` — and
+a repository answers only on its own host's endpoint. The only authentication a
+delivery can carry is the secret: the HMAC signature GitHub (and Bitbucket, in
+`X-Hub-Signature`) computes over the raw body, or the token GitLab echoes in
+`X-Gitlab-Token`, compared in constant time (`modules/webhooks/`); the org and
 repository ids in the URL are not secrets, the same way a Stripe Connect
 account id in a webhook URL isn't — they only select whose signing secret to
 check the delivery against, and nothing runs before that check passes. What
@@ -1607,6 +1616,7 @@ The CLI, the worker and the eval harness all run the identical loop — which me
 | [0010](docs/decisions/ADR-0010-infrastructure-is-validated-not-proven.md) | Infrastructure is schema-validated in CI, never described as proven; billing prices but never settles; the twelve-microservice split stays unbuilt and the queue split is the fan-out that carries its benefit. |
 | [0009](docs/decisions/ADR-0009-github-checkouts-are-ephemeral-and-host-pinned.md) | A connected repository is cloned from `github.com` only, with command-executing and local-file git transports disabled, and the checkout is deleted once analysed — tokens never reach argv or the database. |
 | [0011](docs/decisions/ADR-0011-compose-mode-runs-sandboxed.md) | Compose mode refuses host-reaching settings in the resolved config and layers a hardening override (limits, `cap_drop: ALL`, read-only root, internal network, loopback-only target port); the target alone keeps egress. |
+| [0012](docs/decisions/ADR-0012-gitlab-and-bitbucket-are-fixed-public-hosts.md) | GitLab.com and Bitbucket Cloud join GitHub on a fixed, in-code host allowlist; each host's webhook proves itself its own way and a repository answers only on its own host's endpoint. Self-hosted instances stay out until there is an egress design. |
 
 ---
 
@@ -1789,7 +1799,11 @@ What remains is deliberately deferred rather than pending — see below, and
 [ADR-0008](docs/decisions/ADR-0008-phase-6-scope.md). The honest list of things
 that would come next, none of which are CLAUDE.md requirements:
 
-- **GitLab and Bitbucket** (§5 says GitHub first, and only GitHub is built).
+- **Self-hosted GitLab / Bitbucket Data Center.** GitLab.com and Bitbucket
+  Cloud are built; a self-hosted instance is an internal host by definition and
+  needs an egress design (resolve, refuse private ranges, pin the IP) before it
+  can be allowed ([ADR-0012](docs/decisions/ADR-0012-gitlab-and-bitbucket-are-fixed-public-hosts.md)).
+  Issue sync is still GitHub/Jira only.
 - **Settlement.** The statement is priced; wiring a payment provider needs a
   pricing decision that does not exist yet ([ADR-0010](docs/decisions/ADR-0010-infrastructure-is-validated-not-proven.md)).
 - **Tuning the manifests against a real cluster.** They are schema-valid; the

@@ -178,7 +178,7 @@ export default async function ProjectPage({
 
         <Card
           title="Repository"
-          description="Cloned into a temporary directory, analyzed, then deleted. Only GitHub is supported."
+          description="Cloned into a temporary directory, analyzed, then deleted. GitHub, GitLab.com and Bitbucket Cloud."
         >
           <ConnectRepoForm projectId={projectId} repoUrl={project?.repo_url ?? null} />
         </Card>

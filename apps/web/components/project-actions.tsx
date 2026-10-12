@@ -204,13 +204,13 @@ export function ConnectRepoForm({
   return (
     <form onSubmit={onSubmit} className="grid gap-3 sm:grid-cols-[3fr_1fr_auto] sm:items-end">
       <label className="block text-xs">
-        GitHub repository
+        Repository
         <input
           required
           type="url"
           value={url}
           onChange={(e) => setUrl(e.target.value)}
-          placeholder="https://github.com/owner/repo"
+          placeholder="https://github.com/owner/repo, gitlab.com/..., bitbucket.org/..."
           className="mt-1 w-full rounded border px-3 py-2 text-sm"
           style={inputStyle}
         />

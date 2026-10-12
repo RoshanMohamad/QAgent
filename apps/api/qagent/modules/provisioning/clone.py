@@ -1,5 +1,5 @@
-"""GitHub checkout provisioning (CLAUDE.md section 6: "clones the repository
-into an isolated environment").
+"""Repository checkout provisioning (CLAUDE.md section 6: "clones the repository
+into an isolated environment"; section 5: GitHub, GitLab and Bitbucket).
 
 ADR-0006 settled what the analyzer may *do* with a checkout - read text, never
 execute it. It assumed the checkout was already on local disk, which is why
@@ -16,11 +16,14 @@ Cloning is the first moment untrusted third-party content touches the process
 (ADR-0004), and it happens *before* any sandbox exists (ADR-0006). So the clone
 itself is treated as hostile input rather than a convenience:
 
-- **Host allowlist.** Only ``github.com``. This is not politeness about scope -
-  ``git clone`` accepts transports that execute commands outright (``ext::``),
-  read the local filesystem (``file://``), and reach internal hosts the API
-  process can see but the caller should not (SSRF). Refusing everything that is
-  not an https github.com URL removes all three at once.
+- **Host allowlist.** Only ``github.com``, ``gitlab.com`` and
+  ``bitbucket.org`` - a fixed list, never a configurable one. This is not
+  politeness about scope - ``git clone`` accepts transports that execute
+  commands outright (``ext::``), read the local filesystem (``file://``), and
+  reach internal hosts the API process can see but the caller should not
+  (SSRF). Refusing everything that is not an https URL on a known public host
+  removes all three at once. A self-hosted GitLab is exactly such an internal
+  host, which is why it is not on the list (ADR-0012).
 - **Transports disabled explicitly.** ``protocol.ext.allow=never`` and
   ``protocol.file.allow=never`` hold even if a redirect or a submodule tries to
   reintroduce them behind the URL check.
@@ -52,17 +55,41 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# The one host this module will clone from. See the module docstring: this is a
-# security boundary, not a scoping preference.
-ALLOWED_HOST = "github.com"
 
-# owner/repo, as GitHub itself constrains them: alphanumerics, dot, dash,
-# underscore. Anything else is not a repository path we are willing to build a
-# URL out of.
-_SEGMENT = r"[A-Za-z0-9._-]+"
-_REPO_URL = re.compile(
-    rf"^(?:https://(?:www\.)?{re.escape(ALLOWED_HOST)}/)?({_SEGMENT})/({_SEGMENT}?)(?:\.git)?/?$"
-)
+@dataclass(frozen=True)
+class GitHost:
+    """One host this module will clone from, and how it takes a token."""
+
+    provider: str
+    host: str
+    #: The username a token is presented under in the credential file. Each
+    #: host documents its own: GitHub accepts ``x-access-token`` for PATs and
+    #: app tokens, GitLab ``oauth2`` for personal/project/group tokens, and
+    #: Bitbucket ``x-token-auth`` for repository/workspace access tokens.
+    username: str
+    #: Where a token comes from when the caller does not pass one.
+    token_env: str
+    #: Most path segments a repository path may have. GitLab nests groups
+    #: (``group/subgroup/project``); GitHub and Bitbucket are ``owner/repo``.
+    max_segments: int
+
+
+# The hosts this module will clone from. See the module docstring: this is a
+# security boundary, not a scoping preference, and it is deliberately not read
+# from configuration.
+ALLOWED_HOSTS: dict[str, GitHost] = {
+    "github.com": GitHost("github", "github.com", "x-access-token", "GITHUB_TOKEN", 2),
+    "gitlab.com": GitHost("gitlab", "gitlab.com", "oauth2", "GITLAB_TOKEN", 20),
+    "bitbucket.org": GitHost("bitbucket", "bitbucket.org", "x-token-auth", "BITBUCKET_TOKEN", 2),
+}
+GITHUB = ALLOWED_HOSTS["github.com"]
+
+# One path segment, as all three hosts constrain them: alphanumerics, dot,
+# dash, underscore. Anything else is not a repository path we are willing to
+# build a URL out of.
+_SEGMENT = re.compile(r"^[A-Za-z0-9._-]+$")
+_SHORTHAND = re.compile(r"^([A-Za-z0-9._-]+)/([A-Za-z0-9._-]*?)(?:\.git)?/?$")
+_REPO_URL = re.compile(r"^https://(?:www\.)?([a-z0-9.-]+)/(.*?)(?:\.git)?/?$")
 
 # A branch name we are willing to pass to --branch. Git's own rules are wider,
 # but everything excluded here (leading dash, whitespace, ``..``) exists to stop
@@ -77,15 +104,21 @@ class CloneError(RuntimeError):
 
 @dataclass(frozen=True)
 class RepoRef:
-    """A validated GitHub repository reference.
+    """A validated repository reference.
 
     Built only by :func:`parse_repo_url`, so holding one is proof the host
     allowlist has already been applied - no caller can construct a clone target
-    that skipped validation.
+    that skipped validation. ``owner`` is everything before the repository
+    name, so a GitLab subgroup path lives there whole (``group/subgroup``).
     """
 
     owner: str
     repo: str
+    host: GitHost = GITHUB
+
+    @property
+    def provider(self) -> str:
+        return self.host.provider
 
     @property
     def slug(self) -> str:
@@ -93,33 +126,48 @@ class RepoRef:
 
     @property
     def https_url(self) -> str:
-        return f"https://{ALLOWED_HOST}/{self.slug}.git"
+        return f"https://{self.host.host}/{self.slug}.git"
 
 
 def parse_repo_url(raw: str) -> RepoRef:
     """Validate ``raw`` and return the repository it names.
 
-    Accepts a full ``https://github.com/owner/repo`` URL (with or without
-    ``.git``) or the ``owner/repo`` shorthand. Everything else - other hosts,
+    Accepts a full ``https://`` URL on an allowed host (with or without
+    ``.git``) or the ``owner/repo`` shorthand, which means GitHub - the one
+    host that has always been accepted. Everything else - other hosts,
     ``git@``/``ssh://``/``file://``/``ext::`` transports, URLs carrying
-    credentials or a query string - is refused rather than normalised, because
-    the point of this function is to be the only way in.
+    credentials or a query string, ``.``/``..`` segments - is refused rather
+    than normalised, because the point of this function is to be the only way
+    in.
     """
     candidate = (raw or "").strip()
     if not candidate:
         raise CloneError("no repository URL given")
 
-    match = _REPO_URL.match(candidate)
-    if match is None:
-        raise CloneError(
-            f"not a {ALLOWED_HOST} repository URL: {candidate!r}. "
-            f"Expected https://{ALLOWED_HOST}/owner/repo or owner/repo."
-        )
+    shorthand = _SHORTHAND.match(candidate)
+    if shorthand is not None:
+        host, segments = GITHUB, [shorthand.group(1), shorthand.group(2)]
+    else:
+        match = _REPO_URL.match(candidate)
+        host = ALLOWED_HOSTS.get(match.group(1)) if match else None
+        if match is None or host is None:
+            allowed = ", ".join(f"https://{h}/owner/repo" for h in ALLOWED_HOSTS)
+            raise CloneError(
+                f"not a supported repository URL: {candidate!r}. "
+                f"Expected {allowed}, or owner/repo for GitHub."
+            )
+        segments = match.group(2).split("/")
 
-    owner, repo = match.group(1), match.group(2)
-    if not repo:
+    if not segments[-1]:
         raise CloneError(f"missing repository name in {candidate!r}")
-    return RepoRef(owner=owner, repo=repo)
+    if not 2 <= len(segments) <= host.max_segments:
+        raise CloneError(f"not a {host.host} repository path: {candidate!r}")
+    for segment in segments:
+        # `-` is GitLab's separator before UI routes (`/-/tree/main`), and a
+        # segment of only dots is traversal; both match the character class.
+        if not _SEGMENT.match(segment) or segment == "-" or set(segment) == {"."}:
+            raise CloneError(f"invalid path segment {segment!r} in {candidate!r}")
+    return RepoRef(owner="/".join(segments[:-1]), repo=segments[-1], host=host)
 
 
 def _validate_branch(branch: str | None) -> str | None:
@@ -174,15 +222,15 @@ def _build_clone_args(
     return args
 
 
-def _write_credential_file(directory: Path, token: str) -> Path:
+def _write_credential_file(directory: Path, token: str, host: GitHost = GITHUB) -> Path:
     """Write a git credential-store file readable only by this user.
 
-    ``x-access-token`` is the username GitHub expects for both a PAT and an app
-    installation token, so the same file works for either.
+    The username is the host's own convention for token auth (see
+    ``GitHost.username``); the token is the password either way.
     """
     path = directory / ".git-credentials"
     path.write_text(
-        f"https://x-access-token:{token}@{ALLOWED_HOST}\n",
+        f"https://{host.username}:{token}@{host.host}\n",
         encoding="utf-8",
     )
     # Best effort: chmod is a no-op for practical purposes on Windows, but the
@@ -216,7 +264,7 @@ def cloned_repository(
     token: str | None = None,
     timeout_seconds: float = 300.0,
 ) -> Iterator[Path]:
-    """Clone a GitHub repository to a temporary directory and yield its path.
+    """Clone a repository to a temporary directory and yield its path.
 
     The checkout is deleted on exit whether the body succeeded or raised - the
     same unconditional teardown ``ComposeStack`` gives a compose stack. Nothing
@@ -232,7 +280,7 @@ def cloned_repository(
 
     try:
         if token:
-            credential_file = _write_credential_file(workspace, token)
+            credential_file = _write_credential_file(workspace, token, ref.host)
 
         args = _build_clone_args(
             ref, branch=checked_branch, credential_file=credential_file, destination=destination

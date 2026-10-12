@@ -257,13 +257,14 @@ class AnalyzeRepoIn(BaseModel):
 
 
 class ConnectRepoIn(BaseModel):
-    """Connect a GitHub repository (CLAUDE.md section 6).
+    """Connect a GitHub, GitLab or Bitbucket repository (CLAUDE.md sections 5-6).
 
     ``token`` is a PAT used for the clone and nothing else: it is never written
     to the database and never logged, and the request model excludes it from
     ``repr`` so it cannot reach a traceback or a debug dump. Omitted, the server
-    falls back to ``$GITHUB_TOKEN`` - the same contract ``qagent report-issues``
-    already uses - and a public repository needs neither.
+    falls back to the host's own variable - ``$GITHUB_TOKEN`` (the contract
+    ``qagent report-issues`` already uses), ``$GITLAB_TOKEN`` or
+    ``$BITBUCKET_TOKEN`` - and a public repository needs none.
     """
 
     repo_url: str = Field(min_length=1, max_length=500)
@@ -613,7 +614,7 @@ def connect_repository(
     session: Session = Depends(get_db),
     _owner: Principal = Depends(require_owner),
 ) -> dict:
-    """Clone a GitHub repository and run the Project Analyst over it.
+    """Clone a repository and run the Project Analyst over it.
 
     ``analyze`` above requires the checkout to already be on a disk the API can
     read, which makes "connect a repository" a manual step the operator does
@@ -640,10 +641,9 @@ def connect_repository(
     if project is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "project not found")
 
-    token = payload.token or os.environ.get("GITHUB_TOKEN") or None
-
     try:
         ref = parse_repo_url(payload.repo_url)
+        token = payload.token or os.environ.get(ref.host.token_env) or None
         with cloned_repository(payload.repo_url, branch=payload.branch, token=token) as repo_dir:
             analysis = analyze_repository(repo_dir)
             commit_sha = head_commit(repo_dir)
@@ -676,7 +676,7 @@ def connect_repository(
         repository = models.Repository(
             org_id=org_id,
             project_id=project_id,
-            provider="github",
+            provider=ref.provider,
             url=ref.https_url,
             default_branch=payload.branch or project.default_branch,
         )
@@ -744,14 +744,14 @@ def configure_repository_webhook(
     session: Session = Depends(get_db),
     _owner: Principal = Depends(require_owner),
 ) -> dict:
-    """Name the secret GitHub's webhook settings sign deliveries with.
+    """Name the secret the repository host's webhook settings were given.
 
     Owner-only, for the same reason connecting a repository is: it changes
     which pushes make this server run real traffic against a real
-    environment. Returns the URL to paste into GitHub - not a secret; the org
-    and repository ids in it are not what authenticates a delivery, the HMAC
-    signature is (modules/webhooks/github.py). Configuring the webhook itself,
-    in GitHub's settings, is the operator's step, same as GitHub Actions.
+    environment. Returns the URL to paste into the host - not a secret; the org
+    and repository ids in it are not what authenticates a delivery, the secret
+    is (modules/webhooks/). Configuring the webhook itself, in the host's
+    settings, is the operator's step, same as GitHub Actions.
     """
     repository = session.get(models.Repository, repository_id)
     if repository is None or repository.project_id != project_id:
@@ -761,71 +761,68 @@ def configure_repository_webhook(
     session.commit()
 
     return {
-        "callback_url": f"/api/v1/webhooks/github/{org_id}/{repository_id}",
-        "events": ["push"],
+        "callback_url": f"/api/v1/webhooks/{repository.provider}/{org_id}/{repository_id}",
+        # In each host's own vocabulary, since that is where it gets typed in.
+        "events": _WEBHOOK_EVENTS.get(repository.provider, ["push"]),
         "content_type": "application/json",
     }
 
 
-@app.post(
-    "/api/v1/webhooks/github/{org_id}/{repository_id}",
-    tags=["webhooks"],
-    dependencies=[Depends(rate_limit_by_ip("webhook", limit=120, window_seconds=60))],
-)
-async def receive_github_webhook(
-    org_id: UUID,
-    repository_id: UUID,
-    request: Request,
-    session: Session = Depends(get_db),
-    x_github_event: str | None = Header(default=None),
-    x_hub_signature_256: str | None = Header(default=None),
-) -> dict:
-    """A connected repository's push, re-validated and re-scanned.
+_WEBHOOK_EVENTS = {
+    "github": ["push"],
+    "gitlab": ["Push events"],
+    "bitbucket": ["repo:push"],
+}
 
-    Unauthenticated by bearer token - GitHub cannot send one - so identity is
-    the HMAC signature alone (modules/webhooks/github.py). The org and
-    repository ids in the URL are not secrets; they only say *which* repository's
-    webhook secret to check the signature against, the way a Stripe Connect
-    account id in a webhook URL says whose signing secret applies. Nothing here
-    trusts them before the signature check passes.
 
-    CLAUDE.md section 19's ``git push -> ... -> Run QA``: a push to the
-    repository's default branch queues `qagent.run_scan` for every environment
-    on its project, the same task and the same credential resolution
-    (modules/secrets/) a manual run uses.
+def _webhook_secret(session: Session, org_id: UUID, repository_id: UUID, provider: str):
+    """The repository a delivery names and the secret it must prove.
+
+    Unauthenticated by bearer token - no host can send one - so identity is the
+    webhook secret alone. The org and repository ids in the URL are not
+    secrets; they only say *which* repository's secret to check against, the
+    way a Stripe Connect account id in a webhook URL says whose signing secret
+    applies. Nothing here trusts them before the caller's check passes.
+
+    The same 404 for a missing repository, one with no webhook, and one on a
+    different host: none of those is information a caller who has not yet
+    proven the secret should be able to probe for. Matching the provider also
+    means a GitLab token can never be replayed at the GitHub receiver, whose
+    check (an HMAC) it was never meant to satisfy.
     """
-    import json
-
     from qagent.modules.secrets.store import SecretNotFound, store_from_settings
-    from qagent.modules.webhooks.github import parse_push_event, verify_signature
-
-    body = await request.body()
 
     set_tenant(session, org_id)
     repository = session.get(models.Repository, repository_id)
-    if repository is None or repository.webhook_secret_ref is None:
-        # Same response whether the repository doesn't exist or has no webhook
-        # configured: neither is information a caller who fails the signature
-        # check (checked next, for a real repository) should be able to probe for.
+    if (
+        repository is None
+        or repository.webhook_secret_ref is None
+        or repository.provider != provider
+    ):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no webhook configured")
 
     try:
         secret = store_from_settings(settings).get(repository.webhook_secret_ref, org_id=org_id)
     except SecretNotFound:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no webhook configured") from None
+    return repository, secret
 
-    if not verify_signature(body, x_hub_signature_256, secret):
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "signature mismatch")
 
-    if x_github_event == "ping":
-        return {"status": "pong"}
-    if x_github_event != "push":
-        return {"status": "ignored", "event": x_github_event}
+def _queue_push_scans(
+    session: Session, org_id: UUID, repository: models.Repository, events: list
+) -> dict:
+    """CLAUDE.md section 19's ``git push -> ... -> Run QA``, for any host.
 
-    event = parse_push_event(json.loads(body))
-    if event is None or event.deleted:
+    A push to the repository's default branch queues `qagent.run_scan` for
+    every environment on its project, the same task and the same credential
+    resolution (modules/secrets/) a manual run uses. ``events`` is a list
+    because one Bitbucket delivery can update several branches.
+    """
+    live = [e for e in events if not e.deleted]
+    if not live:
         return {"status": "ignored"}
-    if event.ref != f"refs/heads/{repository.default_branch}":
+    event = next((e for e in live if e.ref == f"refs/heads/{repository.default_branch}"), None)
+    if event is None:
         return {"status": "ignored", "reason": "not the default branch"}
 
     environments = session.execute(
@@ -859,6 +856,102 @@ async def receive_github_webhook(
         "commit_sha": event.commit_sha,
         "run_ids": [str(r) for r in queued_run_ids],
     }
+
+
+@app.post(
+    "/api/v1/webhooks/github/{org_id}/{repository_id}",
+    tags=["webhooks"],
+    dependencies=[Depends(rate_limit_by_ip("webhook", limit=120, window_seconds=60))],
+)
+async def receive_github_webhook(
+    org_id: UUID,
+    repository_id: UUID,
+    request: Request,
+    session: Session = Depends(get_db),
+    x_github_event: str | None = Header(default=None),
+    x_hub_signature_256: str | None = Header(default=None),
+) -> dict:
+    """A connected GitHub repository's push, verified by HMAC and re-scanned
+    (modules/webhooks/github.py)."""
+    import json
+
+    from qagent.modules.webhooks.github import parse_push_event, verify_signature
+
+    body = await request.body()
+    repository, secret = _webhook_secret(session, org_id, repository_id, "github")
+    if not verify_signature(body, x_hub_signature_256, secret):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "signature mismatch")
+
+    if x_github_event == "ping":
+        return {"status": "pong"}
+    if x_github_event != "push":
+        return {"status": "ignored", "event": x_github_event}
+
+    event = parse_push_event(json.loads(body))
+    return _queue_push_scans(session, org_id, repository, [event] if event else [])
+
+
+@app.post(
+    "/api/v1/webhooks/gitlab/{org_id}/{repository_id}",
+    tags=["webhooks"],
+    dependencies=[Depends(rate_limit_by_ip("webhook", limit=120, window_seconds=60))],
+)
+async def receive_gitlab_webhook(
+    org_id: UUID,
+    repository_id: UUID,
+    request: Request,
+    session: Session = Depends(get_db),
+    x_gitlab_event: str | None = Header(default=None),
+    x_gitlab_token: str | None = Header(default=None),
+) -> dict:
+    """A connected GitLab repository's push, verified by its secret token and
+    re-scanned (modules/webhooks/gitlab.py)."""
+    import json
+
+    from qagent.modules.webhooks.gitlab import parse_push_event, verify_token
+
+    body = await request.body()
+    repository, secret = _webhook_secret(session, org_id, repository_id, "gitlab")
+    if not verify_token(x_gitlab_token, secret):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "token mismatch")
+
+    if x_gitlab_event != "Push Hook":
+        return {"status": "ignored", "event": x_gitlab_event}
+
+    event = parse_push_event(json.loads(body))
+    return _queue_push_scans(session, org_id, repository, [event] if event else [])
+
+
+@app.post(
+    "/api/v1/webhooks/bitbucket/{org_id}/{repository_id}",
+    tags=["webhooks"],
+    dependencies=[Depends(rate_limit_by_ip("webhook", limit=120, window_seconds=60))],
+)
+async def receive_bitbucket_webhook(
+    org_id: UUID,
+    repository_id: UUID,
+    request: Request,
+    session: Session = Depends(get_db),
+    x_event_key: str | None = Header(default=None),
+    x_hub_signature: str | None = Header(default=None),
+) -> dict:
+    """A connected Bitbucket repository's push, verified by HMAC and re-scanned
+    (modules/webhooks/bitbucket.py)."""
+    import json
+
+    from qagent.modules.webhooks.bitbucket import parse_push_events, verify_signature
+
+    body = await request.body()
+    repository, secret = _webhook_secret(session, org_id, repository_id, "bitbucket")
+    if not verify_signature(body, x_hub_signature, secret):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "signature mismatch")
+
+    if x_event_key == "diagnostics:ping":
+        return {"status": "pong"}
+    if x_event_key != "repo:push":
+        return {"status": "ignored", "event": x_event_key}
+
+    return _queue_push_scans(session, org_id, repository, parse_push_events(json.loads(body)))
 
 
 @app.post("/api/v1/projects/{project_id}/environments", status_code=201, tags=["projects"])

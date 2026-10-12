@@ -120,7 +120,7 @@ describe("ConnectRepoForm", () => {
   it("offers re-analysis when a repository is already connected", () => {
     render(<ConnectRepoForm projectId="p-1" repoUrl="https://github.com/acme/shop" />);
 
-    expect(screen.getByLabelText("GitHub repository")).toHaveValue(
+    expect(screen.getByLabelText("Repository")).toHaveValue(
       "https://github.com/acme/shop",
     );
     expect(screen.getByRole("button", { name: "Re-analyze" })).toBeInTheDocument();
@@ -130,7 +130,7 @@ describe("ConnectRepoForm", () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse({ id: "p-1" })));
 
     render(<ConnectRepoForm projectId="p-1" repoUrl={null} />);
-    await userEvent.type(screen.getByLabelText("GitHub repository"), "https://github.com/acme/shop");
+    await userEvent.type(screen.getByLabelText("Repository"), "https://github.com/acme/shop");
     await userEvent.type(screen.getByLabelText(/Branch/), "develop");
     await userEvent.click(screen.getByRole("button", { name: "Connect" }));
 

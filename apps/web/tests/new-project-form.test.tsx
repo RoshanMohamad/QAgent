@@ -49,7 +49,7 @@ describe("NewProjectForm", () => {
     render(<NewProjectForm />);
     await userEvent.type(screen.getByLabelText("Project name"), "shop");
     await userEvent.type(
-      screen.getByLabelText(/GitHub repository/),
+      screen.getByLabelText(/^Repository/),
       "https://github.com/acme/shop",
     );
     await userEvent.click(screen.getByRole("button", { name: "Create project" }));
@@ -75,7 +75,7 @@ describe("NewProjectForm", () => {
     render(<NewProjectForm />);
     await userEvent.type(screen.getByLabelText("Project name"), "shop");
     await userEvent.type(
-      screen.getByLabelText(/GitHub repository/),
+      screen.getByLabelText(/^Repository/),
       "https://github.com/acme/missing",
     );
     await userEvent.click(screen.getByRole("button", { name: "Create project" }));

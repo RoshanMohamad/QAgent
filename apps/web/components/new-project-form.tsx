@@ -6,7 +6,7 @@ import { inputStyle, postAction } from "@/lib/actions";
 
 /**
  * Step 1-2 of the user journey (CLAUDE.md section 24): create a project and,
- * optionally, connect its GitHub repository in the same submit.
+ * optionally, connect its GitHub, GitLab or Bitbucket repository in the same submit.
  *
  * Two requests, not one, because they are two API operations with different
  * permissions: any member can create a project, only an owner can make the
@@ -65,12 +65,12 @@ export function NewProjectForm() {
         />
       </label>
       <label className="block text-xs">
-        GitHub repository <span style={{ color: "var(--text-muted)" }}>(optional)</span>
+        Repository <span style={{ color: "var(--text-muted)" }}>(optional)</span>
         <input
           type="url"
           value={repoUrl}
           onChange={(e) => setRepoUrl(e.target.value)}
-          placeholder="https://github.com/owner/repo"
+          placeholder="https://github.com/owner/repo, gitlab.com/..., bitbucket.org/..."
           className="mt-1 w-full rounded border px-3 py-2 text-sm"
           style={inputStyle}
         />

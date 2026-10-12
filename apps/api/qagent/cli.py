@@ -717,15 +717,22 @@ def _render_analysis(analysis: Any, *, label: str, title: str, output: Path | No
 @app.command()
 def connect(
     repo_url: str = typer.Option(
-        ..., "--repo", "-r", help="https://github.com/owner/repo, or the owner/repo shorthand."
+        ...,
+        "--repo",
+        "-r",
+        help="https://github.com/owner/repo, a gitlab.com or bitbucket.org URL, "
+        "or the owner/repo shorthand (GitHub).",
     ),
     branch: str | None = typer.Option(None, "--branch", "-b", help="Branch (default: the repo's)."),
     token: str | None = typer.Option(
-        None, "--token", help="GitHub token for private repos; defaults to $GITHUB_TOKEN."
+        None,
+        "--token",
+        help="Token for private repos; defaults to $GITHUB_TOKEN, $GITLAB_TOKEN or "
+        "$BITBUCKET_TOKEN by host.",
     ),
     output: Path | None = typer.Option(None, "--json", help="Write the full analysis as JSON."),
 ) -> None:
-    """Clone a GitHub repository and analyze it (CLAUDE.md section 6).
+    """Clone a GitHub, GitLab or Bitbucket repository and analyze it (CLAUDE.md section 6).
 
     The same Project Analyst `analyze` runs, against a shallow clone made in a
     temporary directory and deleted when this exits. Nothing in the checkout is
@@ -734,11 +741,16 @@ def connect(
     import os
 
     from qagent.modules.analyzer.analyst import analyze_repository
-    from qagent.modules.provisioning.clone import CloneError, cloned_repository, head_commit
-
-    resolved_token = token or os.environ.get("GITHUB_TOKEN")
+    from qagent.modules.provisioning.clone import (
+        CloneError,
+        cloned_repository,
+        head_commit,
+        parse_repo_url,
+    )
 
     try:
+        ref = parse_repo_url(repo_url)
+        resolved_token = token or os.environ.get(ref.host.token_env)
         console.print(f"[dim]cloning {repo_url} ...[/dim]")
         with cloned_repository(repo_url, branch=branch, token=resolved_token) as repo_dir:
             commit_sha = head_commit(repo_dir)

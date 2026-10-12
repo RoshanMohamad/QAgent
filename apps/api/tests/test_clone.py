@@ -1,4 +1,4 @@
-"""GitHub checkout provisioning.
+"""Repository checkout provisioning (GitHub, GitLab, Bitbucket).
 
 The end-to-end clone tests run against a real ``git`` binary and a repository
 created on local disk in a tmp_path -- no network, and nothing pulled from
@@ -50,12 +50,68 @@ def test_parse_accepts_github_forms(raw: str) -> None:
 
 
 @pytest.mark.parametrize(
+    ("raw", "provider", "owner", "https_url"),
+    [
+        ("https://gitlab.com/acme/shop", "gitlab", "acme", "https://gitlab.com/acme/shop.git"),
+        ("https://gitlab.com/acme/shop.git", "gitlab", "acme", "https://gitlab.com/acme/shop.git"),
+        (
+            "https://gitlab.com/acme/platform/web/shop",
+            "gitlab",
+            "acme/platform/web",
+            "https://gitlab.com/acme/platform/web/shop.git",
+        ),
+        (
+            "https://bitbucket.org/acme/shop",
+            "bitbucket",
+            "acme",
+            "https://bitbucket.org/acme/shop.git",
+        ),
+        ("https://github.com/acme/shop", "github", "acme", "https://github.com/acme/shop.git"),
+    ],
+)
+def test_parse_accepts_gitlab_and_bitbucket(
+    raw: str, provider: str, owner: str, https_url: str
+) -> None:
+    ref = parse_repo_url(raw)
+    assert (ref.provider, ref.owner, ref.repo, ref.https_url) == (provider, owner, "shop", https_url)
+
+
+def test_each_host_presents_its_token_under_its_own_username(tmp_path: Path) -> None:
+    lines = {}
+    for url in ["acme/shop", "https://gitlab.com/acme/shop", "https://bitbucket.org/acme/shop"]:
+        ref = parse_repo_url(url)
+        directory = tmp_path / ref.provider
+        directory.mkdir()
+        path = clone_mod._write_credential_file(directory, "tok", ref.host)
+        lines[ref.provider] = path.read_text(encoding="utf-8")
+
+    assert lines == {
+        "github": "https://x-access-token:tok@github.com\n",
+        "gitlab": "https://oauth2:tok@gitlab.com\n",
+        "bitbucket": "https://x-token-auth:tok@bitbucket.org\n",
+    }
+
+
+@pytest.mark.parametrize(
     "raw",
     [
         "",
         "   ",
-        "https://gitlab.com/acme/shop",
+        # A self-hosted GitLab is an internal host by definition (ADR-0012).
+        "https://gitlab.internal.example/acme/shop",
+        "https://gitlab.com.evil.test/acme/shop",
         "https://github.com.evil.test/acme/shop",
+        "http://gitlab.com/acme/shop",
+        "git@gitlab.com:acme/shop.git",
+        "https://oauth2:glpat-x@gitlab.com/acme/shop",
+        # GitLab UI routes, traversal, and depth past what each host allows.
+        "https://gitlab.com/acme/shop/-/tree/main",
+        "https://gitlab.com/acme/../shop",
+        "https://gitlab.com/acme/./shop",
+        "https://bitbucket.org/acme/team/shop",
+        "https://github.com/acme/team/shop",
+        "https://gitlab.com/" + "/".join(["g"] * 20) + "/shop",
+        "https://bitbucket.org/acme",
         "https://evil.test/acme/shop",
         # Transports that execute a command or read the local filesystem: the
         # reason the allowlist exists at all.

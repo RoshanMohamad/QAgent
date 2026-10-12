@@ -54,6 +54,9 @@ defect shape neither of the first two carries — a check that runs but verifies
 the wrong thing, not one that is simply missing — also scores **5 of 5 at 0%
 false positives**. A fourth, the first that is not REST — a [GraphQL](#graphql)
 API where every response is `200 OK` — scores **6 of 6 at 0% false positives**.
+A fifth, a fourth language (Go, standard library only), seeds the first defects
+that live in the query string — a category no rule reached before it — and
+scores **4 of 4 at 0% false positives**.
 
 **Verified:** the pipeline (discovery, planning, generation, execution, triage,
 reporting), the CLI, the eval harness, **543 unit tests** and lint — all run
@@ -191,6 +194,28 @@ because no fixture exercised it. Reported: **6/6 detected, 0% false positives.**
 
 `packages/fixtures/library-graphql` is the fourth, and the first that is not
 REST — see [GraphQL](#graphql) below. **6/6 detected, 0% false positives.**
+
+`packages/fixtures/inventory-api` is the fifth, and a fourth language — Go,
+`net/http` only, no module dependencies:
+
+```bash
+cd packages/fixtures/inventory-api && go run . &
+
+qagent evaluate --url http://127.0.0.1:8084 --name inventory-api --fixtures packages/fixtures
+```
+
+Two of its four defects are a category the generator could not reach at all
+before it. Every rule varied the body, the path or the credentials, and always
+sent required query parameters with valid values, so a handler that slices
+`?q=` without checking it was sent (BUG-501), or parses `?page=` and drops the
+error (BUG-502), passed every check. `case_missing_required_query` and
+`case_wrong_query_type` were written for exactly these, and the fixture carries
+the same two shapes done correctly (`GET /warehouses`, `GET /warehouses/lookup`)
+so both rules are measured for false positives, not just detections. Removing
+the two rules drops the fixture to 2/4. The other two defects are Go's own
+spellings of familiar ones: a nil `*Item` from an absent map key, and an
+unchecked `.(string)` assertion on decoded JSON. **4/4 detected, 0% false
+positives.**
 
 > **Restart each fixture between runs.** Same caveat as task-tracker's, for the
 > same reason: generation includes destructive and mutating cases, and each
@@ -1811,9 +1836,10 @@ that would come next, none of which are CLAUDE.md requirements:
 - **More fixtures**, which is the highest-leverage work at any point — every
   metric in this README is only as trustworthy as the ground truth behind it.
   A third ([notes-api](#evaluating-against-more-fixtures), Node.js, the
-  alg=none token-forgery category) and a fourth
-  ([library-graphql](#graphql), the first non-REST one) have landed, which
-  does not make this item done; each makes the next fixture worth exactly as
+  alg=none token-forgery category), a fourth
+  ([library-graphql](#graphql), the first non-REST one) and a fifth
+  ([inventory-api](#evaluating-against-more-fixtures), Go, query-string
+  defects) have landed, which does not make this item done; each makes the next fixture worth exactly as
   much as it was.
 
 Phase 6 (CLAUDE.md §23) is scoped, not skipped — see

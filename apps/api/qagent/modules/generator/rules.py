@@ -257,6 +257,97 @@ def case_boundary_value(endpoint: EndpointSpec) -> GeneratedCase | None:
     )
 
 
+def _query_params(endpoint: EndpointSpec) -> list[dict]:
+    return [p for p in endpoint.parameters if p.get("in") == "query" and p.get("name")]
+
+
+def case_missing_required_query(endpoint: EndpointSpec) -> GeneratedCase | None:
+    """Omit one required query parameter.
+
+    The query-string twin of `case_missing_required_field`: every other rule
+    always sends required query parameters (`_required_query`), so a handler
+    that reads ``?q=`` without checking it was there was invisible until this.
+    """
+    required = [p for p in _query_params(endpoint) if p.get("required")]
+    if not required:
+        return None
+
+    dropped = required[0]["name"]
+    query = _required_query(endpoint)
+    query.pop(dropped, None)
+
+    return GeneratedCase(
+        name=f"{endpoint.key()} rejects a request missing query parameter '{dropped}'",
+        kind="api_functional",
+        endpoint_key=endpoint.key(),
+        rationale=(
+            f"Query parameter '{dropped}' is declared required; omitting it must be a "
+            "client error, not a crash."
+        ),
+        spec={
+            "request": _request(
+                endpoint,
+                path_params=_valid_path_params(endpoint),
+                query=query,
+                body=values.example_body(endpoint.request_schema)
+                if endpoint.request_schema
+                else None,
+            ),
+            "assertions": [
+                {"type": "status_in", "value": [400, 422]},
+                NO_SERVER_ERROR,
+                NO_STACK_TRACE,
+            ],
+            "expectation": f"Omitting required query parameter '{dropped}' returns 400.",
+        },
+    )
+
+
+def case_wrong_query_type(endpoint: EndpointSpec) -> GeneratedCase | None:
+    """Send a non-parseable value for a typed query parameter.
+
+    Required or optional: an optional ``?page=`` that is parsed when present
+    crashes just as hard on ``?page=abc`` as a required one does, and paging,
+    limits and filters - the usual query parameters - are mostly optional.
+    """
+    for param in _query_params(endpoint):
+        violation = values.query_violation(param.get("schema"))
+        if violation is not None:
+            break
+    else:
+        return None
+
+    target = param["name"]
+    query = _required_query(endpoint)
+    query[target] = violation
+
+    return GeneratedCase(
+        name=f"{endpoint.key()} rejects a wrongly typed query parameter '{target}'",
+        kind="api_functional",
+        endpoint_key=endpoint.key(),
+        rationale=(
+            "Query strings arrive as text and are parsed by the handler; an unchecked "
+            "parse turns bad input into a 500."
+        ),
+        spec={
+            "request": _request(
+                endpoint,
+                path_params=_valid_path_params(endpoint),
+                query=query,
+                body=values.example_body(endpoint.request_schema)
+                if endpoint.request_schema
+                else None,
+            ),
+            "assertions": [
+                {"type": "status_in", "value": [400, 422]},
+                NO_SERVER_ERROR,
+                NO_STACK_TRACE,
+            ],
+            "expectation": f"A non-parseable '{target}' returns 400, never a server error.",
+        },
+    )
+
+
 def case_malformed_path_param(endpoint: EndpointSpec) -> GeneratedCase | None:
     params = endpoint.path_params
     if not params:
@@ -396,6 +487,8 @@ RULES = [
     case_missing_required_field,
     case_wrong_field_type,
     case_boundary_value,
+    case_missing_required_query,
+    case_wrong_query_type,
     case_malformed_path_param,
     case_absent_resource,
     case_unauthenticated,
@@ -410,6 +503,8 @@ RULE_INTENTS: dict[str, str] = {
     "case_missing_required_field": "Missing required field is rejected",
     "case_wrong_field_type": "Wrongly typed field is rejected",
     "case_boundary_value": "Value past a declared bound is rejected",
+    "case_missing_required_query": "Missing required query parameter is rejected",
+    "case_wrong_query_type": "Wrongly typed query parameter is rejected",
     "case_malformed_path_param": "Malformed identifier is rejected",
     "case_absent_resource": "Absent resource returns 404",
     "case_unauthenticated": "Unauthenticated request is refused",

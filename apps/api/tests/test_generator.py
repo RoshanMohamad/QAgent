@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from qagent.modules.discovery.openapi import EndpointSpec, parse_openapi, score_risk
 from qagent.modules.generator import values
-from qagent.modules.generator.rules import case_boundary_value, generate
+from qagent.modules.generator.rules import (
+    case_boundary_value,
+    case_missing_required_query,
+    case_wrong_query_type,
+    generate,
+)
 
 DOCUMENT = {
     "openapi": "3.0.0",
@@ -254,3 +259,87 @@ class TestBoundaryValueHelper:
     def test_non_numeric_bound_values_are_ignored_rather_than_crashing(self):
         # A malformed spec (a string where a number belongs) must not raise.
         assert values.first_bounded_field({"n": {"type": "integer", "minimum": "not-a-number"}}) is None
+
+
+def _query_endpoint(*params: dict) -> EndpointSpec:
+    return EndpointSpec(
+        method="GET",
+        path="/items",
+        parameters=[{"in": "query", **p} for p in params],
+        responses={"200": {}, "400": {}},
+    )
+
+
+class TestQueryParameterRules:
+    """`case_missing_required_query` and `case_wrong_query_type`: the first
+    rules that vary the query string (inventory-api's BUG-501 and BUG-502)."""
+
+    def test_missing_required_query_drops_only_the_first_required_one(self):
+        endpoint = _query_endpoint(
+            {"name": "q", "required": True, "schema": {"type": "string"}},
+            {"name": "region", "required": True, "schema": {"type": "string"}},
+            {"name": "page", "required": False, "schema": {"type": "integer"}},
+        )
+        case = case_missing_required_query(endpoint)
+        query = case.spec["request"]["query"]
+        assert "q" not in query
+        assert "region" in query  # the other required one is still sent
+        assert "page" not in query  # optional ones never are
+
+    def test_missing_required_query_needs_a_required_parameter(self):
+        endpoint = _query_endpoint({"name": "page", "required": False, "schema": {"type": "integer"}})
+        assert case_missing_required_query(endpoint) is None
+
+    def test_wrong_query_type_targets_optional_typed_parameters_too(self):
+        endpoint = _query_endpoint(
+            {"name": "q", "required": True, "schema": {"type": "string"}},
+            {"name": "page", "required": False, "schema": {"type": "integer"}},
+        )
+        case = case_wrong_query_type(endpoint)
+        assert case.spec["request"]["query"] == {"page": "not-an-integer", "q": "qagent-q"}
+
+    def test_wrong_query_type_skips_parameters_that_have_no_wrong_type(self):
+        endpoint = _query_endpoint({"name": "q", "required": True, "schema": {"type": "string"}})
+        assert case_wrong_query_type(endpoint) is None
+
+    def test_both_assert_a_400_and_no_server_error(self):
+        endpoint = _query_endpoint(
+            {"name": "page", "required": True, "schema": {"type": "integer"}}
+        )
+        for case in (case_missing_required_query(endpoint), case_wrong_query_type(endpoint)):
+            status_in = next(a for a in case.spec["assertions"] if a["type"] == "status_in")
+            assert status_in["value"] == [400, 422]
+            assert any(a["type"] == "status_not_in" for a in case.spec["assertions"])
+
+    def test_path_parameters_are_not_query_parameters(self):
+        endpoint = EndpointSpec(
+            method="GET",
+            path="/items/{id}",
+            parameters=[{"name": "id", "in": "path", "required": True, "schema": {"type": "integer"}}],
+            responses={"200": {}},
+        )
+        assert case_missing_required_query(endpoint) is None
+        assert case_wrong_query_type(endpoint) is None
+
+    def test_planner_names_them(self):
+        endpoint = _query_endpoint({"name": "page", "required": True, "schema": {"type": "integer"}})
+        names = {c.generated_by_rule for c in generate([endpoint]).cases}
+        assert {"case_missing_required_query", "case_wrong_query_type"} <= names
+
+
+class TestQueryViolation:
+    """qagent.modules.generator.values.query_violation"""
+
+    def test_parsed_types_have_a_textual_violation(self):
+        assert values.query_violation({"type": "integer"}) == "not-an-integer"
+        assert values.query_violation({"type": "number"}) == "not-a-number"
+        assert values.query_violation({"type": "boolean"}) == "not-a-boolean"
+        assert values.query_violation({"type": ["integer", "null"]}) == "not-an-integer"
+
+    def test_an_enum_is_violated_by_a_value_outside_it(self):
+        assert values.query_violation({"type": "string", "enum": ["a", "b"]}) == "qagent-not-in-enum"
+
+    def test_free_text_has_no_wrong_type(self):
+        assert values.query_violation({"type": "string"}) is None
+        assert values.query_violation({}) is None
+        assert values.query_violation(None) is None

@@ -101,6 +101,26 @@ def violation_for(schema: dict | None, name: str = "value") -> Any:
     return {"unexpected": "object"}
 
 
+def query_violation(schema: dict | None) -> str | None:
+    """A query-string value of the wrong type, or ``None`` if none exists.
+
+    Narrower than `violation_for` because a query string is text: ``12345`` is
+    a perfectly good string, so a string parameter has no wrong *type* to send.
+    Only parameters a handler has to parse - numbers, booleans - or match
+    against a closed set - enums - can be violated this way.
+    """
+    if not isinstance(schema, dict):
+        return None
+    if "enum" in schema:
+        return "qagent-not-in-enum"
+    kind = schema.get("type")
+    if isinstance(kind, list):
+        kind = next((k for k in kind if k != "null"), None)
+    if kind in {"integer", "number", "boolean"}:
+        return str(_TYPE_VIOLATIONS[kind])
+    return None
+
+
 def example_body(schema: dict | None) -> dict:
     value = example_for(schema, "body")
     return value if isinstance(value, dict) else {"value": value}

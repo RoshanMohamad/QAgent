@@ -41,6 +41,10 @@ jobs:
         with:
           node-version: "22"
 
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
       - name: Install
         run: |
           pip install --upgrade pip
@@ -71,6 +75,12 @@ jobs:
           FLASK_APP=app.py flask run --port 8083 &
           for i in $(seq 1 20); do
             curl -sf http://127.0.0.1:8083/health && break
+            sleep 1
+          done
+          cd ../inventory-api
+          go build -o /tmp/inventory-api . && /tmp/inventory-api &
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:8084/health && break
             sleep 1
           done
 
@@ -108,6 +118,14 @@ jobs:
         env:
           QAGENT_LLM_PROVIDER: "null"
         run: qagent evaluate --url http://127.0.0.1:8083 --name library-graphql --fixtures packages/fixtures
+
+      - name: Evaluate (inventory-api, Go)
+        # Fourth language, and the first defects in the query string: BUG-501
+        # and BUG-502 are reachable only by case_missing_required_query and
+        # case_wrong_query_type (modules/generator/rules.py).
+        env:
+          QAGENT_LLM_PROVIDER: "null"
+        run: qagent evaluate --url http://127.0.0.1:8084 --name inventory-api --fixtures packages/fixtures
 
       - name: Emitted suite must agree with the pipeline
         # Agent 3 emits standalone pytest files. The claim is that they are the

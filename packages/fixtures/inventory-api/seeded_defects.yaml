@@ -1,0 +1,87 @@
+# Ground truth for the inventory-api fixture (ADR-0003).
+#
+# Fifth fixture, and a fourth language: Go, standard library only (net/http's
+# method-and-wildcard ServeMux, Go 1.22+). Go fails in shapes the other four
+# do not: an absent map entry is a nil pointer rather than an exception, an
+# unchecked type assertion on decoded JSON panics, and a panic only becomes a
+# 500 because recovery middleware turns it into one (main.go, recoverPanics).
+#
+# BUG-501 and BUG-502 are the first fixture defects that live in the query
+# string. Every rule before them varied the body, the path or the
+# credentials, and `_required_query` (modules/generator/rules.py) always sent
+# required query parameters with valid values - so a handler that trusted
+# `?q=` or ignored a failed parse of `?page=` was invisible. They are what
+# case_missing_required_query and case_wrong_query_type were added to reach.
+#
+# Two of the clean endpoints are deliberately the same shapes done right
+# (GET /warehouses parses `limit` and checks the error; GET /warehouses/lookup
+# checks `code` is present), so both new rules carry a false-positive control
+# from the day they were written, not only a detection target.
+
+identities:
+  primary:
+    Authorization: "Bearer inventory-fixture-token"
+
+fixture: inventory-api
+description: Go (net/http, no framework) inventory API with four seeded defects
+  and four correct endpoints.
+
+defects:
+  - id: BUG-501
+    endpoint: "GET /items/search"
+    title: Required query parameter used without checking it was sent
+    expected_class: real_bug
+    expected_severity: high
+    detect_with: request omitting a required query parameter
+    notes: >
+      `q[:1]` on the empty string Go's Query().Get returns for an absent
+      parameter is a slice-bounds panic, recovered into a 500 where 400 is
+      documented. case_missing_required_query; GET /warehouses/lookup is the
+      same shape with the presence check in place.
+
+  - id: BUG-502
+    endpoint: "GET /items"
+    title: Typed query parameter parsed with its error discarded
+    expected_class: real_bug
+    expected_severity: medium
+    detect_with: a non-numeric value for an integer query parameter
+    notes: >
+      `page, _ = strconv.Atoi(raw)` drops the error, so `?page=abc` becomes
+      page 0 and the slice start becomes -10: a panic where 400 is documented.
+      `page` is optional and defaults to 1, so the happy path is unaffected.
+      case_wrong_query_type; GET /warehouses parses `limit` the same way and
+      checks the error.
+
+  - id: BUG-503
+    endpoint: "GET /items/{id}"
+    title: Absent map entry dereferenced as a row
+    expected_class: real_bug
+    expected_severity: high
+    detect_with: absent-but-well-formed resource reference
+    notes: >
+      A malformed id is rejected correctly (strconv.Atoi's error is checked,
+      400). A well-formed absent id is not: `items[id]` yields a nil *Item and
+      `item.ID` is a nil pointer dereference, 500 where 404 is documented. Go's
+      version of buggy-shop's BUG-002 and notes-api's BUG-403.
+
+  - id: BUG-504
+    endpoint: "POST /items"
+    title: Unchecked type assertion on a required body field
+    expected_class: real_bug
+    expected_severity: high
+    detect_with: missing required field, or wrong field type
+    notes: >
+      `body["sku"].(string)` panics when 'sku' is absent (a nil interface) or
+      is a JSON number (float64). The comma-ok form exists for exactly this.
+      Authentication is enforced correctly first, so the auth rules pass here.
+
+# Correct endpoints. Reported defects against these count as false positives.
+#
+# PUT /items/{id}/stock is the control for every body, path and auth rule at
+# once: it authenticates, validates the id, checks existence, then validates
+# a bounded body - in that order.
+clean:
+  - "GET /health"
+  - "GET /warehouses"
+  - "GET /warehouses/lookup"
+  - "PUT /items/{id}/stock"

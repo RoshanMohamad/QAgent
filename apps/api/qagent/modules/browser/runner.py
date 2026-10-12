@@ -152,8 +152,8 @@ def _check_page(page: _Page, url: str, timeout_ms: int, context: Any = None) -> 
     if not failures and context is not None and hasattr(context, "tracing"):
         try:
             context.tracing.stop()
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001 - nothing to keep from a passing check
+            logger.debug("discarding trace for %s failed: %s", url, exc)
 
     return PageCheckResult(
         url=url,
@@ -203,8 +203,8 @@ def run_browser_checks(
                 finally:
                     try:
                         context.close()
-                    except Exception:
-                        pass
+                    except Exception as exc:  # noqa: BLE001 - the browser closes below anyway
+                        logger.debug("closing browser context for %s failed: %s", url, exc)
         finally:
             browser.close()
 

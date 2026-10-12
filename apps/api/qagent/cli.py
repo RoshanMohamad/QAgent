@@ -2182,7 +2182,8 @@ def prune_artifacts_cmd(
         None,
         "--days",
         "-d",
-        help="Evict artifacts older than this many days (defaults to QAGENT_ARTIFACT_RETENTION_DAYS).",
+        help="Evict artifacts older than this many days "
+        "(defaults to QAGENT_ARTIFACT_RETENTION_DAYS).",
     ),
     max_mb: int | None = typer.Option(
         None, "--max-mb", help="Evict oldest artifacts when org total exceeds this size in MB."
@@ -2193,6 +2194,7 @@ def prune_artifacts_cmd(
 ) -> None:
     """Evict expired or quota-exceeding evidence artifacts (CLAUDE.md section 15)."""
     import uuid
+
     from qagent.db import SessionLocal
     from qagent.modules.storage.factory import store_from_settings
     from qagent.modules.storage.retention import prune_artifacts

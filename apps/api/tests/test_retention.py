@@ -7,10 +7,8 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from unittest.mock import MagicMock
 
-import pytest
-
 from qagent.models import Artifact
-from qagent.modules.storage.retention import PruneSummary, prune_artifacts
+from qagent.modules.storage.retention import prune_artifacts
 
 
 class _FakeStore:

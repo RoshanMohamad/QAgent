@@ -14,9 +14,9 @@ This module implements deterministic retention and quota pruning:
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-import logging
 from uuid import UUID
 
 from sqlalchemy import func, select

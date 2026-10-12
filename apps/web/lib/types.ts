@@ -182,6 +182,13 @@ export interface BugComment {
   at: string;
 }
 
+export interface Artifact {
+  id: string;
+  kind: "screenshot" | "har" | "log" | "trace" | string;
+  content_type: string;
+  size_bytes: number;
+}
+
 export interface BugHistory {
   bug: {
     id: string;
@@ -193,6 +200,8 @@ export interface BugHistory {
   };
   events: BugEvent[];
   comments: BugComment[];
+  /** Evidence from the latest result that reproduced the defect. */
+  artifacts: Artifact[];
   /** How often this defect came back after being closed. */
   reopen_count: number;
 }

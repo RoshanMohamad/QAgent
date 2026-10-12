@@ -17,6 +17,7 @@ from qagent.modules.explorer.actions import InteractionPolicy
 from qagent.modules.explorer.interact import (
     InteractionGraph,
     _interact,
+    _TraceChunks,
     explore_interactive,
     fingerprint,
 )
@@ -405,6 +406,111 @@ def test_failed_interaction_is_recorded_not_raised() -> None:
     assert len(outcomes) == 1
     assert outcomes[0].ok is False
     assert outcomes[0].error is not None
+
+
+class FakeTracing:
+    """Records the chunk lifecycle; writes ``chunk-N`` bytes on a saved stop."""
+
+    def __init__(self, fail_on: str | None = None) -> None:
+        self.calls: list[str] = []
+        self._chunk = 0
+        self._fail_on = fail_on
+
+    def _record(self, name: str) -> None:
+        self.calls.append(name)
+        if name == self._fail_on:
+            raise RuntimeError(f"{name} failed")
+
+    def start(self, **_: Any) -> None:
+        self._record("start")
+        self._chunk += 1
+
+    def start_chunk(self) -> None:
+        self._record("start_chunk")
+        self._chunk += 1
+
+    def stop_chunk(self, path: str | None = None) -> None:
+        self._record("save" if path else "discard")
+        if path:
+            with open(path, "wb") as fh:
+                fh.write(f"chunk-{self._chunk}".encode())
+
+    def stop(self) -> None:
+        self._record("stop")
+
+
+def _broken_add_to_cart_page() -> FakeInteractivePage:
+    states = {
+        "start": {"url": ROOT, "elements": [_button("add-btn", "Add to cart")]},
+        "broken": {"url": ROOT, "elements": [], "fire_page_error": "TypeError: price"},
+    }
+    states["start"]["transitions"] = {'button[data-testid="add-btn"]': "broken"}
+    return FakeInteractivePage(states, entry_by_url={ROOT: "start"})
+
+
+def _crawl(page: FakeInteractivePage, traces: Any) -> list:
+    graph = _interact(
+        page,
+        root=ROOT,
+        policy=InteractionPolicy(),
+        llm=_null_llm(),
+        max_pages=25,
+        max_depth=3,
+        max_total_actions=40,
+        timeout_ms=5000,
+        traces=traces,
+    )
+    return [o for n in graph.nodes.values() for o in n.actions_taken]
+
+
+def test_action_causing_errors_carries_its_branch_trace() -> None:
+    tracing = FakeTracing()
+    traces = _TraceChunks(types.SimpleNamespace(tracing=tracing))
+    traces.start()
+
+    outcomes = _crawl(_broken_add_to_cart_page(), traces)
+
+    assert len(outcomes) == 1
+    # chunk-1 is opened by start(), discarded at the first reload; chunk-2 is
+    # the branch that broke, saved whole.
+    assert outcomes[0].trace_zip == b"chunk-2"
+    assert tracing.calls[:4] == ["start", "discard", "start_chunk", "save"]
+
+
+def test_clean_actions_never_save_a_trace() -> None:
+    states = {
+        "start": {"url": ROOT, "elements": [_button("ok-btn", "Fine")]},
+        "fine": {"url": ROOT, "elements": []},
+    }
+    states["start"]["transitions"] = {'button[data-testid="ok-btn"]': "fine"}
+    tracing = FakeTracing()
+    traces = _TraceChunks(types.SimpleNamespace(tracing=tracing))
+    traces.start()
+
+    outcomes = _crawl(FakeInteractivePage(states, entry_by_url={ROOT: "start"}), traces)
+
+    assert outcomes and all(o.trace_zip is None for o in outcomes)
+    assert "save" not in tracing.calls
+
+
+def test_tracing_failure_never_ends_the_crawl() -> None:
+    tracing = FakeTracing(fail_on="save")
+    traces = _TraceChunks(types.SimpleNamespace(tracing=tracing))
+    traces.start()
+
+    outcomes = _crawl(_broken_add_to_cart_page(), traces)
+
+    assert len(outcomes) == 1
+    assert outcomes[0].page_errors == ["TypeError: price"]
+    assert outcomes[0].trace_zip is None
+
+
+def test_context_without_tracing_is_a_no_op() -> None:
+    traces = _TraceChunks(types.SimpleNamespace(new_page=lambda: None))
+    traces.start()
+    outcomes = _crawl(_broken_add_to_cart_page(), traces)
+    assert outcomes[0].trace_zip is None
+    traces.stop()
 
 
 def test_fingerprint_ignores_free_text_but_not_structure() -> None:

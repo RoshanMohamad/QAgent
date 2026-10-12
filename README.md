@@ -1071,8 +1071,8 @@ has open, with no QAgent involved.
 | Defect from | Evidence |
 |---|---|
 | API check | HAR (replayable request + response) |
-| Browser page check | Screenshot, console log |
-| Interactive exploration | Screenshot, console log |
+| Browser page check | Screenshot, console log, Playwright trace |
+| Interactive exploration | Screenshot, console log, Playwright trace |
 
 The last row is new, and its absence was not a decision — nothing had wired it
 up, which left the hardest-to-reproduce findings the least documented. Both
@@ -1088,6 +1088,24 @@ aspirational.
 
 Evidence is attached only to outcomes that became defects. A screenshot of every
 passing page load is storage cost with no reader.
+
+**Playwright traces** (`trace.zip`: DOM snapshots, screenshots and network, step
+by step) are the strongest browser evidence and the most expensive, so they
+follow the same rule harder. A page check records one per page and keeps it only
+on failure. Interactive exploration runs a whole crawl through one browser
+context, so it records in *chunks* — one per branch, starting at each pristine
+reload — and writes a chunk out only when an action in it raised console or page
+errors. A saved trace therefore shows every fill leading up to the submit that
+broke, not just the click, and a clean crawl stores nothing. Size is bounded by
+`qagent prune-artifacts`, which evicts by age
+(`QAGENT_ARTIFACT_RETENTION_DAYS`, default 30) and by a per-organization quota
+(`QAGENT_ARTIFACT_MAX_BYTES_PER_ORG`, default 1 GB).
+
+Evidence is listed on the dashboard's bug page and downloads with a real
+filename (`trace-<id>.zip`, `har-<id>.har`, ...). Open a trace with
+`npx playwright show-trace trace-<id>.zip` or at
+[trace.playwright.dev](https://trace.playwright.dev); nothing is uploaded by the
+latter.
 
 ### Quality score
 
@@ -1771,10 +1789,6 @@ What remains is deliberately deferred rather than pending — see below, and
 [ADR-0008](docs/decisions/ADR-0008-phase-6-scope.md). The honest list of things
 that would come next, none of which are CLAUDE.md requirements:
 
-- **Playwright `trace.zip`** on browser defects. The HAR covers the network
-  side; a trace adds DOM snapshots and is strictly better evidence, at the cost
-  of tens of megabytes per failure — worth doing once there is a retention
-  policy to size it against.
 - **GitLab and Bitbucket** (§5 says GitHub first, and only GitHub is built).
 - **Settlement.** The statement is priced; wiring a payment provider needs a
   pricing decision that does not exist yet ([ADR-0010](docs/decisions/ADR-0010-infrastructure-is-validated-not-proven.md)).

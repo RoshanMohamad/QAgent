@@ -1,5 +1,6 @@
 import Link from "next/link";
 import { api, apiBaseUrl, isConfigured, settle } from "@/lib/api";
+import { EvidenceList } from "@/components/evidence-list";
 import { Card, Empty } from "@/components/figures";
 import { SetupNotice } from "@/components/setup-notice";
 import { SeverityBadge } from "@/components/status";
@@ -39,6 +40,7 @@ export default async function BugPage({
   }
 
   const { bug, events, comments, reopen_count } = history.data;
+  const artifacts = history.data.artifacts ?? [];
 
   return (
     <div className="space-y-6">
@@ -123,6 +125,10 @@ export default async function BugPage({
             ))}
           </ol>
         )}
+      </Card>
+
+      <Card title="Evidence" description="From the latest run that reproduced this defect.">
+        <EvidenceList artifacts={artifacts} />
       </Card>
 
       <Card

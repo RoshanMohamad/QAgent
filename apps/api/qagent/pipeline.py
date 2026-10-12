@@ -610,7 +610,7 @@ def _action_outcome_to_case_outcome(outcome: ActionOutcome, llm: LlmClient) -> C
             _browser_artifacts(
                 screenshot=outcome.screenshot_png,
                 log_lines=outcome.console_errors + outcome.page_errors,
-                trace_zip=getattr(outcome, "trace_zip", None),
+                trace_zip=outcome.trace_zip,
             )
         )
     return case_outcome

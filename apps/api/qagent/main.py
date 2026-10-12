@@ -1290,6 +1290,16 @@ def bug_history(
         .order_by(models.BugComment.created_at)
     ).scalars().all()
 
+    artifacts = (
+        session.execute(
+            select(models.Artifact)
+            .where(models.Artifact.result_id == bug.result_id)
+            .order_by(models.Artifact.created_at)
+        ).scalars().all()
+        if bug.result_id is not None
+        else []
+    )
+
     return {
         "bug": {
             "id": str(bug.id),
@@ -1319,6 +1329,17 @@ def bug_history(
                 "at": c.created_at,
             }
             for c in comments
+        ],
+        # Evidence from the latest result that reproduced it. Bytes are at
+        # GET /api/v1/artifacts/{id}; a pruned artifact simply drops off here.
+        "artifacts": [
+            {
+                "id": str(a.id),
+                "kind": a.kind,
+                "content_type": a.content_type,
+                "size_bytes": a.size_bytes,
+            }
+            for a in artifacts
         ],
         # The number a triage meeting actually asks for.
         "reopen_count": sum(1 for e in events if e.event == "reopened"),
@@ -1667,7 +1688,17 @@ def get_artifact(
     except ArtifactNotFound as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "artifact not found") from exc
 
-    return Response(content=data, media_type=artifact.content_type)
+    # A filename, so a downloaded trace lands as something `npx playwright
+    # show-trace` and trace.playwright.dev recognise rather than a bare UUID.
+    filename = f"{artifact.kind}-{artifact.id}{_ARTIFACT_EXTENSIONS.get(artifact.kind, '')}"
+    return Response(
+        content=data,
+        media_type=artifact.content_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+_ARTIFACT_EXTENSIONS = {"trace": ".zip", "screenshot": ".png", "log": ".log", "har": ".har"}
 
 
 @app.get("/api/v1/projects/{project_id}/tests/flaky", tags=["tests"])

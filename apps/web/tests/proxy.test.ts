@@ -8,7 +8,7 @@ vi.mock("@/lib/session", () => ({
 
 process.env.QAGENT_API_URL = "http://api.test";
 
-const { describeError, proxyPost } = await import("@/lib/proxy");
+const { describeError, proxyDownload, proxyPost } = await import("@/lib/proxy");
 
 function request(body: unknown): Request {
   return new Request("http://dashboard.test/api/x", {
@@ -96,5 +96,63 @@ describe("describeError", () => {
   it("returns null for anything it cannot read, so the caller's fallback applies", () => {
     expect(describeError(undefined)).toBeNull();
     expect(describeError([{}])).toBeNull();
+  });
+});
+
+describe("proxyDownload", () => {
+  beforeEach(() => {
+    getToken.mockReset();
+    vi.stubGlobal("fetch", vi.fn());
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("refuses without a session and never reaches the API", async () => {
+    getToken.mockResolvedValue(null);
+
+    const response = await proxyDownload("/api/v1/artifacts/a-1");
+
+    expect(response.status).toBe(401);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("passes the bytes through with only the download headers", async () => {
+    getToken.mockResolvedValue("secret-token");
+    vi.mocked(fetch).mockResolvedValue(
+      new Response(new Uint8Array([80, 75, 3, 4]), {
+        status: 200,
+        headers: {
+          "content-type": "application/zip",
+          "content-disposition": 'attachment; filename="trace-a-1.zip"',
+          "x-internal": "do-not-forward",
+        },
+      }),
+    );
+
+    const response = await proxyDownload("/api/v1/artifacts/a-1");
+
+    expect(fetch).toHaveBeenCalledWith(
+      "http://api.test/api/v1/artifacts/a-1",
+      expect.objectContaining({
+        headers: expect.objectContaining({ Authorization: "Bearer secret-token" }),
+      }),
+    );
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-disposition")).toBe(
+      'attachment; filename="trace-a-1.zip"',
+    );
+    expect(response.headers.get("x-internal")).toBeNull();
+    expect(new Uint8Array(await response.arrayBuffer())).toEqual(new Uint8Array([80, 75, 3, 4]));
+  });
+
+  it("keeps the upstream status for a missing artifact", async () => {
+    getToken.mockResolvedValue("t");
+    vi.mocked(fetch).mockResolvedValue(new Response("{}", { status: 404 }));
+
+    const response = await proxyDownload("/api/v1/artifacts/nope");
+
+    expect(response.status).toBe(404);
   });
 });

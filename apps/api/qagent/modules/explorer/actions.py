@@ -97,6 +97,10 @@ class ActionOutcome:
     #: interactive defect deserves the same evidence a page-load defect gets,
     #: and `pipeline.py` decides whether it became a bug worth storing one for.
     screenshot_png: bytes | None = None
+    #: The Playwright trace chunk covering this action's branch - from the
+    #: last pristine reload up to and including this action, so the fills that
+    #: led to a failing submit are in it. Same in-memory contract as above.
+    trace_zip: bytes | None = None
 
 
 @dataclass

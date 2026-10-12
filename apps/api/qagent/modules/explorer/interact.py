@@ -206,6 +206,88 @@ def _capture_screenshot(page: Any) -> bytes | None:
         return None
 
 
+class _TraceChunks:
+    """Playwright trace capture, one chunk per branch of the crawl.
+
+    `modules/browser/runner` gives every page check its own context and so its
+    own trace. A crawl can't: it runs 40 actions through one context, and a
+    trace of the whole crawl is both enormous and useless as evidence for one
+    defect. Playwright's chunking is built for exactly this - `start()` once,
+    then each `stop_chunk()` closes the current chunk (saved or discarded) and
+    `start_chunk()` opens the next, all on the same context.
+
+    A chunk begins at each pristine reload, so a saved one shows the whole
+    branch - every fill before the submit that broke - not just the click.
+    Only chunks ending in an action that produced errors are ever written out;
+    the rest are discarded, which is what keeps this from costing tens of
+    megabytes per clean crawl.
+
+    Best-effort throughout, like screenshots: a tracing failure disables
+    tracing for the rest of the crawl rather than ending it.
+    """
+
+    def __init__(self, context: Any) -> None:
+        self._tracing = getattr(context, "tracing", None) if context is not None else None
+        self._open = False
+
+    def start(self) -> None:
+        if self._tracing is None:
+            return
+        try:
+            self._tracing.start(screenshots=True, snapshots=True, sources=False)
+            self._open = True
+        except Exception as exc:  # noqa: BLE001 - see class docstring
+            logger.warning("interactive tracing could not start: %s", exc)
+            self._tracing = None
+
+    def restart(self) -> None:
+        """Discard the current chunk and open a fresh one."""
+        if self._tracing is None:
+            return
+        try:
+            if self._open:
+                self._tracing.stop_chunk()
+            self._tracing.start_chunk()
+            self._open = True
+        except Exception as exc:  # noqa: BLE001 - see class docstring
+            logger.warning("interactive tracing disabled: %s", exc)
+            self._tracing = None
+            self._open = False
+
+    def save(self) -> bytes | None:
+        """Close the current chunk to bytes, then open the next one."""
+        if self._tracing is None or not self._open:
+            return None
+        data: bytes | None = None
+        try:
+            import tempfile
+            from pathlib import Path
+
+            with tempfile.TemporaryDirectory() as tmpdir:
+                path = Path(tmpdir) / "trace.zip"
+                self._open = False
+                self._tracing.stop_chunk(path=str(path))
+                if path.exists():
+                    data = path.read_bytes()
+            self._tracing.start_chunk()
+            self._open = True
+        except Exception as exc:  # noqa: BLE001 - see class docstring
+            logger.warning("interactive trace capture failed: %s", exc)
+            self._tracing = None
+            self._open = False
+        return data
+
+    def stop(self) -> None:
+        if self._tracing is None:
+            return
+        try:
+            self._tracing.stop()
+        except Exception as exc:  # noqa: BLE001 - the crawl is over; nothing left to protect
+            logger.debug("interactive tracing stop failed: %s", exc)
+        self._tracing = None
+        self._open = False
+
+
 def _interact(
     page: _InteractivePage,
     *,
@@ -216,6 +298,7 @@ def _interact(
     max_depth: int,
     max_total_actions: int,
     timeout_ms: int,
+    traces: _TraceChunks | None = None,
 ) -> InteractionGraph:
     graph = InteractionGraph(root=root)
     visited_keys: set[str] = set()
@@ -257,6 +340,8 @@ def _interact(
             just_reloaded = need_reload
 
             if need_reload:
+                if traces is not None:
+                    traces.restart()
                 try:
                     page.goto(current_url, timeout=timeout_ms, wait_until="load")
                 except Exception as exc:  # noqa: BLE001 - an unreachable page is a dead-end node
@@ -381,6 +466,10 @@ def _interact(
                 console_buffer=console_buffer,
                 page_error_buffer=page_error_buffer,
             )
+            # Same condition as the screenshot: only an action that produced
+            # errors is a candidate defect, and only a defect needs a trace.
+            if traces is not None and (outcome.console_errors or outcome.page_errors):
+                outcome.trace_zip = traces.save()
             node.actions_taken.append(outcome)
             attempted_selectors.add(chosen.target.selector)
             total_actions += 1
@@ -443,16 +532,23 @@ def explore_interactive(
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=headless)
         try:
-            page = browser.new_context().new_page()
-            return _interact(
-                page,
-                root=root,
-                policy=policy,
-                llm=llm,
-                max_pages=max_pages,
-                max_depth=max_depth,
-                max_total_actions=max_total_actions,
-                timeout_ms=timeout_ms,
-            )
+            context = browser.new_context()
+            traces = _TraceChunks(context)
+            traces.start()
+            page = context.new_page()
+            try:
+                return _interact(
+                    page,
+                    root=root,
+                    policy=policy,
+                    llm=llm,
+                    max_pages=max_pages,
+                    max_depth=max_depth,
+                    max_total_actions=max_total_actions,
+                    timeout_ms=timeout_ms,
+                    traces=traces,
+                )
+            finally:
+                traces.stop()
         finally:
             browser.close()

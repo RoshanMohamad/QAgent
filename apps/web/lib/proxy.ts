@@ -53,6 +53,45 @@ export async function proxyPost(
   return NextResponse.json(payload, { status: response.status });
 }
 
+/**
+ * Streams one binary download (an evidence artifact) from the QAgent API.
+ *
+ * Same reasoning as `proxyPost`: an `<a href>` in the browser cannot carry the
+ * httpOnly token, so the download goes through a handler that attaches it.
+ * The body is passed through untouched and only the headers a download needs
+ * are copied, so nothing else from the API leaks to the browser.
+ */
+export async function proxyDownload(path: string): Promise<Response> {
+  const token = await getToken();
+  if (!token) {
+    return NextResponse.json({ error: "Not signed in" }, { status: 401 });
+  }
+
+  let response: Response;
+  try {
+    response = await fetch(`${BASE_URL}${path}`, {
+      headers: { Authorization: `Bearer ${token}` },
+      cache: "no-store",
+    });
+  } catch {
+    return NextResponse.json(
+      { error: `Cannot reach the QAgent API at ${BASE_URL}` },
+      { status: 503 },
+    );
+  }
+
+  if (!response.ok) {
+    return NextResponse.json({ error: "Artifact not found" }, { status: response.status });
+  }
+
+  const headers = new Headers();
+  for (const name of ["content-type", "content-disposition", "content-length"]) {
+    const value = response.headers.get(name);
+    if (value) headers.set(name, value);
+  }
+  return new Response(response.body, { status: 200, headers });
+}
+
 export function describeError(detail: unknown): string | null {
   if (typeof detail === "string") {
     return detail;

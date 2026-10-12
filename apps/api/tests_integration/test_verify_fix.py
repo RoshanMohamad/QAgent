@@ -65,6 +65,17 @@ def test_verifying_an_unfixed_defect_reports_still_failing(client, fixture_app_u
     assert verified is not None, "at least one API defect should be replayable"
     bug, queued = verified
 
+    # Its evidence is reachable from the bug itself, and downloads as a file a
+    # HAR viewer will open rather than as a bare UUID.
+    evidence = client.get(f"/api/v1/bugs/{bug['id']}/history", headers=headers).json()
+    har = next(a for a in evidence["artifacts"] if a["kind"] == "har")
+    assert har["size_bytes"] > 0
+    download = client.get(f"/api/v1/artifacts/{har['id']}", headers=headers)
+    assert download.status_code == 200
+    assert download.headers["content-disposition"] == (
+        f'attachment; filename="har-{har["id"]}.har"'
+    )
+
     summary = verify_bug.apply(args=[org_id, bug["id"], queued["run_id"], 3]).get()
 
     assert summary["verdict"] == "still_failing", summary
